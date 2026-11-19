@@ -1,0 +1,1175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.org/schemas/final-educational-document.schema.json",
+  "title": "Универсальная схема учебно-методического документа",
+  "description": "Единая схема для одного учебно-методического документа: РПД, практики, аспирантуры и смежных видов. Неизвестные поля разрешены для сохранения сведений из нестандартных документов.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "documentType",
+    "title",
+    "metadata"
+  ],
+  "properties": {
+    "documentType": {
+      "type": "string",
+      "description": "Тип документа, например рабочая программа дисциплины, программа практики, план аспиранта или иной учебно-методический документ."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Полное наименование документа или дисциплины/практики."
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    },
+    "discipline": {
+      "$ref": "#/$defs/discipline"
+    },
+    "purposeAndTasks": {
+      "$ref": "#/$defs/purposeAndTasks"
+    },
+    "competencies": {
+      "type": "array",
+      "description": "Компетенции и результаты обучения, формируемые документом.",
+      "items": {
+        "$ref": "#/$defs/competency"
+      }
+    },
+    "workload": {
+      "$ref": "#/$defs/workload"
+    },
+    "assessment": {
+      "$ref": "#/$defs/assessment"
+    },
+    "curriculum": {
+      "type": "array",
+      "description": "Тематический или календарный план учебной работы по семестрам и видам занятий.",
+      "items": {
+        "$ref": "#/$defs/semesterPlan"
+      }
+    },
+    "independentStudy": {
+      "type": "array",
+      "description": "План самостоятельной внеаудиторной работы.",
+      "items": {
+        "$ref": "#/$defs/studyTask"
+      }
+    },
+    "coursework": {
+      "$ref": "#/$defs/coursework"
+    },
+    "assessmentMaterials": {
+      "type": "array",
+      "description": "Фонд оценочных средств: оценочные материалы, задания, критерии и шкалы.",
+      "items": {
+        "$ref": "#/$defs/assessmentMaterial"
+      }
+    },
+    "readingList": {
+      "type": "array",
+      "description": "Основная, дополнительная и иная рекомендованная литература и электронные ресурсы.",
+      "items": {
+        "$ref": "#/$defs/source"
+      }
+    },
+    "facilities": {
+      "type": "array",
+      "description": "Материально-технические и программные ресурсы, необходимые для освоения документа.",
+      "items": {
+        "$ref": "#/$defs/facility"
+      }
+    },
+    "methodologicalGuidance": {
+      "type": "string",
+      "description": "Методические рекомендации обучающимся по освоению дисциплины, практики или проекта."
+    },
+    "practiceDetails": {
+      "$ref": "#/$defs/practiceDetails"
+    },
+    "researchPlan": {
+      "type": "array",
+      "description": "Этапы и результаты индивидуального плана научной деятельности.",
+      "items": {
+        "$ref": "#/$defs/researchMilestone"
+      }
+    },
+    "approvals": {
+      "type": "array",
+      "description": "Сведения о составителях, рассмотрении, утверждении и согласовании документа.",
+      "items": {
+        "$ref": "#/$defs/approval"
+      }
+    },
+    "appendices": {
+      "type": "array",
+      "description": "Приложения и иные разделы исходного документа, не представленные отдельными полями схемы.",
+      "items": {
+        "$ref": "#/$defs/appendix"
+      }
+    },
+    "programs": {
+      "type": "array",
+      "description": "Направления подготовки и профили, для которых действует документ.",
+      "items": {
+        "$ref": "#/$defs/program"
+      }
+    },
+    "sourceNotes": {
+      "type": "array",
+      "description": "Замечания к исходному документу: расхождения, опечатки, неразборчивые фрагменты и решения при нормализации данных.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "assessmentPassport": {
+      "type": "array",
+      "description": "Паспорт фонда оценочных средств: соответствие индикаторов компетенций оценочным средствам.",
+      "items": {
+        "$ref": "#/$defs/assessmentPassportEntry"
+      }
+    }
+  },
+  "$defs": {
+    "metadata": {
+      "type": "object",
+      "description": "Идентификационные и редакционные сведения об учебно-методическом документе.",
+      "additionalProperties": false,
+      "required": [
+        "institution"
+      ],
+      "properties": {
+        "institution": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Полное наименование образовательной организации."
+        },
+        "unit": {
+          "type": "string",
+          "description": "Институт, факультет, кафедра или иное подразделение-разработчик."
+        },
+        "academicYear": {
+          "type": "string",
+          "description": "Учебный год или период действия документа."
+        },
+        "version": {
+          "type": "string",
+          "description": "Редакция, номер версии или дата актуализации документа."
+        },
+        "documentNumber": {
+          "type": "string",
+          "description": "Регистрационный номер, шифр или номер протокола документа."
+        },
+        "language": {
+          "type": "string",
+          "description": "Язык документа в формате BCP 47, например ru или en."
+        },
+        "sourceFile": {
+          "type": "string",
+          "description": "Имя исходного файла, из которого перенесены сведения."
+        },
+        "eSignature": {
+          "$ref": "#/$defs/eSignature"
+        },
+        "sourceFiles": {
+          "type": "array",
+          "description": "Исходные файлы, на основании которых заполнена запись.",
+          "items": {
+            "$ref": "#/$defs/sourceFile"
+          }
+        }
+      }
+    },
+    "program": {
+      "type": "object",
+      "description": "Сведения об образовательной программе и направлении подготовки.",
+      "additionalProperties": false,
+      "properties": {
+        "programCode": {
+          "type": "string",
+          "pattern": "^[0-9]{2}\\.[0-9]{2}\\.[0-9]{2}$",
+          "description": "Код направления подготовки, например 01.03.02."
+        },
+        "programName": {
+          "type": "string",
+          "description": "Наименование направления подготовки или специальности."
+        },
+        "profile": {
+          "type": "string",
+          "description": "Профиль или направленность образовательной программы."
+        },
+        "level": {
+          "type": "string",
+          "description": "Уровень образования или квалификация, например бакалавриат, магистратура, аспирантура."
+        },
+        "formOfStudy": {
+          "type": "array",
+          "description": "Формы обучения, для которых разработан документ.",
+          "items": {
+            "type": "string",
+            "enum": [
+              "очная",
+              "очно-заочная",
+              "заочная",
+              "иная"
+            ]
+          }
+        },
+        "standard": {
+          "type": "string",
+          "description": "Образовательный стандарт или иной нормативный документ, на основании которого разработана программа."
+        }
+      }
+    },
+    "discipline": {
+      "type": "object",
+      "description": "Параметры дисциплины, модуля, практики или проекта.",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Название дисциплины, модуля, практики или проекта."
+        },
+        "code": {
+          "type": "string",
+          "description": "Внутренний код дисциплины или ее шифр в учебном плане."
+        },
+        "cycle": {
+          "type": "string",
+          "description": "Блок или часть образовательной программы, к которой относится дисциплина."
+        },
+        "semesterNumbers": {
+          "type": "array",
+          "description": "Номера семестров освоения.",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "prerequisites": {
+          "type": "array",
+          "description": "Дисциплины и знания, необходимые до начала освоения.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "subsequentCourses": {
+          "type": "array",
+          "description": "Элементы программы, для которых требуются результаты данной дисциплины.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "type": "string",
+          "description": "Пояснение роли дисциплины в учебном плане и ее связи с другими элементами программы."
+        }
+      }
+    },
+    "purposeAndTasks": {
+      "type": "object",
+      "description": "Цель освоения и задачи дисциплины, практики или проекта.",
+      "additionalProperties": false,
+      "properties": {
+        "goals": {
+          "type": "array",
+          "description": "Цели освоения.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tasks": {
+          "type": "array",
+          "description": "Задачи, через которые достигаются цели.",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "competency": {
+      "type": "object",
+      "description": "Компетенция и соответствующие ей индикаторы и результаты обучения.",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "description"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[А-ЯA-ZЁ]{2,5}(-[А-ЯA-ZЁ0-9.]+)+$",
+          "description": "Шифр компетенции, например УК-2, ОПК-1 или ПК-3.1."
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "УК",
+            "ОПК",
+            "ПК",
+            "иная"
+          ],
+          "description": "Категория компетенции: универсальная, общепрофессиональная, профессиональная или иная."
+        },
+        "description": {
+          "type": "string",
+          "description": "Формулировка компетенции из образовательного стандарта или программы."
+        },
+        "indicators": {
+          "type": "array",
+          "description": "Индикаторы достижения компетенции и соотнесенные с ними результаты обучения.",
+          "items": {
+            "$ref": "#/$defs/indicator"
+          }
+        }
+      }
+    },
+    "indicator": {
+      "type": "object",
+      "description": "Индикатор достижения компетенции с результатами обучения.",
+      "additionalProperties": false,
+      "required": [
+        "description"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[А-ЯA-ZЁ]{2,5}(-[А-ЯA-ZЁ0-9.]+)+$",
+          "description": "Шифр индикатора, если он указан в исходном документе."
+        },
+        "description": {
+          "type": "string",
+          "description": "Формулировка индикатора достижения компетенции."
+        },
+        "learningOutcomes": {
+          "type": "array",
+          "description": "Планируемые результаты в категориях знания, умения и владения навыками.",
+          "items": {
+            "$ref": "#/$defs/learningOutcome"
+          }
+        }
+      }
+    },
+    "learningOutcome": {
+      "type": "object",
+      "description": "Конкретный результат обучения по индикатору.",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "description"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "знания",
+            "умения",
+            "навыки",
+            "иной результат"
+          ],
+          "description": "Категория результата обучения."
+        },
+        "description": {
+          "type": "string",
+          "description": "Что обучающийся знает, умеет делать или чем владеет."
+        }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "description": "Общая трудоемкость и ее распределение по единицам измерения, семестрам и видам занятий.",
+      "additionalProperties": false,
+      "properties": {
+        "totalCredits": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Общая трудоемкость в зачетных единицах (ЗЕТ)."
+        },
+        "totalHours": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Общая трудоемкость в академических часах."
+        },
+        "bySemester": {
+          "type": "array",
+          "description": "Распределение трудоемкости и форм контроля по семестрам.",
+          "items": {
+            "$ref": "#/$defs/semesterWorkload"
+          }
+        }
+      }
+    },
+    "semesterWorkload": {
+      "type": "object",
+      "description": "Трудоемкость учебной работы и аттестация за семестр.",
+      "additionalProperties": false,
+      "required": [
+        "semester"
+      ],
+      "properties": {
+        "semester": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Номер семестра."
+        },
+        "credits": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Объем работы в ЗЕТ за семестр."
+        },
+        "hours": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Объем работы в часах за семестр."
+        },
+        "lectureHours": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Часы лекционных занятий."
+        },
+        "seminarHours": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Часы семинарских или практических занятий."
+        },
+        "laboratoryHours": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Часы лабораторных занятий."
+        },
+        "consultationHours": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Часы консультаций."
+        },
+        "independentHours": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Часы самостоятельной работы."
+        },
+        "assessmentHours": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Часы на промежуточную аттестацию, если выделяются отдельно."
+        },
+        "assessmentForm": {
+          "type": "string",
+          "enum": [
+            "экзамен",
+            "зачет",
+            "зачет с оценкой",
+            "дифференцированный зачет",
+            "защита",
+            "иная форма"
+          ],
+          "description": "Форма промежуточной аттестации в семестре."
+        }
+      }
+    },
+    "assessment": {
+      "type": "object",
+      "description": "Формы текущего контроля и промежуточной аттестации.",
+      "additionalProperties": false,
+      "properties": {
+        "interimForms": {
+          "type": "array",
+          "description": "Формы промежуточной аттестации по семестрам.",
+          "items": {
+            "type": "string",
+            "enum": [
+              "экзамен",
+              "зачет",
+              "зачет с оценкой",
+              "дифференцированный зачет",
+              "защита",
+              "иная форма"
+            ]
+          }
+        },
+        "currentForms": {
+          "type": "array",
+          "description": "Формы текущего контроля знаний и навыков.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "gradingScale": {
+          "type": "string",
+          "description": "Описание шкалы оценивания и перевода баллов в итоговую отметку."
+        }
+      }
+    },
+    "semesterPlan": {
+      "type": "object",
+      "description": "Тематический план одного семестра.",
+      "additionalProperties": false,
+      "required": [
+        "semester",
+        "topics"
+      ],
+      "properties": {
+        "semester": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Номер семестра, к которому относится тематический план."
+        },
+        "formOfStudy": {
+          "type": "string",
+          "enum": [
+            "очная",
+            "очно-заочная",
+            "заочная",
+            "иная"
+          ],
+          "description": "Форма обучения для данного плана."
+        },
+        "topics": {
+          "type": "array",
+          "description": "Темы и занятия с детализацией трудоемкости и контроля.",
+          "items": {
+            "$ref": "#/$defs/topic"
+          }
+        }
+      }
+    },
+    "topic": {
+      "type": "object",
+      "description": "Тема, модуль или учебное занятие.",
+      "additionalProperties": false,
+      "required": [
+        "title"
+      ],
+      "properties": {
+        "number": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Порядковый номер темы или занятия."
+        },
+        "module": {
+          "type": "string",
+          "description": "Название модуля или тематического раздела."
+        },
+        "title": {
+          "type": "string",
+          "description": "Название темы или занятия."
+        },
+        "questions": {
+          "type": "array",
+          "description": "Основные вопросы и содержание темы.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "activityHours": {
+          "type": "object",
+          "description": "Часы по видам учебной работы в рамках темы.",
+          "additionalProperties": false,
+          "properties": {
+            "lectures": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Часы лекций."
+            },
+            "seminars": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Часы практических или семинарских занятий."
+            },
+            "laboratories": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Часы лабораторных занятий."
+            },
+            "consultations": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Часы консультаций."
+            },
+            "independentStudy": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Часы самостоятельной работы."
+            }
+          },
+          "required": []
+        },
+        "classFormat": {
+          "type": "array",
+          "description": "Форматы проведения занятия, включая практическую подготовку и онлайн-форматы.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "assessmentTools": {
+          "type": "array",
+          "description": "Оценочные средства, применяемые по теме.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "controlType": {
+          "type": "string",
+          "description": "Вид контроля по теме, например текущий или промежуточный."
+        },
+        "points": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Максимальная сумма баллов за тему или занятие."
+        },
+        "practicalTraining": {
+          "$ref": "#/$defs/practicalTraining"
+        }
+      }
+    },
+    "studyTask": {
+      "type": "object",
+      "description": "Задание самостоятельной внеаудиторной работы.",
+      "additionalProperties": false,
+      "required": [
+        "description"
+      ],
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Содержание самостоятельного задания."
+        },
+        "semester": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Семестр выполнения задания."
+        },
+        "hours": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Трудоемкость задания в часах."
+        },
+        "expectedResult": {
+          "type": "string",
+          "description": "Ожидаемый результат выполнения задания."
+        },
+        "assessmentMethod": {
+          "type": "string",
+          "description": "Способ проверки или оценивания задания."
+        }
+      }
+    },
+    "coursework": {
+      "type": "object",
+      "description": "Сведения о курсовой работе, курсовом проекте или иной самостоятельной проектной работе, если предусмотрена.",
+      "additionalProperties": false,
+      "properties": {
+        "required": {
+          "type": "boolean",
+          "description": "Признак обязательности курсовой или проектной работы."
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "курсовая работа",
+            "курсовой проект",
+            "проект",
+            "иная работа"
+          ],
+          "description": "Вид самостоятельной работы."
+        },
+        "topics": {
+          "type": "array",
+          "description": "Темы или направления работ.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "requirements": {
+          "type": "array",
+          "description": "Требования к выполнению и оформлению работы.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "assessmentCriteria": {
+          "type": "array",
+          "description": "Критерии оценивания работы.",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "assessmentMaterial": {
+      "type": "object",
+      "description": "Отдельное оценочное средство или материал фонда оценочных средств.",
+      "additionalProperties": false,
+      "required": [
+        "title"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Название оценочного средства, например тест, лабораторная или экзаменационный билет."
+        },
+        "type": {
+          "type": "string",
+          "description": "Вид оценочного средства."
+        },
+        "competencyCodes": {
+          "type": "array",
+          "description": "Шифры компетенций, оцениваемых этим средством.",
+          "items": {
+            "type": "string",
+            "pattern": "^[А-ЯA-ZЁ]{2,5}(-[А-ЯA-ZЁ0-9.]+)+$"
+          }
+        },
+        "instructions": {
+          "type": "string",
+          "description": "Инструкция обучающемуся по выполнению оценочного задания."
+        },
+        "tasks": {
+          "type": "array",
+          "description": "Вопросы, задания или варианты оценочного средства.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "criteria": {
+          "type": "array",
+          "description": "Критерии и показатели оценивания.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "maximumPoints": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Максимальное количество баллов за оценочное средство."
+        },
+        "id": {
+          "type": "string",
+          "description": "Необязательный идентификатор оценочного средства, используемый для ссылок из паспорта ФОС."
+        },
+        "variants": {
+          "type": "array",
+          "description": "Варианты теста, задания или экзаменационного билета.",
+          "items": {
+            "$ref": "#/$defs/assessmentVariant"
+          }
+        },
+        "taskDetails": {
+          "type": "array",
+          "description": "Подробные задания с формулировками, баллами и при необходимости вложенными подпунктами.",
+          "items": {
+            "$ref": "#/$defs/assessmentTask"
+          }
+        },
+        "gradingScale": {
+          "type": "array",
+          "description": "Шкала или диапазоны оценивания; границы и критерии можно заполнить частично.",
+          "items": {
+            "$ref": "#/$defs/gradingBand"
+          }
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "description": "Библиографическая запись или электронный ресурс.",
+      "additionalProperties": false,
+      "required": [
+        "title"
+      ],
+      "properties": {
+        "category": {
+          "type": "string",
+          "enum": [
+            "основная литература",
+            "дополнительная литература",
+            "периодическое издание",
+            "интернет-ресурс",
+            "нормативный документ",
+            "иная литература"
+          ],
+          "description": "Категория источника в списке литературы."
+        },
+        "title": {
+          "type": "string",
+          "description": "Название книги, статьи, ресурса или документа."
+        },
+        "authors": {
+          "type": "array",
+          "description": "Авторы или редакторы источника.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "publication": {
+          "type": "string",
+          "description": "Выходные данные: издательство, журнал, место издания или организация."
+        },
+        "year": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Год публикации."
+        },
+        "url": {
+          "type": "string",
+          "description": "Адрес электронного источника; может быть указан без протокола или содержать кириллицу."
+        },
+        "accessedAt": {
+          "type": "string",
+          "description": "Дата обращения к интернет-ресурсу в формате, использованном в исходном документе (например, ДД.ММ.ГГГГ или текстовая дата)."
+        }
+      }
+    },
+    "facility": {
+      "type": "object",
+      "description": "Аудитория, оборудование, программное обеспечение или доступ к информационной системе.",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Название ресурса или оборудования."
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "аудитория",
+            "оборудование",
+            "программное обеспечение",
+            "информационная система",
+            "иная инфраструктура"
+          ],
+          "description": "Категория материально-технического обеспечения."
+        },
+        "details": {
+          "type": "string",
+          "description": "Характеристики, назначение или условия доступа."
+        }
+      }
+    },
+    "practiceDetails": {
+      "type": "object",
+      "description": "Специфические сведения о практической подготовке и производственной или учебной практике.",
+      "additionalProperties": false,
+      "properties": {
+        "practiceType": {
+          "type": "string",
+          "enum": [
+            "учебная",
+            "производственная",
+            "научно-исследовательская",
+            "преддипломная",
+            "иная"
+          ],
+          "description": "Вид практики."
+        },
+        "place": {
+          "type": "string",
+          "description": "Место проведения практики или тип принимающей организации."
+        },
+        "stages": {
+          "type": "array",
+          "description": "Этапы прохождения практики.",
+          "items": {
+            "$ref": "#/$defs/practiceStage"
+          }
+        },
+        "reportingRequirements": {
+          "type": "array",
+          "description": "Требования к отчету и защите практики.",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "practiceStage": {
+      "type": "object",
+      "description": "Этап практики и ожидаемые результаты его выполнения.",
+      "additionalProperties": false,
+      "required": [
+        "title"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Название этапа практики."
+        },
+        "description": {
+          "type": "string",
+          "description": "Содержание работ на этапе."
+        },
+        "hours": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Трудоемкость этапа в часах."
+        },
+        "expectedResult": {
+          "type": "string",
+          "description": "Результат, подтверждающий выполнение этапа."
+        }
+      }
+    },
+    "researchMilestone": {
+      "type": "object",
+      "description": "Этап индивидуального плана научной деятельности аспиранта или исследователя.",
+      "additionalProperties": false,
+      "required": [
+        "title"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Название этапа или вида научной деятельности."
+        },
+        "period": {
+          "type": "string",
+          "description": "Срок выполнения: семестр, год или календарный период."
+        },
+        "description": {
+          "type": "string",
+          "description": "Содержание планируемой научной работы."
+        },
+        "deliverables": {
+          "type": "array",
+          "description": "Ожидаемые результаты, публикации, отчеты или аттестационные материалы.",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "description": "Сведения о разработке, рассмотрении, согласовании или утверждении документа.",
+      "additionalProperties": false,
+      "properties": {
+        "role": {
+          "type": "string",
+          "description": "Роль лица или органа: составитель, кафедра, ученый совет, утверждающий руководитель и т. п."
+        },
+        "person": {
+          "type": "string",
+          "description": "ФИО и должность ответственного лица."
+        },
+        "date": {
+          "type": "string",
+          "description": "Дата рассмотрения или утверждения в формате исходного документа, например ДД.ММ.ГГГГ или «сентябрь 2025 г.»."
+        },
+        "protocolNumber": {
+          "type": "string",
+          "description": "Номер протокола заседания или распорядительного документа."
+        }
+      }
+    },
+    "appendix": {
+      "type": "object",
+      "description": "Приложение или дополнительный раздел, структура которого не унифицирована.",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "content"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Название приложения или дополнительного раздела."
+        },
+        "content": {
+          "type": "string",
+          "description": "Текстовое содержание либо краткое описание приложения."
+        }
+      }
+    },
+    "eSignature": {
+      "type": "object",
+      "description": "Сведения об электронной подписи документа, если они присутствуют в исходнике.",
+      "additionalProperties": true,
+      "properties": {
+        "signerName": {
+          "type": "string",
+          "description": "ФИО подписанта в написании исходного документа."
+        },
+        "signerPosition": {
+          "type": "string",
+          "description": "Должность подписанта."
+        },
+        "certificateNumber": {
+          "type": "string",
+          "description": "Номер или идентификатор сертификата электронной подписи."
+        },
+        "validFrom": {
+          "type": "string",
+          "description": "Начало срока действия сертификата в формате исходного документа."
+        },
+        "validTo": {
+          "type": "string",
+          "description": "Окончание срока действия сертификата в формате исходного документа."
+        },
+        "signedAt": {
+          "type": "string",
+          "description": "Дата или дата-время подписания в формате исходного документа."
+        },
+        "details": {
+          "type": "string",
+          "description": "Прочие сведения о подписи, сертификате или проверке подписи."
+        }
+      }
+    },
+    "sourceFile": {
+      "type": "object",
+      "description": "Файл-источник, приложенный к документу или использованный при извлечении данных.",
+      "additionalProperties": true,
+      "properties": {
+        "fileName": {
+          "type": "string",
+          "description": "Имя исходного файла."
+        },
+        "fileType": {
+          "type": "string",
+          "description": "Формат или тип файла, например PDF, DOCX, TXT."
+        },
+        "language": {
+          "type": "string",
+          "description": "Язык содержимого файла."
+        },
+        "sourceUrl": {
+          "type": "string",
+          "description": "Ссылка на файл, если она известна; допускается без протокола и с кириллицей."
+        }
+      }
+    },
+    "practicalTraining": {
+      "type": "object",
+      "description": "Практическая подготовка, предусмотренная в рамках конкретной темы занятия.",
+      "additionalProperties": true,
+      "properties": {
+        "hours": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Количество часов практической подготовки в рамках темы."
+        },
+        "location": {
+          "type": "string",
+          "description": "Место проведения практической подготовки."
+        },
+        "description": {
+          "type": "string",
+          "description": "Содержание или пояснение практической подготовки."
+        }
+      }
+    },
+    "assessmentVariant": {
+      "type": "object",
+      "description": "Один вариант оценочного средства или экзаменационный билет.",
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Название, номер или обозначение варианта."
+        },
+        "tasks": {
+          "type": "array",
+          "description": "Задания, входящие в вариант.",
+          "items": {
+            "$ref": "#/$defs/assessmentTask"
+          }
+        },
+        "description": {
+          "type": "string",
+          "description": "Дополнительное описание варианта."
+        }
+      }
+    },
+    "assessmentTask": {
+      "type": "object",
+      "description": "Задание оценочного средства, включая необязательные баллы и вложенные подпункты.",
+      "additionalProperties": true,
+      "properties": {
+        "label": {
+          "type": "string",
+          "description": "Номер или обозначение задания."
+        },
+        "kind": {
+          "type": "string",
+          "description": "Тип задания в формулировке исходного документа."
+        },
+        "statement": {
+          "type": "string",
+          "description": "Формулировка задания."
+        },
+        "maxPoints": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Максимальное количество баллов за задание."
+        },
+        "subtasks": {
+          "type": "array",
+          "description": "Подзадачи или подпункты задания.",
+          "items": {
+            "$ref": "#/$defs/assessmentTask"
+          }
+        }
+      }
+    },
+    "gradingBand": {
+      "type": "object",
+      "description": "Элемент шкалы оценивания или критерий с необязательными границами баллов.",
+      "additionalProperties": true,
+      "properties": {
+        "minPoints": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Нижняя граница диапазона баллов."
+        },
+        "maxPoints": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Верхняя граница диапазона баллов."
+        },
+        "label": {
+          "type": "string",
+          "description": "Название уровня или отметки."
+        },
+        "criteria": {
+          "type": "string",
+          "description": "Критерии присвоения уровня или отметки."
+        },
+        "appliesTo": {
+          "type": "string",
+          "description": "Задание или часть работы, к которой относится критерий."
+        }
+      }
+    },
+    "assessmentPassportEntry": {
+      "type": "object",
+      "description": "Связь индикатора компетенции с одним или несколькими оценочными средствами.",
+      "additionalProperties": true,
+      "properties": {
+        "competencyCode": {
+          "type": "string",
+          "description": "Шифр компетенции."
+        },
+        "indicatorCode": {
+          "type": "string",
+          "description": "Шифр индикатора достижения компетенции."
+        },
+        "assessmentMaterialIds": {
+          "type": "array",
+          "description": "Идентификаторы оценочных средств, связанных с индикатором.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "assessmentTitles": {
+          "type": "array",
+          "description": "Названия оценочных средств, если у них нет идентификаторов.",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
