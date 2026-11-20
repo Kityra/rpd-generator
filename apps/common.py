@@ -14,7 +14,7 @@ from auth.settings import Settings
 from auth.user_repository import SqlUserRepository
 from auth.yandex_users import DirectoryError, YandexUserRepository
 from run_rpd import open_yandex
-from storage.database import make_engine
+from storage.database import DatabaseSetupError, ensure_schema, make_engine
 from web_preview import read_attachment
 
 
@@ -66,16 +66,20 @@ async def authenticated(roles, render):
 def portal(title, roles, render):
     st.title(title)
     try:
+        ensure_schema(Settings().app_database_url)
         asyncio.run(authenticated(roles, render))
-    except DirectoryError as error:
+    except (DirectoryError, DatabaseSetupError) as error:
         st.error(str(error))
     except ValidationError:
         st.error("Проверьте настройки приложения в .env, включая SESSION_SIGNING_KEY.")
     except SQLAlchemyError as error:
         cause = getattr(error, "orig", None)
         logging.error("Хранилище кабинета: %s (%s)", type(error).__name__, getattr(cause, "sqlite_errorname", type(cause).__name__))
-        st.error("База приложения недоступна. Проверьте подключение и миграцию Alembic.")
+        st.error("База приложения недоступна. Проверьте APP_DATABASE_URL в .env и доступ к файлу базы.")
     except (APIError, UnicodeError):
         st.error("Не удалось прочитать справочник пользователей в Yandex Cloud. Проверьте доступ и формат файла.")
     except (ValueError, PermissionError) as error:
         st.error(str(error))
+    except OSError as error:
+        logging.error("Файл базы приложения: %s", error)
+        st.error("Не удалось открыть файл базы приложения. Проверьте APP_DATABASE_URL в .env и права на папку data.")
