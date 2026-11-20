@@ -149,40 +149,54 @@ class YandexResilienceTests(DatabaseFixture, unittest.IsolatedAsyncioTestCase):
             query = '{"institution":"University","title":"Databases","year":"2026/2027"}'
             live = await evidence.search("university", query, owner_scope="owner")
             self.assertEqual([source.source_type for source in live], ["RPD"])
+            self.assertEqual(live.rpd_lookup["status"], "live")
             self.assertIn("Books", live.notices[0])
             self.client.vector_stores.search.side_effect = sdk_error(503)
             cached = await YandexEvidenceClient(self.settings).search("university", query, owner_scope="owner")
             self.assertEqual(cached[0], live[0])
+            self.assertEqual(cached.rpd_lookup["status"], "snapshot")
             self.assertTrue(any("снимок" in note for note in cached.notices))
-            with self.assertRaises(ExternalUnavailable):
-                await evidence.search("university", query.replace("2026/2027", "2027/2028"), owner_scope="owner")
-            with self.assertRaises(ExternalUnavailable):
-                await evidence.search("university", query, owner_scope="other-owner")
+            for search, owner in ((query.replace("2026/2027", "2027/2028"), "owner"), (query, "other-owner")):
+                miss = await evidence.search("university", search, owner_scope=owner)
+                self.assertEqual(miss, [])
+                self.assertEqual(miss.rpd_lookup["status"], "unavailable")
             other_scope = YandexEvidenceClient({**self.settings, "YANDEX_API_KEY": "other-fixture"})
-            with self.assertRaises(ExternalUnavailable):
-                await other_scope.search("university", query, owner_scope="owner")
+            self.assertEqual(await other_scope.search("university", query, owner_scope="owner"), [])
 
     @staticmethod
     def raise_unavailable():
         raise sdk_error(503)
 
-    def test_required_source_outage_blocks_document_generation(self):
+    def test_empty_source_is_distinct_and_outage_keeps_provisional_draft(self):
         request_data = {"discipline": "Database testing", "institution": "Test University", "academic_year": "2026"}
         # An earlier successful empty response does not supply evidence during an outage.
-        profile_search = run_rpd.PROFILES["university"].searches[0]
         self.client.vector_stores.search.return_value = SimpleNamespace(data=[])
-        with self.assertRaises(ExternalUnavailable):
-            yandex_calls.search_fragments(self.client, self.settings, "RPD", "rpd",
-                                          profile_search.query.format_map(request_data), profile_search.result_count,
-                                          scope=("local", request_data["institution"], "", request_data["discipline"],
-                                                 request_data["academic_year"]))
+        request = run_rpd.RpdRequest(**request_data)
+        live = run_rpd.request_rpd_materials(self.client, self.settings, request)
+        self.assertEqual(live["rpd_lookup"]["status"], "empty")
         self.client.vector_stores.search.side_effect = sdk_error(503)
-        self.client.responses.create.return_value = reply('{"query":""}')
-        graph = run_rpd.create_rpd_graph(self.client, self.settings)
-        with self.assertRaises(ExternalUnavailable):
-            graph.invoke({"request": request_data}, config={"configurable": {"thread_id": "outage"}})
-        self.assertNotIn("rpd_draft", [call.kwargs["text"]["format"]["name"]
-                                      for call in self.client.responses.create.call_args_list])
+        self.client.responses.create.return_value = reply(json.dumps({"document": {
+            "purposeAndTasks": {"goals": ["SQL"], "tasks": ["Indexing"]}, "workload": {"totalHours": 42},
+            "appendices": [{"title": "Предлагаемый тематический план", "content": "SQL"}]}}))
+        with patch.object(run_rpd, "collect_recent_articles", return_value=[]):
+            graph = run_rpd.create_rpd_graph(self.client, self.settings, draft_first=True)
+            result = graph.invoke({"request": request_data}, config={"configurable": {"thread_id": "outage"}})
+        self.assertTrue(result["ready"])
+        self.assertTrue(result["official_rpd_error"])
+        self.assertEqual(result["university"]["rpd_lookup"]["status"], "unavailable")
+        self.assertNotIn("workload", result["document"])
+
+        messages = []
+        with TemporaryDirectory() as location, patch.object(run_rpd, "yandex_settings", return_value=self.settings), \
+             patch.object(run_rpd, "open_yandex", return_value=nullcontext(self.client)), \
+             patch.object(run_rpd, "collect_recent_articles", return_value=[]), \
+             patch("builtins.print", side_effect=lambda *args, **kwargs: messages.extend(args)):
+            output = Path(location) / "blocked.json"
+            code = run_rpd.main(["--discipline", request.discipline, "--institution", request.institution,
+                                 "--year", request.academic_year, "--output", str(output)])
+            self.assertEqual(code, 1)
+            self.assertFalse(output.exists())
+            self.assertTrue(any("Экспорт РПД приостановлен" in message for message in messages))
 
     def test_document_and_final_prompt_report_original_snapshot_date(self):
         request = {"discipline": "Databases", "institution": "Test University", "academic_year": "2026/2027",
@@ -191,7 +205,7 @@ class YandexResilienceTests(DatabaseFixture, unittest.IsolatedAsyncioTestCase):
         query = search.query.format_map(request) + " Образовательная программа: Software Engineering."
         scope = ("local", request["institution"], request["program"], request["discipline"], request["academic_year"])
         hit = SimpleNamespace(file_id="fixture-plan", filename="plan.pdf", content=[
-            SimpleNamespace(type="text", text="Материалы по дисциплине Databases для 2026/2027")])
+            SimpleNamespace(type="text", text="Test University Software Engineering Databases 2026/2027")])
         self.client.vector_stores.search.return_value = SimpleNamespace(data=[hit])
         (saved,), _ = yandex_calls.search_fragments(self.client, self.settings, "RPD", "rpd", query,
                                                     search.result_count, scope=scope)
@@ -216,6 +230,7 @@ class YandexResilienceTests(DatabaseFixture, unittest.IsolatedAsyncioTestCase):
         snapshot_note = f"RPD: использован сохранённый снимок от {saved.retrieved_at:%Y-%m-%d %H:%M} UTC."
         self.assertIn(snapshot_note, payload["sourceNotices"])
         self.assertIn(snapshot_note, result["document"]["sourceNotes"])
+        self.assertEqual(result["official_rpd_error"], "")
 
 
 class ScienceResilienceTests(DatabaseFixture, unittest.TestCase):

@@ -96,6 +96,8 @@ def new_request(preview: PreviewSession) -> None:
 def download_package(batch: Batch) -> bytes:
     if not batch.tasks or any(task.document is None for task in batch.tasks):
         raise ValueError("Архив доступен, когда подготовлены РПД всех дисциплин.")
+    if any(task.official_rpd_error for task in batch.tasks):
+        raise ValueError("Экспорт РПД приостановлен до подтверждения официальных материалов по всем дисциплинам.")
     heading = [batch.title, f"Вуз — {batch.institution}", f"Учебный год — {batch.year}"]
     if batch.approved:
         heading.append("Курс утверждён в текущей сессии.")
@@ -199,8 +201,9 @@ def preview_requests(preview: PreviewSession) -> None:
     if batch.kind == "course":
         download, approve = st.columns(2)
         complete = count == len(batch.tasks)
-        download.download_button("Скачать отчёт и готовые РПД", download_package(batch) if complete else b"",
-                                 file_name="course-rpd.zip", mime="application/zip", disabled=not complete,
+        can_export = complete and all(not task.official_rpd_error for task in batch.tasks)
+        download.download_button("Скачать отчёт и готовые РПД", download_package(batch) if can_export else b"",
+                                 file_name="course-rpd.zip", mime="application/zip", disabled=not can_export,
                                  help="В архив входят отчёт и отдельная РПД для каждой дисциплины.")
         if approve.button("Утвердить курс", disabled=batch.approved or not complete,
                           help="Утверждает текущие версии РПД всех дисциплин."):
@@ -215,10 +218,19 @@ def preview_requests(preview: PreviewSession) -> None:
             if doc := task.document:
                 show_document(task)
                 outputs = st.columns(3)
-                outputs[0].download_button("Скачать JSON", json.dumps(doc, ensure_ascii=False, indent=2),
-                                           discipline_filename(task, index, "json"), "application/json", key=f"json_{task.id}")
-                outputs[1].download_button("Скачать TXT", readable_document(task),
-                                           discipline_filename(task, index, "txt"), "text/plain", key=f"txt_{task.id}")
+                if reason := task.official_rpd_error:
+                    st.warning(f"Экспорт РПД приостановлен. {reason}")
+                    if st.button("Перепроверить материалы РПД", key=f"official_{task.id}"):
+                        try:
+                            preview.recheck_official(task)
+                            st.rerun()
+                        except Exception as error:
+                            st.error(request_error(error))
+                else:
+                    outputs[0].download_button("Скачать JSON", json.dumps(doc, ensure_ascii=False, indent=2),
+                                               discipline_filename(task, index, "json"), "application/json", key=f"json_{task.id}")
+                    outputs[1].download_button("Скачать TXT", readable_document(task),
+                                               discipline_filename(task, index, "txt"), "text/plain", key=f"txt_{task.id}")
                 if outputs[2].button("Утвердить дисциплину", key=f"approve_{task.id}", disabled=task.approved):
                     task.approve()
                     st.rerun()

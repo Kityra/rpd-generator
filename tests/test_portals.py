@@ -18,10 +18,11 @@ from auth.yandex_users import accounts_from_text
 from domain.export import export_course
 from domain.schemas import EvidenceResults
 from orchestration.checkpointer import open_checkpointer
+from orchestration.evidence_cache import source_record
 from orchestration.graph import build_course_graph
 from storage.database import make_engine
-from storage.models import Base, Course, CourseVersion, ExpertInvitation, Interview, Notification, WorkflowCommand, now
-from storage.portal import acknowledge, assigned_interviews, create_course, decide, schedule_due
+from storage.models import Base, Course, CourseVersion, ExpertInvitation, Interview, Notification, SourceRow, WorkflowCommand, now
+from storage.portal import acknowledge, assigned_interviews, create_course, decide, recheck_official_rpd, schedule_due
 from storage.workflow import SqlWorkflowStore
 from test_course_architecture import program, records
 from workers.course_worker import process_next
@@ -34,9 +35,11 @@ def user(role, suffix=""):
 class Model:
     def __init__(self, gap):
         self.gap, self.relevance = gap, True
+        self.calls = []
 
     async def generate(self, output, prompt, payload, context, flash=False):
         name = output.__name__
+        self.calls.append(name)
         if name == "AgentReport":
             value = {"findings": []}
         elif name == "AppliedActivityModel":
@@ -79,6 +82,11 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         self.teacher = user("teacher")
         await create_course(self.factory, self.teacher, "course", {"title": "Курс", "institution": "Вуз", "year": "2026"}, [])
 
+    @staticmethod
+    def official_source(year="2026"):
+        return source_record("RPD", "https://example.org/study-plan", "Учебный план",
+                             f"Вуз. Курс. Базы данных. Учебный год {year}.")
+
     async def asyncTearDown(self):
         await self.engine.dispose()
         self.tmp.cleanup()
@@ -87,13 +95,15 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         # Новый saver и новый граф имитируют смену процесса между всеми действиями.
         async with open_checkpointer(self.checkpoint) as saver:
             graph = build_course_graph(self.settings, self.model, self.evidence, self.store, saver)
-            self.assertTrue(await process_next(self.engine, self.factory, graph))
+            self.assertTrue(await process_next(self.engine, self.factory, graph, self.evidence))
         async with self.factory() as db:
             return await db.get(Course, "course")
 
     async def test_direct_course_review_export_and_audit(self):
         notes = ["Books: использован сохранённый снимок."]
-        self.evidence.search.return_value = EvidenceResults(records().values(), notes)
+        official = self.official_source()
+        all_sources = {**records(), official.source_id: official}
+        self.evidence.search.return_value = EvidenceResults(all_sources.values(), notes)
         course = await self.process()
         self.assertEqual(course.status, "waiting_for_review")
         args = (self.factory, self.teacher, course.id, course.draft_version_id)
@@ -107,7 +117,7 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         active = course.active_version_id
         async with self.factory() as db:
             version = await db.get(CourseVersion, active)
-            archive = export_course(course.course_meta, version, {k: v.model_dump(mode="json") for k, v in records().items()})
+            archive = export_course(course.course_meta, version, {k: v.model_dump(mode="json") for k, v in all_sources.items()})
         with ZipFile(BytesIO(archive)) as package:
             rpd = json.loads(package.read("rpd/01/rpd.json"))
             self.assertEqual(rpd["workload"]["totalCredits"], 1)
@@ -133,10 +143,14 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_expert_then_teacher_revision(self):
         self.model.gap = True
+        professional_sources = [source for source in records().values() if source.source_type != "RPD"]
+        self.evidence.search.return_value = EvidenceResults(
+            professional_sources, rpd_lookup={"status": "unavailable", "reason": "Индекс РПД недоступен."})
         course = await self.process()
         self.assertEqual(course.status, "waiting_for_expert")
         async with self.factory() as db:
             interview = await db.scalar(select(Interview))
+            self.assertTrue(interview.gap_report["activity"]["tasks"])
         expert = user("expert")
         users = AsyncMock()
         users.get_by_id.return_value = expert
@@ -162,6 +176,37 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             await db.commit()
         self.assertEqual((await self.process()).draft_version_id, course.draft_version_id)
         self.assertEqual(sum(call.args[0] == "business" for call in self.evidence.search.call_args_list), 1)
+        version_id = course.draft_version_id
+        await decide(self.factory, self.teacher, course.id, version_id, "approve")
+        course = await self.process()
+        original_calls = self.model.calls[:]
+        async with self.factory() as db:
+            version = await db.get(CourseVersion, version_id)
+            self.assertEqual(version.content["official_audit"]["lookup"]["status"], "unavailable")
+            self.assertTrue(version.content["activity"]["tasks"])
+            with self.assertRaisesRegex(ValueError, "Экспорт РПД приостановлен"):
+                export_course(course.course_meta, version, {})
+
+        self.evidence.search.return_value = EvidenceResults([self.official_source("2025")])
+        await recheck_official_rpd(self.factory, self.teacher, course.id, version_id)
+        self.assertEqual((await self.process()).active_version_id, version_id)
+        async with self.factory() as db:
+            version = await db.get(CourseVersion, version_id)
+            self.assertEqual(version.content["official_audit"]["missing"], ["Базы данных"])
+
+        snapshot_note = "RPD: использован сохранённый снимок от 2026-11-21 09:00 UTC."
+        self.evidence.search.return_value = EvidenceResults([self.official_source()], [snapshot_note],
+            rpd_lookup={"status": "snapshot", "reason": ""})
+        await recheck_official_rpd(self.factory, self.teacher, course.id, version_id)
+        await self.process()
+        self.assertEqual(self.model.calls, original_calls)
+        async with self.factory() as db:
+            version = await db.get(CourseVersion, version_id)
+            sources = {row.source_id: row.record for row in (await db.scalars(select(SourceRow))).all()}
+            archive = export_course(course.course_meta, version, sources)
+            self.assertTrue((await db.get(Interview, interview.id)).gap_report["verification"])
+        with ZipFile(BytesIO(archive)) as package:
+            self.assertIn(snapshot_note, json.loads(package.read("rpd/01/rpd.json"))["sourceNotes"])
 
 
 class DirectoryTests(unittest.TestCase):

@@ -8,6 +8,7 @@ from langgraph.types import interrupt
 from pydantic import ValidationError
 
 from auth.settings import Settings
+from domain.official_rpd import course_audit
 from domain.schemas import (AppliedActivityModel, BusinessCourseAudit, CourseProgramModel, GapReport,
                             Grounded, InterviewTurn, Model, RelevanceDecision, SourceRecord, SubjectPlan,
                             VerificationReport, all_blocks, block_value)
@@ -90,7 +91,7 @@ class WorkflowStore(Protocol):
         """Идемпотентно создать интервью."""
 
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
-                         scheduled: bool, activity: dict, *, source_notices: list[str]) -> None:
+                         scheduled: bool, activity: dict, *, source_notices: list[str], official_audit: dict) -> None:
         """Сохранить версию и уведомление."""
 
     async def finish_review(self, course_id: str, version_id: str, action: str, actor: str, workloads=None) -> None:
@@ -151,8 +152,11 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             query = json.dumps(state["course_meta"], ensure_ascii=False, sort_keys=True)
             sources = await evidence.search(role, query, owner_scope=state["owner_user_id"])
             notices = getattr(sources, "notices", [])
+            rpd = {"rpd_lookup": getattr(sources, "rpd_lookup", None),
+                   "rpd_source_ids": [item.source_id for item in sources if item.source_type == "RPD"]
+                   } if role == "university" else {}
             if not sources:
-                return {f"{role}_report": {"findings": [], "source_notices": notices}, "sources": []}
+                return {f"{role}_report": {"findings": [], "source_notices": notices, **rpd}, "sources": []}
             source_map = {item.source_id: item for item in sources}
             instructions = prompts.AGENT.format(role=role)
             if role == "business" and any(item.source_type == SOURCE for item in sources):
@@ -165,7 +169,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             except ExternalUnavailable:
                 report = AgentReport(findings=[])
                 notices = [*notices, f"{role}: модель не сформировала сводку. Сохранены исходные материалы."]
-            return {f"{role}_report": {**report.model_dump(mode="json"), "source_notices": notices},
+            return {f"{role}_report": {**report.model_dump(mode="json"), "source_notices": notices, **rpd},
                     "sources": [item.model_dump(mode="json") for item in sources]}
         return run
 
@@ -272,7 +276,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                   "previous_interview_id": state.get("interview_session_id") if round_number else None,
                   "method_source_ids": [item.source_id for item in methods]}
         notices = list(dict.fromkeys([*state.get("interview_source_notices", []), *getattr(methods, "notices", [])]))
-        interview_id = await store.prepare_interview(state["request_id"], identifier, report)
+        interview_id = await store.prepare_interview(state["request_id"], identifier,
+                                                      {**report, "activity": state["applied_activity"]})
         await store.save_sources(state["request_id"], [*registry(state).values(), *methods])
         await store.set_status(state["request_id"], "waiting_for_expert", state["owner_user_id"])
         return {"interrupt_id": identifier, "interview_session_id": interview_id,
@@ -323,11 +328,16 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def persist_review(state: GraphState) -> dict:
         identifier = str(uuid5(NAMESPACE_URL, f"{state['request_id']}/{state['run_id']}/version/{state.get('review_iteration', 0)}"))
-        await store.save_sources(state["request_id"], list(registry(state).values()))
+        registered = registry(state)
+        await store.save_sources(state["request_id"], list(registered.values()))
         program = CourseProgramModel.model_validate(state["course_program"], context=context(state))
         scheduled = state.get("mode") == "relevance"
+        report = state.get("university_report", {})
+        official = course_audit(state["course_meta"], state["course_program"]["subjects"],
+                                (registered[key] for key in report.get("rpd_source_ids", []) if key in registered),
+                                report.get("rpd_lookup"))
         await store.save_draft(state["request_id"], identifier, program, scheduled, state["applied_activity"],
-                               source_notices=run_source_notices(state))
+                               source_notices=run_source_notices(state), official_audit=official)
         return {"version_id": identifier, "status": "pending_update_review" if scheduled else "waiting_for_review"}
 
     async def review(state: GraphState) -> dict:

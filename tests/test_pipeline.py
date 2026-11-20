@@ -39,11 +39,11 @@ def setUpModule():
     unittest.addModuleCleanup(cache.stop)
 
 
-def index_reply(index):
+def index_reply(index, query):
     if index != ENVIRONMENT["YANDEX_VECTOR_STORE_ID_RPD"]:
         return SimpleNamespace(data=[])
     return SimpleNamespace(data=[SimpleNamespace(file_id="rpd", filename="plan.pdf",
-        content=[SimpleNamespace(type="text", text="Учебный план 2026/2027")])])
+        content=[SimpleNamespace(type="text", text=query)])])
 
 
 def model_reply(value):
@@ -68,7 +68,10 @@ class RpdPipelineTests(unittest.TestCase):
     def setUp(self):
         self.schema = json.loads(SCHEMA.read_text(encoding="utf-8-sig"))
         self.config = {"configurable": {"thread_id": self.id()}}
-        self.research = MagicMock(return_value={"fragments": [], "findings": []})
+        self.research = MagicMock(side_effect=lambda role, request: {
+            "fragments": [{"file": "Учебный план", "index": "RPD",
+                           "text": f"{request.institution} {request.academic_year} {request.discipline}"}]
+            if role == "university" else [], "findings": []})
 
     def test_schema_and_source_roles(self):
         Draft202012Validator.check_schema(self.schema)
@@ -116,7 +119,7 @@ class RpdPipelineTests(unittest.TestCase):
 
     def test_cli_saves_one_valid_rpd_without_overwriting(self):
         client = MagicMock()
-        client.vector_stores.search.side_effect = lambda index, **_: index_reply(index)
+        client.vector_stores.search.side_effect = lambda index, **kwargs: index_reply(index, kwargs["query"])
         client.responses.create.side_effect = [model_reply('{"findings": []}'), model_reply(proposal())]
         with TemporaryDirectory() as directory:
             output = Path(directory) / "rpd.json"
@@ -201,7 +204,7 @@ class SciencePipelineTests(unittest.TestCase):
     def test_only_science_sees_article_cards_and_proposals_reach_rpd(self):
         settings = {**ENVIRONMENT, "YANDEX_VECTOR_STORE_ID_BOOKS": "books"}
         client = MagicMock()
-        client.vector_stores.search.side_effect = lambda index, **_: index_reply(index)
+        client.vector_stores.search.side_effect = lambda index, **kwargs: index_reply(index, kwargs["query"])
         article = science.Article("Relational database query optimization", 2026, "https://doi.org/10.1234/good",
                                   "published_candidate", doi="10.1234/good", authors=("Example Author",), citations=15,
                                   abstract="The evaluation compares physical query plans.")
@@ -288,7 +291,7 @@ class CoursePipelineTests(unittest.TestCase):
 
     def test_batch_saves_completed_documents_and_lists_unresolved_disciplines(self):
         client = MagicMock()
-        client.vector_stores.search.side_effect = lambda index, **_: index_reply(index)
+        client.vector_stores.search.side_effect = lambda index, **kwargs: index_reply(index, kwargs["query"])
         document = SimpleNamespace(incomplete_details=None, output=[], status="completed", output_text=proposal())
         incomplete = SimpleNamespace(incomplete_details=SimpleNamespace(reason="max_output_tokens"),
                                      output=[], status="incomplete", output_text="")

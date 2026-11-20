@@ -4,6 +4,9 @@ from datetime import datetime
 from hashlib import sha256
 from urllib.parse import quote
 
+from openai import APIResponseValidationError, APIStatusError
+
+from domain.official_rpd import RpdLookup
 from domain.schemas import SourceRecord, SourceType
 from orchestration.evidence_cache import ACADEMIC_TTL, MARKET_TTL, SnapshotEvidence, search_evidence, source_record
 from orchestration.resilience import EXTERNAL, ExternalUnavailable
@@ -46,13 +49,22 @@ def search_fragments(client, settings, index: SourceType, store_id: str, query: 
     if index == "Interview":
         return tuple(item.source for item in fetch()), None
     ttl = MARKET_TTL if index in {"HH", "Priklad"} else ACADEMIC_TTL
-    try:
-        fragments, taken_at = search_evidence(service, (scope, query, count), fetch, ttl=ttl)
-    except ExternalUnavailable as error:
-        if index == "RPD":
-            raise ExternalUnavailable("Индекс РПД недоступен, пригодного снимка нет.") from error
-        raise
-    if index == "RPD" and not fragments:
-        detail = "В снимке РПД" if taken_at is not None else "В индексе РПД"
-        raise ExternalUnavailable(f"{detail} нет материалов по этому запросу.")
+    fragments, taken_at = search_evidence(service, (scope, query, count), fetch, ttl=ttl)
     return tuple(item.source for item in fragments), taken_at
+
+
+def lookup_rpd(client, settings, query: str, count: int, **options
+               ) -> tuple[tuple[SourceRecord, ...], datetime | None, RpdLookup]:
+    store_id = settings.get("YANDEX_VECTOR_STORE_ID_RPD")
+    if not store_id:
+        return (), None, {"status": "unconfigured", "reason": "Индекс РПД не настроен."}
+    try:
+        fragments, taken_at = search_fragments(client, settings, "RPD", store_id, query, count, **options)
+    except (APIStatusError, APIResponseValidationError, ExternalUnavailable, InvalidIndexResponse) as error:
+        status = f" (HTTP {error.status_code})" if isinstance(error, APIStatusError) else ""
+        return (), None, {"status": "unavailable", "reason": f"Индекс РПД недоступен{status}, пригодного снимка нет."}
+    if not fragments:
+        if taken_at is not None:
+            return (), None, {"status": "unavailable", "reason": "В сохранённом снимке РПД нет материалов по запросу."}
+        return (), None, {"status": "empty", "reason": "Индекс РПД не вернул материалов по запросу."}
+    return fragments, taken_at, {"status": "snapshot" if taken_at is not None else "live", "reason": ""}

@@ -28,7 +28,10 @@ def web_proposal(*, edited=False, only_pedagogy=False):
 class WebPreviewTests(unittest.TestCase):
     def setUp(self):
         self.preview = PreviewSession()
-        self.research = MagicMock(return_value={"fragments": [], "findings": []})
+        self.research = MagicMock(side_effect=lambda role, request: {
+            "fragments": [{"file": "Учебный план", "index": "RPD", "text":
+                           f"{request.institution} {request.academic_year} {request.program} {request.discipline}"}]
+            if role == "university" else [], "findings": []})
         self.generate = MagicMock()
         for target, options in (
             ("web_preview.yandex_settings", {"return_value": {}}),
@@ -110,6 +113,28 @@ class WebPreviewTests(unittest.TestCase):
             self.assertIn("Тематический план".casefold(), plan.casefold())
             self.assertIn("часы и ЗЕТ", plan)
         self.assertTrue(all(task.approved for task in batch.tasks))
+
+    def test_source_recheck_unlocks_preview_without_regenerating(self):
+        self.research.side_effect = None
+        self.research.return_value = {"fragments": [], "findings": []}
+        self.generate.return_value = web_proposal()
+        batch_id = self.preview.create_batch("Информатика", "Вуз", "2026/2027",
+                                               [Discipline("Базы данных")], "", kind="course")
+        batch = self.preview.batches[batch_id]
+        task = batch.tasks[0]
+        self.preview.advance(task)
+        self.assertNotIn("workload", task.document)
+        with self.assertRaisesRegex(ValueError, "Экспорт РПД приостановлен"):
+            download_package(batch)
+        report = {"fragments": [{"file": "РПД", "index": "RPD",
+                                  "text": "Вуз Информатика Базы данных 2026/2027"}],
+                  "findings": [], "source_notices": ["RPD: использован сохранённый снимок."]}
+        with patch("web_preview.request_rpd_materials", return_value=report):
+            self.preview.recheck_official(task)
+        self.assertFalse(task.official_rpd_error)
+        self.assertEqual(self.generate.call_count, 1)
+        self.assertNotIn("workload", task.document)
+        self.assertTrue(download_package(batch))
 
     def test_network_binding_leaves_public_generation_unavailable(self):
         with patch("streamlit.get_option", return_value="0.0.0.0"):

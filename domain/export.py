@@ -7,6 +7,8 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from jsonschema import Draft202012Validator
 from sympy import Integer, Rational
 
+from domain.official_rpd import audit_block_reason, course_subject_matches
+
 HOURS = {"lectures": "Лекции", "practice": "Практика", "labs": "Лабораторные", "independent": "Самостоятельная работа"}
 REASONS = {"market_demand": "Спрос работодателей", "scientific_trend": "Научные результаты",
            "expert_practice": "Практика эксперта", "fundamental_core": "Фундаментальная подготовка",
@@ -71,12 +73,29 @@ def block_html(block, sources, level=2):
     return "\n".join(parts)
 
 
+def course_export_block(meta, content, sources):
+    audit = content.get("official_audit")
+    if reason := audit_block_reason(audit):
+        return reason
+    subject_sources = audit.get("subject_sources", {})
+    for subject in content["program"]["subjects"]:
+        records = [sources.get(key, {}) for key in subject_sources.get(subject["id"], [])]
+        if not records or any(record.get("source_type") != "RPD" or
+                              not course_subject_matches(meta, subject, record["title"], record["content"])
+                              for record in records):
+            return "В версии отсутствуют проверенные материалы РПД для всех дисциплин."
+    return ""
+
+
 def export_course(meta, version, sources):
     if version.status != "approved":
         raise ValueError("Экспорт доступен после утверждения версии.")
     content = version.content
+    if reason := course_export_block(meta, content, sources):
+        raise ValueError(f"Экспорт РПД приостановлен. {reason}")
     program = content["program"]
-    notices = content.get("source_notices", [])
+    audit = content["official_audit"]
+    notices = list(dict.fromkeys([*content.get("source_notices", []), *audit.get("notices", [])]))
     notices_html = ""
     if notices:
         items = "".join(f"<li>{escape(note)}</li>" for note in notices)
@@ -87,7 +106,8 @@ def export_course(meta, version, sources):
         def write_json(path, data):
             archive.writestr(path, json.dumps(data, ensure_ascii=False, indent=2))
         write_json("course.json", content)
-        write_json("sources.json", {k: sources[k] for k in sorted(set(used_sources(content)))})
+        official_ids = {key for ids in audit["subject_sources"].values() for key in ids}
+        write_json("sources.json", {k: sources[k] for k in sorted(set(used_sources(content)) | official_ids)})
         for index, subject in enumerate(program["subjects"], 1):
             tasks = [a for t in subject["topics"] for a in t["assignments"]]
             refs = [ref for b in [subject, *subject["topics"], *tasks] for ref in b["learning_references"]]

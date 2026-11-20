@@ -70,7 +70,7 @@ def discover_disciplines(
         query += f", {study_year} курс обучения"
     fragments = []
     searches = [
-        ("RPD", settings["YANDEX_VECTOR_STORE_ID_RPD"], query, 8),
+        ("RPD", settings.get("YANDEX_VECTOR_STORE_ID_RPD"), query, 8),
         ("Books", os.environ.get("YANDEX_VECTOR_STORE_ID_BOOKS", "").strip(),
          f"Современные учебные темы, учебники, технологии и практические задачи: {course}, {year}", 4),
     ]
@@ -81,9 +81,7 @@ def discover_disciplines(
             results, taken_at = search_fragments(client, settings, index, store_id, search, count,
                                                 scope=("local-course-plan", institution, course, year))
         except (APIStatusError, APIResponseValidationError, ExternalUnavailable, InvalidIndexResponse):
-            if index == "RPD":
-                raise
-            print("Books недоступен. Перечень формируется по результатам RPD.", file=sys.stderr)
+            print(f"Индекс {index} недоступен. Используются доступные материалы.", file=sys.stderr)
             continue
         if taken_at is not None:
             print(snapshot_notice(index, taken_at), file=sys.stderr)
@@ -203,9 +201,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.facts_dir and not args.facts_dir.is_dir():
         parser.error("--facts-dir должен указывать на существующую папку.")
     load_dotenv(run_rpd.ROOT / ".env", encoding="utf-8-sig", interpolate=False)
-    required = ("YANDEX_API_KEY", "YANDEX_FOLDER_ID", "YANDEX_MODEL_URI", "YANDEX_VECTOR_STORE_ID_RPD")
+    required = ("YANDEX_API_KEY", "YANDEX_FOLDER_ID", "YANDEX_MODEL_URI")
     settings = {name: os.environ.get(name, "").strip() for name in required}
-    missing = [name for name, value in settings.items() if not value]
+    settings.update(run_rpd.content_indexes())
+    missing = [name for name in required if not settings[name]]
     if missing:
         parser.error("Заполните .env: " + ", ".join(missing))
     if os.environ.get("YANDEX_BASE_URL", run_rpd.YANDEX_BASE_URL).strip().rstrip("/") != run_rpd.YANDEX_BASE_URL:

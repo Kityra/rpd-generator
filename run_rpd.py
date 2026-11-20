@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from check_yandex_indexes import content_indexes
 from orchestration.rabota_business import RabotaBusiness, SOURCE_GUIDANCE
 from orchestration.resilience import ExternalUnavailable, snapshot_notice
-from orchestration.yandex_calls import InvalidIndexResponse, model_response, search_fragments
+from orchestration.yandex_calls import InvalidIndexResponse, lookup_rpd, model_response, search_fragments
 from rpd_graph import RpdRequest, build_rpd_graph
 from rpd_specialists import PROFILE_SCHEMA, PROFILES, ProfileName, SourceFragment, SpecialistReport, analyse_fragments
 from science_literature import Article, find_course_articles, normalise_doi
@@ -80,7 +80,7 @@ def read_answer(prompt: str) -> str:
 def yandex_settings() -> dict[str, str]:
     load_dotenv(ROOT / ".env", encoding="utf-8-sig", interpolate=False)
     indexes = content_indexes()
-    required = ("YANDEX_API_KEY", "YANDEX_FOLDER_ID", "YANDEX_MODEL_URI", "YANDEX_VECTOR_STORE_ID_RPD")
+    required = ("YANDEX_API_KEY", "YANDEX_FOLDER_ID", "YANDEX_MODEL_URI")
     settings = {name: os.environ.get(name, "").strip() for name in required}
     settings.update(indexes)
     missing = [name for name in required if not settings[name]]
@@ -100,6 +100,21 @@ def yandex_settings() -> dict[str, str]:
 def open_yandex(settings: dict[str, str], timeout: float = 120):
     return OpenAI(api_key=settings["YANDEX_API_KEY"], project=settings["YANDEX_FOLDER_ID"],
                   base_url=YANDEX_BASE_URL, timeout=timeout, max_retries=0)
+
+
+def request_rpd_materials(client, settings, request: RpdRequest) -> SpecialistReport:
+    search = PROFILES["university"].searches[0]
+    query = search.query.format_map(request.model_dump())
+    if request.program:
+        query += f" Образовательная программа: {request.program}."
+    scope = ("local", request.institution, request.program, request.discipline, request.academic_year)
+    results, taken_at, lookup = lookup_rpd(client, settings, query, search.result_count, scope=scope, budget=20)
+    fragments = [SourceFragment(file=hit.title, text=hit.content, index="RPD",
+                                url=hit.url, retrieved_at=hit.retrieved_at.isoformat()) for hit in results]
+    notices = [lookup["reason"]] if lookup["reason"] else []
+    if taken_at is not None:
+        notices.append(snapshot_notice("RPD", taken_at))
+    return {"fragments": fragments, "findings": [], "source_notices": notices, "rpd_lookup": lookup}
 
 
 def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda message: None, checkpointer=None,
@@ -131,6 +146,7 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
         profile = PROFILES[name]
         fragments: list[SourceFragment] = []
         notices: list[str] = []
+        rpd: SpecialistReport = {"fragments": [], "findings": []}
 
         def note(message: str) -> None:
             notices.append(message)
@@ -138,24 +154,21 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
 
         fields = request.model_dump()
         for search in profile.searches:
+            if search.index == "RPD":
+                rpd = request_rpd_materials(client, settings, request)
+                fragments.extend(rpd["fragments"])
+                for message in rpd.get("source_notices", []):
+                    note(message)
+                continue
             index_id = settings.get(f"YANDEX_VECTOR_STORE_ID_{search.index.upper()}", "")
             if not index_id:
-                if search.required:
-                    raise ValueError(f"Обязательный индекс {search.index} не настроен.")
                 note(f"{profile.label}: индекс {search.index} пока не указан.")
                 continue
             query = search.query.format_map(fields)
-            scope = ("local",)
-            if search.required:
-                if request.program:
-                    query += f" Образовательная программа: {request.program}."
-                scope = ("local", request.institution, request.program, request.discipline, request.academic_year)
             try:
                 results, taken_at = search_fragments(client, settings, search.index, index_id,
-                                                    query, search.result_count, scope=scope, budget=20)
+                                                    query, search.result_count, budget=20)
             except (APIStatusError, APIResponseValidationError, ExternalUnavailable, InvalidIndexResponse):
-                if search.required:
-                    raise
                 note(f"{profile.label}: индекс {search.index} недоступен.")
                 continue
             if taken_at is not None:
@@ -191,7 +204,8 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
             return {"fragments": [], "findings": [], "source_notices": notices}
         except (APIStatusError, APIConnectionError, RuntimeError, ValidationError):
             note(f"{profile.label}: модель не сформировала краткий отчёт.")
-            return {"fragments": fragments if name == "university" else [], "findings": [], "source_notices": notices}
+            return {**rpd, "fragments": fragments if name == "university" else [], "findings": [],
+                    "source_notices": notices}
 
         notify(f"{profile.label}: найдено фрагментов — {len(fragments)}, "
                f"наблюдений — {len(report['findings'])}.")
@@ -209,6 +223,8 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
             report["fragments"] = fragments[:book_count]
             report["findings"] = [finding for finding in report["findings"] if finding["fragment"] <= book_count]
         report["source_notices"] = notices
+        if "rpd_lookup" in rpd:
+            report["rpd_lookup"] = rpd["rpd_lookup"]
         return report
 
     def generate(instructions: str, payload: str, response_schema: dict[str, Any]) -> str:
@@ -251,6 +267,9 @@ def main(argv: list[str] | None = None) -> int:
             config = {"configurable": {"thread_id": str(uuid4())}}
             result = graph.invoke({"request": request.model_dump()}, config=config)
 
+        if result.get("official_rpd_error"):
+            print(f"Экспорт РПД приостановлен. {result['official_rpd_error']}", file=sys.stderr)
+            return 1
         if result.get("__interrupt__"):
             print("Для интервью создайте курс в кабинете преподавателя.", file=sys.stderr)
             return 1

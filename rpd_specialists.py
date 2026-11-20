@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Callable, Literal, NotRequired, TypedDict
 
 from pydantic import BaseModel, ConfigDict, StrictInt
+from domain.official_rpd import RpdLookup
 
 
 class SourceFragment(TypedDict):
@@ -33,6 +34,7 @@ class SpecialistReport(TypedDict):
     findings: list[dict]
     articles: NotRequired[list["ArticleSuggestion"]]
     source_notices: NotRequired[list[str]]
+    rpd_lookup: NotRequired[RpdLookup]
 
 
 class ArticleSuggestion(TypedDict):

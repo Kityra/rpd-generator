@@ -140,7 +140,7 @@ class CourseBusinessTests(unittest.IsolatedAsyncioTestCase):
         async def open_saver(url):
             yield InMemorySaver()
 
-        async def process(engine, factory, graph):
+        async def process(engine, factory, graph, evidence):
             state = await graph.ainvoke(
                 {"request_id": "course", "run_id": "run", "owner_user_id": "owner", "mode": "create",
                  "course_meta": {"title": "Python", "institution": "Частные данные курса"}},

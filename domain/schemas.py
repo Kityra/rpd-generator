@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from domain.official_rpd import RpdLookup
 
 
 class Model(BaseModel):
@@ -36,9 +37,10 @@ class SourceRecord(Model):
 class EvidenceResults(list[SourceRecord]):
     """List of sources with backend notices about coverage and snapshot age."""
 
-    def __init__(self, records=(), notices=()):
+    def __init__(self, records=(), notices=(), *, rpd_lookup: RpdLookup | None = None):
         super().__init__(records)
         self.notices = list(notices)
+        self.rpd_lookup = rpd_lookup
 
 
 class Grounded(Model):

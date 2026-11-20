@@ -70,6 +70,23 @@ async def acknowledge(factory: async_sessionmaker[AsyncSession], actor: CurrentU
                          Notification.course_id == course_id, Notification.read_at.is_(None)).values(read_at=datetime.now(timezone.utc)))
 
 
+async def recheck_official_rpd(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str,
+                               version_id: str) -> None:
+    require_teacher(actor)
+    async with write_transaction(factory) as db:
+        course = await db.scalar(select(Course).where(Course.id == course_id, Course.owner_user_id == actor.id).with_for_update())
+        if course is None or version_id not in {course.draft_version_id, course.active_version_id}:
+            raise PermissionError("Версия курса недоступна.")
+        key = f"official-rpd:{version_id}"
+        command = await db.get(WorkflowCommand, key)
+        if command is None:
+            db.add(WorkflowCommand(id=key, course_id=course_id, kind="official_rpd",
+                                   payload={"version_id": version_id}))
+        elif command.status != "pending":
+            command.status = "pending"
+            command.created_at = datetime.now(timezone.utc)
+
+
 async def schedule_due(factory: async_sessionmaker[AsyncSession], at: datetime | None = None) -> int:
     at = at or datetime.now(timezone.utc)
     async with write_transaction(factory) as db:

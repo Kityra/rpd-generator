@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import logging
+import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,6 +11,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from auth.settings import Settings
+from domain.official_rpd import course_audit
 from orchestration.checkpointer import open_checkpointer
 from orchestration.clients import YandexEvidenceClient, YandexModelClient, source_record
 from orchestration.graph import build_course_graph
@@ -44,7 +46,41 @@ async def worker_lock(engine):
             yield True
 
 
-async def execute(graph, factory, cmd):
+async def audit_official_rpd(factory, evidence, cmd):
+    version_id = cmd.payload["version_id"]
+    async with factory() as db:
+        course = await db.get(Course, cmd.course_id)
+        if course is None or version_id not in {course.draft_version_id, course.active_version_id}:
+            return
+        version = await db.get(CourseVersion, version_id)
+        subjects = version.content["program"]["subjects"]
+        meta, owner = course.course_meta, course.owner_user_id
+
+    slots = asyncio.Semaphore(4)
+
+    async def search(subject):
+        # Keep each search scoped to the exact discipline and course.
+        query = json.dumps({**meta, "discipline": subject["title"]}, ensure_ascii=False, sort_keys=True)
+        async with slots:
+            return await evidence.search("official_rpd", query, owner_scope=owner)
+
+    results = await asyncio.gather(*(search(subject) for subject in subjects))
+    sources = {item.source_id: item for result in results for item in result if item.source_type == "RPD"}
+    audit = course_audit(meta, subjects, sources.values(), None)
+    audit["lookups"] = {subject["title"]: getattr(result, "rpd_lookup", None)
+                        for subject, result in zip(subjects, results)}
+    audit["notices"] = list(dict.fromkeys(note for result in results for note in getattr(result, "notices", [])))
+    await SqlWorkflowStore(factory).save_sources(cmd.course_id, list(sources.values()))
+    async with write_transaction(factory) as db:
+        course = await db.scalar(select(Course).where(Course.id == cmd.course_id).with_for_update())
+        if course and version_id in {course.draft_version_id, course.active_version_id}:
+            version = await db.get(CourseVersion, version_id)
+            version.content = {**version.content, "official_audit": audit}
+
+
+async def execute(graph, factory, cmd, evidence=None):
+    if cmd.kind == "official_rpd":
+        return await audit_official_rpd(factory, evidence, cmd)
     if cmd.kind in {"resume", "review"}:
         key = cmd.payload.get("interrupt_id") or cmd.payload["version_id"]
         return await resume_graph(graph, cmd.course_id, key, cmd.payload)
@@ -68,7 +104,7 @@ async def execute(graph, factory, cmd):
     return await graph.ainvoke(state, config)
 
 
-async def process_next(engine, factory, graph):
+async def process_next(engine, factory, graph, evidence=None):
     async with worker_lock(engine) as acquired:
         if not acquired:
             return False
@@ -79,14 +115,14 @@ async def process_next(engine, factory, graph):
             return False
         status = "done"
         try:
-            await execute(graph, factory, cmd)
+            await execute(graph, factory, cmd, evidence)
         except Exception as error:
             status = "failed"
             logging.error("Команда %s: %s", cmd.id, type(error).__name__)
         async with write_transaction(factory) as db:
             row = await db.get(WorkflowCommand, cmd.id)
             row.status = status
-            if status == "failed":
+            if status == "failed" and cmd.kind != "official_rpd":
                 course = await db.get(Course, cmd.course_id)
                 course.status = "failed"
         return True
@@ -105,7 +141,7 @@ async def run(once):
             graph = build_course_graph(settings, YandexModelClient(config), evidence,
                                        SqlWorkflowStore(factory), saver)
             while True:
-                worked = await process_next(engine, factory, graph)
+                worked = await process_next(engine, factory, graph, evidence)
                 if once:
                     return
                 if not worked:

@@ -11,7 +11,7 @@ from domain.schemas import (ActivityAspect, ActivityProcess, ActivityTask, Appli
                             Model, SourceRecord)
 from orchestration.evidence_cache import source_record
 from orchestration.resilience import ExternalUnavailable, snapshot_notice
-from orchestration.yandex_calls import InvalidIndexResponse, model_response, search_fragments
+from orchestration.yandex_calls import InvalidIndexResponse, lookup_rpd, model_response, search_fragments
 from run_rpd import ScientificSearch, collect_recent_articles, open_yandex, require_response_text
 
 
@@ -150,7 +150,7 @@ class YandexEvidenceClient:
     def _search(self, role: str, query: str, owner_scope: str) -> list[SourceRecord]:
         indexes = {
             "business": ("Priklad", "HH"), "books": ("Books",),
-            "university": ("RPD", "Books"), "interview": ("Interview",),
+            "university": ("RPD", "Books"), "official_rpd": ("RPD",), "interview": ("Interview",),
             "factcheck": ("Priklad", "HH", "Books"), "science": (),
         }
         if role not in indexes:
@@ -163,20 +163,23 @@ class YandexEvidenceClient:
 
         with open_yandex(self.settings) as client:
             for index in indexes[role]:
+                if index == "RPD":
+                    fragments, taken_at, records.rpd_lookup = lookup_rpd(
+                        client, self.settings, query, 4, scope=("portal", owner_scope, "university"))
+                    if records.rpd_lookup["reason"]:
+                        note(records.rpd_lookup["reason"])
+                    if taken_at is not None:
+                        note(snapshot_notice(index, taken_at))
+                    records.extend(fragments)
+                    continue
                 store = self.settings.get(f"YANDEX_VECTOR_STORE_ID_{index.upper()}")
                 if not store:
-                    if index == "RPD":
-                        raise ValueError("Обязательный индекс РПД не настроен.")
                     note(f"Индекс {index} не настроен.")
                     continue
                 try:
                     fragments, taken_at = search_fragments(client, self.settings, index, store, query, 4,
                                                           scope=("portal", owner_scope, role))
-                except (APIStatusError, APIResponseValidationError, ExternalUnavailable, InvalidIndexResponse) as error:
-                    if index == "RPD":
-                        reason = str(error) if isinstance(error, ExternalUnavailable) else type(error).__name__
-                        logger.warning("Поиск в обязательном индексе РПД остановлен: %s", reason)
-                        raise
+                except (APIStatusError, APIResponseValidationError, ExternalUnavailable, InvalidIndexResponse):
                     note(f"Индекс {index} недоступен.")
                     continue
                 if taken_at is not None:

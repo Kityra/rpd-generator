@@ -13,9 +13,9 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
-from rpd_graph import RpdRequest
+from rpd_graph import RpdRequest, official_rpd_error, remove_unconfirmed_fields
 from run_course import Discipline
-from run_rpd import create_rpd_graph, open_yandex, yandex_settings
+from run_rpd import create_rpd_graph, open_yandex, request_rpd_materials, yandex_settings
 
 
 UPLOAD_BYTES = 10 * 1024 * 1024
@@ -91,6 +91,7 @@ class Task:
     error: str | None = None
     version: int = 0
     approved: bool = False
+    official_rpd_error: str = "Официальные материалы ещё не проверены."
 
     def approve(self) -> None:
         if self.document is None:
@@ -204,7 +205,31 @@ class PreviewSession:
                 revision.applied = True
             task.status = "ready"
             task.error = None
+            task.official_rpd_error = result.get("official_rpd_error", task.official_rpd_error)
         except Exception as error:
             if task.document is None:
                 task.status = "error"
             task.error = request_error(error)
+
+    def recheck_official(self, task: Task) -> None:
+        if task.document is None:
+            raise ValueError("Сначала подготовьте черновик.")
+        settings = yandex_settings()
+        config = {"configurable": {"thread_id": task.id}}
+        with open_yandex(settings) as client:
+            report = request_rpd_materials(client, settings, task.request)
+            reason = official_rpd_error(task.request.model_dump(), report)
+            if not reason:
+                graph = create_rpd_graph(client, settings, checkpointer=self.checkpoint, draft_first=True)
+                previous = graph.get_state(config)
+                prior = previous.values.get("university", {})
+                other = [item for item in prior.get("fragments", []) if item.get("index") != "RPD"]
+                report["fragments"].extend(other)
+                if not previous.values:
+                    remove_unconfirmed_fields(task.document)
+                if notes := report.get("source_notices"):
+                    task.document["sourceNotes"] = list(dict.fromkeys([*task.document.get("sourceNotes", []), *notes]))
+                if previous.values and not previous.next:
+                    graph.update_state(config, {"university": report, "official_rpd_error": "",
+                                                "document": task.document}, as_node="draft")
+            task.official_rpd_error = reason

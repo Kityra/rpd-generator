@@ -5,9 +5,9 @@ import streamlit as st
 from sqlalchemy import select
 
 from apps.common import composer, portal
-from domain.export import HOURS, block_html, export_course
+from domain.export import HOURS, block_html, course_export_block, export_course
 from storage.models import Course, CourseVersion, Interview, Notification, SourceRow
-from storage.portal import acknowledge, create_course, decide, retry_command
+from storage.portal import acknowledge, create_course, decide, recheck_official_rpd, retry_command
 from storage.workflow import SqlWorkflowStore
 
 
@@ -98,7 +98,34 @@ async def course_detail(actor, settings, factory, users, course, notices):
         else:
             st.info("В справочнике нет экспертов.")
     version = draft or active
+    activity = version.content.get("activity") if version else None
+    if not activity and interviews:
+        activity = interviews[0].gap_report.get("activity")
+    if activity:
+        with st.expander("Модель прикладной деятельности"):
+            for task in activity.get("tasks", []):
+                st.write(task["title"])
+                if task.get("artifacts"):
+                    st.caption("Результаты: " + ", ".join(task["artifacts"]))
+
+    async def show_official_check(item):
+        if reason := course_export_block(course.course_meta, item.content, registry):
+            st.warning(f"Официальная проверка версии {item.revision} приостановлена. {reason}")
+            audit = item.content.get("official_audit") or {}
+            lookups = [audit.get("lookup"), *audit.get("lookups", {}).values()]
+            for detail in dict.fromkeys(entry["reason"] for entry in lookups if entry and entry.get("reason")):
+                st.caption(detail)
+            if st.button("Перепроверить материалы РПД", key=f"official-rpd-{item.id}"):
+                await recheck_official_rpd(factory, actor, course.id, item.id)
+                st.info("Проверка поставлена в очередь. Результат появится после обновления статуса.")
+            return False
+        for note in (item.content.get("official_audit") or {}).get("notices", []):
+            st.caption(note)
+        return True
+
+    export_available = False
     if version:
+        export_available = await show_official_check(version)
         program = version.content["program"]
         st.subheader(f"Программа курса · версия {version.revision}")
         for subject in program["subjects"]:
@@ -128,8 +155,11 @@ async def course_detail(actor, settings, factory, users, course, notices):
             await decide(factory, actor, course.id, draft.id, "revise", *change)
             st.rerun()
     if active:
-        st.download_button(f"Скачать утверждённую версию {active.revision} · ZIP",
-                           export_course(course.course_meta, active, registry), f"course-v{active.revision}.zip", "application/zip")
+        if draft:
+            export_available = await show_official_check(active)
+        if export_available:
+            st.download_button(f"Скачать утверждённую версию {active.revision} · ZIP",
+                               export_course(course.course_meta, active, registry), f"course-v{active.revision}.zip", "application/zip")
         if course.next_audit_at:
             st.caption(f"Следующий аудит — {course.next_audit_at:%d.%m.%Y}")
     if course.status == "failed" and st.button("Повторить обработку"):
