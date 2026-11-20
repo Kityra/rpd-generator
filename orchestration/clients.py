@@ -2,13 +2,16 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
 from typing import Any, Protocol, TypeVar
 
-from openai import APIConnectionError, InternalServerError, RateLimitError
+from openai import APIResponseValidationError, APIStatusError
 from pydantic import BaseModel, ValidationError, ValidationInfo, model_validator
 
-from domain.schemas import ActivityAspect, ActivityProcess, ActivityTask, AppliedActivityModel, Model, SourceRecord
+from domain.schemas import (ActivityAspect, ActivityProcess, ActivityTask, AppliedActivityModel, EvidenceResults,
+                            Model, SourceRecord)
+from orchestration.evidence_cache import source_record
+from orchestration.resilience import ExternalUnavailable, snapshot_notice
+from orchestration.yandex_calls import InvalidIndexResponse, model_response, search_fragments
 from run_rpd import ScientificSearch, collect_recent_articles, open_yandex, require_response_text
 
 
@@ -43,7 +46,7 @@ class ModelClient(Protocol):
 
 
 class EvidenceClient(Protocol):
-    async def search(self, role: str, query: str) -> list[SourceRecord]:
+    async def search(self, role: str, query: str, *, owner_scope: str = "") -> list[SourceRecord]:
         """Получить проверяемые записи из реальных источников."""
 
 
@@ -76,6 +79,8 @@ def grounded_schema(output, context):
             props["source_id"]["enum"] = allowed
         if "task_ids" in props and context.get("task_ids"):
             props["task_ids"]["items"]["enum"] = context["task_ids"]
+        if "activity_task_ids" in props and context.get("activity"):
+            props["activity_task_ids"]["items"]["enum"] = [task.id for task in context["activity"].tasks]
     return schema
 
 
@@ -121,12 +126,13 @@ class YandexModelClient:
         request = payload
         with open_yandex(self.settings) as client:
             for attempt in range(2):
-                response = client.responses.create(
+                response = model_response(client, self.settings,
                     model=model, instructions=prompt,
                     input=json.dumps(request, ensure_ascii=False),
                     text={"format": {"type": "json_schema", "name": output.__name__,
                                      "schema": grounded_schema(output, context), "strict": True}},
                     max_output_tokens=8192 if flash else 16384, store=False,
+                    budget=45 if flash else 120,
                 )
                 raw = require_response_text(response)
                 try:
@@ -140,21 +146,14 @@ class YandexModelClient:
         raise RuntimeError("Не удалось проверить структурированный ответ.")
 
 
-def source_record(kind: str, url: str, title: str, content: str) -> SourceRecord:
-    digest = hashlib.sha256(content.encode()).hexdigest()
-    key = kind + "-" + hashlib.sha256(f"{kind}\n{url}\n{digest}".encode()).hexdigest()[:20]
-    return SourceRecord(source_id=key, source_type=kind, url=url, title=title,
-                        retrieved_at=datetime.now(timezone.utc), raw_hash=digest, content=content)
-
-
 class YandexEvidenceClient:
     def __init__(self, settings: dict[str, str]) -> None:
         self.settings = settings
 
-    async def search(self, role: str, query: str) -> list[SourceRecord]:
-        return await asyncio.to_thread(self._search, role, query)
+    async def search(self, role: str, query: str, *, owner_scope: str = "") -> list[SourceRecord]:
+        return await asyncio.to_thread(self._search, role, query, owner_scope)
 
-    def _search(self, role: str, query: str) -> list[SourceRecord]:
+    def _search(self, role: str, query: str, owner_scope: str) -> list[SourceRecord]:
         indexes = {
             "business": ("Priklad", "HH"), "books": ("Books",),
             "university": ("RPD", "Books"), "interview": ("Interview",),
@@ -162,35 +161,44 @@ class YandexEvidenceClient:
         }
         if role not in indexes:
             raise ValueError(f"Неизвестная роль поиска {role}.")
-        records = []
+        records = EvidenceResults()
+
+        def note(message: str) -> None:
+            records.notices.append(message)
+            logger.warning("%s", message)
+
         with open_yandex(self.settings) as client:
-            search_client = client.with_options(max_retries=2) if role == "factcheck" else client
             for index in indexes[role]:
                 store = self.settings.get(f"YANDEX_VECTOR_STORE_ID_{index.upper()}")
                 if not store:
-                    raise ValueError(f"Для {role} требуется индекс {index}.")
-                try:
-                    result = search_client.vector_stores.search(store, query=query, max_num_results=4, timeout=30)
-                except (APIConnectionError, InternalServerError, RateLimitError) as error:
-                    if role != "factcheck":
-                        raise
-                    logger.warning("Индекс %s временно недоступен для проверки ответа: %s",
-                                   index, getattr(error, "status_code", type(error).__name__))
+                    if index == "RPD":
+                        raise ValueError("Обязательный индекс РПД не настроен.")
+                    note(f"Индекс {index} не настроен.")
                     continue
-                for hit in result.data:
-                    text = "\n".join(part.text for part in hit.content if part.type == "text" and part.text)
-                    if text.strip():
-                        records.append(source_record(index, f"https://ai.api.cloud.yandex.net/v1/files/{hit.file_id}",
-                                                     hit.filename, text[:6000]))
+                try:
+                    fragments, taken_at = search_fragments(client, self.settings, index, store, query, 4,
+                                                          scope=("portal", owner_scope, role))
+                except (APIStatusError, APIResponseValidationError, ExternalUnavailable, InvalidIndexResponse) as error:
+                    if index == "RPD":
+                        reason = str(error) if isinstance(error, ExternalUnavailable) else type(error).__name__
+                        logger.warning("Поиск в обязательном индексе РПД остановлен: %s", reason)
+                        raise
+                    note(f"Индекс {index} недоступен.")
+                    continue
+                if taken_at is not None:
+                    note(snapshot_notice(index, taken_at))
+                records.extend(fragments)
             if role == "science":
                 def plan(prompt: str, subject: str) -> str:
-                    response = client.responses.create(
+                    response = model_response(client, self.settings,
                         model=f"gpt://{self.settings['YANDEX_FOLDER_ID']}/aliceai-llm-flash",
-                        instructions=prompt, input=subject, store=False, max_output_tokens=384,
+                        instructions=prompt, input=subject, store=False, max_output_tokens=384, budget=20,
                         text={"format": {"type": "json_schema", "name": "search", "strict": True,
                                          "schema": output_schema(ScientificSearch.model_json_schema())}})
                     return require_response_text(response)
-                for article in collect_recent_articles(query, plan, logger.warning):
+                for article in collect_recent_articles(query, plan, note):
                     records.append(source_record("arXiv" if article.status == "arxiv_candidate" else "Crossref",
-                                                 article.url, article.title, str(article.as_science_source(include_abstract=True))))
+                                                 article.url, article.title, article.as_science_source(
+                                                     include_abstract=True, include_snapshot_notice=False)["text"],
+                                                 retrieved_at=article.retrieved_at))
         return records

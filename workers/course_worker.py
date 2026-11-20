@@ -11,11 +11,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from auth.settings import Settings
 from orchestration.checkpointer import open_checkpointer
-from orchestration.clients import YandexEvidenceClient, YandexModelClient
+from orchestration.clients import YandexEvidenceClient, YandexModelClient, source_record
 from orchestration.graph import build_course_graph
+from orchestration.rabota_business import BusinessEvidenceClient, RabotaBusiness
 from orchestration.resume import resume_graph
 from run_rpd import yandex_settings
-from storage.database import make_engine, write_transaction
+from storage.database import DatabaseSetupError, ensure_schema, make_engine, write_transaction
 from storage.models import Course, CourseVersion, WorkflowCommand
 from storage.workflow import SqlWorkflowStore
 
@@ -98,7 +99,10 @@ async def run(once):
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with open_checkpointer(settings.checkpoint_url) as saver:
-            graph = build_course_graph(settings, YandexModelClient(config), YandexEvidenceClient(config),
+            evidence = YandexEvidenceClient(config)
+            if rabota := RabotaBusiness.from_environment():
+                evidence = BusinessEvidenceClient(evidence, rabota, source_record)
+            graph = build_course_graph(settings, YandexModelClient(config), evidence,
                                        SqlWorkflowStore(factory), saver)
             while True:
                 worked = await process_next(engine, factory, graph)
@@ -113,4 +117,9 @@ async def run(once):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--once", action="store_true")
-    asyncio.run(run(parser.parse_args().once))
+    arguments = parser.parse_args()
+    try:
+        ensure_schema(Settings().app_database_url)
+    except DatabaseSetupError as error:
+        raise SystemExit(str(error))
+    asyncio.run(run(arguments.once))

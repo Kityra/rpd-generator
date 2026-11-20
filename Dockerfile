@@ -13,6 +13,7 @@ COPY *.py final_schema.json ./
 COPY auth/ auth/
 COPY domain/ domain/
 COPY orchestration/ orchestration/
+COPY rabota_it/ rabota_it/
 COPY storage/ storage/
 COPY apps/ apps/
 COPY workers/ workers/

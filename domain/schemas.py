@@ -9,8 +9,8 @@ class Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-SourceType = Literal["HH", "Priklad", "Crossref", "arXiv", "Books", "RPD", "Interview", "expert", "teacher", "documentation"]
-INDEPENDENT_EXPERT_SOURCE_TYPES = frozenset({"HH", "Priklad", "Books", "Crossref", "arXiv", "documentation"})
+SourceType = Literal["HH", "Priklad", "Crossref", "arXiv", "Books", "RPD", "Interview", "expert", "teacher", "documentation", "RabotaRu"]
+INDEPENDENT_EXPERT_SOURCE_TYPES = frozenset({"HH", "Priklad", "Books", "Crossref", "arXiv", "documentation", "RabotaRu"})
 ChangeStatus = Literal["unchanged", "added", "modified", "fundamental_protected"]
 GapType = Literal["missing_tasks", "missing_stack", "missing_quality_criteria", "missing_artifacts", "conflicting_evidence"]
 
@@ -32,6 +32,14 @@ class SourceRecord(Model):
         if parsed.scheme not in {"https", "http"} or not parsed.hostname or parsed.username or parsed.password:
             raise ValueError("Нужен абсолютный HTTP(S) URL без учётных данных.")
         return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", parsed.query, ""))
+
+
+class EvidenceResults(list[SourceRecord]):
+    """List of sources with backend notices about coverage and snapshot age."""
+
+    def __init__(self, records=(), notices=()):
+        super().__init__(records)
+        self.notices = list(notices)
 
 
 class Grounded(Model):

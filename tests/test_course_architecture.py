@@ -5,13 +5,11 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import bcrypt
-import httpx
 from argon2 import PasswordHasher
 from langgraph.types import Command
-from openai import InternalServerError
 from pydantic import ValidationError
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -24,6 +22,7 @@ from domain.schemas import CourseProgramModel, ExpertClaimVerification, Intervie
 from orchestration.checkpointer import open_checkpointer
 from orchestration.clients import YandexEvidenceClient
 from orchestration.graph import build_course_graph
+from orchestration.resilience import ExternalUnavailable
 from storage.models import Base, Course, CourseVersion, WorkflowCommand
 from storage.workflow import SqlWorkflowStore
 
@@ -62,19 +61,15 @@ class SchemaTests(unittest.TestCase):
             ExpertClaimVerification.model_validate(dict(claim, verification_status="verified"), context=context)
 
     @patch("orchestration.clients.open_yandex")
-    def test_factcheck_continues_if_one_index_fails(self, open_client):
-        client = open_client.return_value.__enter__.return_value
-        search = client.with_options.return_value.vector_stores.search
-        request = httpx.Request("POST", "https://ai.api.cloud.yandex.net/v1/vector_stores/test/search")
-        error = InternalServerError("Search failed", response=httpx.Response(500, request=request), body=None)
-        result = MagicMock(data=[MagicMock(file_id="f", filename="source.txt",
-                                            content=[MagicMock(type="text", text="Evidence")])])
-        search.side_effect = [error, result, result]
+    @patch("orchestration.clients.search_fragments")
+    def test_factcheck_continues_if_one_index_fails(self, search, open_client):
+        sources = records()
+        search.side_effect = [ExternalUnavailable("HTTP 500"), ((sources["HH"],), None), ((sources["Books"],), None)]
         settings = {f"YANDEX_VECTOR_STORE_ID_{name}": name for name in ("PRIKLAD", "HH", "BOOKS")}
         with self.assertLogs("orchestration.clients", level="WARNING"):
-            sources = YandexEvidenceClient(settings)._search("factcheck", "ML-инженерия")
-        client.with_options.assert_called_once_with(max_retries=2)
-        self.assertEqual([source.source_type for source in sources], ["HH", "Books"])
+            found = YandexEvidenceClient(settings)._search("factcheck", "ML-инженерия", "teacher")
+        self.assertEqual([source.source_type for source in found], ["HH", "Books"])
+        self.assertEqual(found.notices, ["Индекс Priklad недоступен."])
 
     def test_supported_password_formats(self):
         password = "test-password"
@@ -207,7 +202,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_graph_persists_interrupt_and_resumes_without_agents_repeated(self):
         source_map = records()
         evidence = AsyncMock()
-        evidence.search.side_effect = lambda role, query: list(source_map.values())
+        evidence.search.side_effect = lambda role, query, **kwargs: list(source_map.values())
         llm = AsyncMock()
         activity_calls = 0
         audit_calls = 0

@@ -14,6 +14,8 @@ from domain.schemas import (AppliedActivityModel, BusinessCourseAudit, CoursePro
 from orchestration.clients import EvidenceClient, ModelClient, NoActivityEvidence, source_record
 from orchestration import prompts
 from orchestration.interview_methods import load_interview_methods
+from orchestration.rabota_business import SOURCE, SOURCE_GUIDANCE
+from orchestration.resilience import ExternalUnavailable
 from run_rpd import YandexModeratedResponse
 
 
@@ -43,6 +45,8 @@ class GraphState(TypedDict, total=False):
     science_report: dict
     books_report: dict
     university_report: dict
+    interview_source_notices: list[str]
+    factcheck_source_notices: list[str]
     applied_activity: dict
     gap_report: dict
     interview_session_id: str
@@ -70,6 +74,13 @@ class AgentReport(Model):
     findings: list[Finding]
 
 
+def run_source_notices(state: GraphState) -> list[str]:
+    notices = [note for role in ("business", "science", "books", "university")
+               for note in state.get(f"{role}_report", {}).get("source_notices", [])]
+    return list(dict.fromkeys([*notices, *state.get("interview_source_notices", []),
+                               *state.get("factcheck_source_notices", [])]))
+
+
 class WorkflowStore(Protocol):
     async def set_status(self, course_id: str, status: str, owner: str) -> None:
         """Сохранить статус с проверкой владельца."""
@@ -81,7 +92,7 @@ class WorkflowStore(Protocol):
         """Идемпотентно создать интервью."""
 
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
-                         scheduled: bool, activity: dict, evidence_gaps: dict) -> None:
+                         scheduled: bool, activity: dict, *, evidence_gaps: dict, source_notices: list[str]) -> None:
         """Сохранить версию и уведомление."""
 
     async def finish_review(self, course_id: str, version_id: str, action: str, actor: str, workloads=None) -> None:
@@ -98,11 +109,22 @@ def registry(state: GraphState) -> dict[str, SourceRecord]:
     return {item["source_id"]: SourceRecord.model_validate(item) for item in state.get("sources", [])}
 
 
+def planned_subjects(state: GraphState) -> list[dict]:
+    suggestions = state.get("auto_subjects", {}).get("subjects", [])
+    if not state.get("gap_report", {}).get("gap_types"):
+        return suggestions
+    # Первый черновик оставляет место для решения преподавателя о расширении программы.
+    unique = {}
+    for subject in suggestions:
+        unique.setdefault(" ".join(subject["name"].casefold().split()), subject)
+    return sorted(unique.values(), key=lambda subject: not subject["is_fundamental"])[:5]
+
+
 def context(state: GraphState) -> dict:
     result: dict = {"sources": registry(state), "manual_subjects": state.get("manual_subjects", []),
                     "allow_incomplete_activity": bool(state.get("gap_report", {}).get("gap_types")),
                     "market_measurements": {}, "fundamental_subjects": [
-                        subject["name"] for subject in state.get("auto_subjects", {}).get("subjects", [])
+                        subject["name"] for subject in planned_subjects(state)
                         if subject["is_fundamental"]]}
     if state.get("applied_activity"):
         result["activity"] = AppliedActivityModel.model_validate(state["applied_activity"], context=result)
@@ -125,6 +147,9 @@ def payload(state: GraphState) -> dict:
         # В генерацию попадает описание пробелов без вопросов, цитирующих неподтверждённый ответ.
         report = result["gap_report"]
         result["gap_report"] = {key: report[key] for key in ("gap_types", "business_coverage", "science_coverage") if key in report}
+        if report.get("gap_types"):
+            result["auto_subjects"] = {"subjects": planned_subjects(state)}
+            result["sources"] = [{**source, "content": source["content"][:1800]} for source in state.get("sources", [])]
     baseline = context(state).get("baseline")
     if baseline:
         result["previous_values"] = {key: block_value(block) for key, block in all_blocks(baseline.subjects).items()}
@@ -139,20 +164,30 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         await store.set_status(state["request_id"], "agents_running", state["owner_user_id"])
         return {"status": "agents_running", "interview_round": 0, "review_iteration": 0,
                 "interview_answers": [], "review_feedback": [], "revision_baseline": None,
+                "interview_source_notices": [], "factcheck_source_notices": [],
                 "applied_activity": {}, "gap_report": {}, "verification": {}, "auto_subjects": {},
                 "course_program": {}, "consumed_review_id": "", "closed_interview_id": "", "version_id": ""}
 
     def agent(role: str):
         async def run(state: GraphState) -> dict:
-            query = json.dumps(state["course_meta"], ensure_ascii=False)
-            sources = await evidence.search(role, query)
+            query = json.dumps(state["course_meta"], ensure_ascii=False, sort_keys=True)
+            sources = await evidence.search(role, query, owner_scope=state["owner_user_id"])
+            notices = getattr(sources, "notices", [])
             if not sources:
-                return {f"{role}_report": {"findings": []}, "sources": []}
+                return {f"{role}_report": {"findings": [], "source_notices": notices}, "sources": []}
             source_map = {item.source_id: item for item in sources}
-            report = await llm.generate(AgentReport, prompts.AGENT.format(role=role),
-                                        {"course": state["course_meta"], "sources": [item.model_dump(mode="json") for item in sources]},
-                                        {"sources": source_map}, flash=True)
-            return {f"{role}_report": report.model_dump(mode="json"),
+            instructions = prompts.AGENT.format(role=role)
+            if role == "business" and any(item.source_type == SOURCE for item in sources):
+                instructions += "\n" + SOURCE_GUIDANCE
+            try:
+                report = await llm.generate(AgentReport, instructions,
+                                            {"course": state["course_meta"],
+                                             "sources": [item.model_dump(mode="json") for item in sources],
+                                             "source_notices": notices}, {"sources": source_map}, flash=True)
+            except ExternalUnavailable:
+                report = AgentReport(findings=[])
+                notices = [*notices, f"{role}: модель не сформировала сводку. Сохранены исходные материалы."]
+            return {f"{role}_report": {**report.model_dump(mode="json"), "source_notices": notices},
                     "sources": [item.model_dump(mode="json") for item in sources]}
         return run
 
@@ -167,13 +202,16 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def formalize(state: GraphState) -> dict:
         sources = {k: s for k, s in registry(state).items()
-                   if s.source_type in {"Priklad", "HH", "Crossref", "arXiv", "expert", "documentation"}}
+                   if s.source_type in {"Priklad", "HH", "Crossref", "arXiv", "expert", "documentation", SOURCE}}
         if not sources:
             return {"applied_activity": {}}
         activity_input = {"course": state["course_meta"], "business": state["business_report"],
                           "science": state["science_report"], "sources": [s.model_dump(mode="json") for s in sources.values()]}
         try:
-            model = await llm.generate(AppliedActivityModel, prompts.ACTIVITY, activity_input, {"sources": sources})
+            instructions = prompts.ACTIVITY
+            if any(source.source_type == SOURCE for source in sources.values()):
+                instructions += "\n" + SOURCE_GUIDANCE
+            model = await llm.generate(AppliedActivityModel, instructions, activity_input, {"sources": sources})
         except NoActivityEvidence:
             return {"applied_activity": {}}
         return {"applied_activity": model.model_dump(mode="json")}
@@ -196,7 +234,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         def coverage(types: set[str]) -> float:
             return sum(any(sources[key].source_type in types for key in task.source_ids)
                        for task in activity.tasks) / max(count, 1)
-        business = coverage({"HH", "Priklad"})
+        business = coverage({"HH", "Priklad", SOURCE})
         science = coverage({"Crossref", "arXiv"})
         gaps, questions = [], []
         if count < 5 or len(activity.processes) < 3:
@@ -228,7 +266,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         if round_number:
             return {"status": "designing"}
         identifier = str(uuid5(NAMESPACE_URL, f"{state['request_id']}/{state['run_id']}/interview/{round_number}"))
-        methods = await evidence.search("interview", json.dumps(state["gap_report"], ensure_ascii=False))
+        methods = await evidence.search("interview", json.dumps(state["gap_report"], ensure_ascii=False),
+                                        owner_scope=state["owner_user_id"])
         local_skill = load_interview_methods(settings.interview_skill_directory, state["gap_report"]["gap_types"])
         skill = (local_skill + "\n\n" + "\n\n".join(item.content for item in methods))[:18000]
         try:
@@ -253,11 +292,12 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                   "question_origin": question_origin,
                   "previous_interview_id": state.get("interview_session_id") if round_number else None,
                   "method_source_ids": [item.source_id for item in methods]}
+        notices = list(dict.fromkeys([*state.get("interview_source_notices", []), *getattr(methods, "notices", [])]))
         interview_id = await store.prepare_interview(state["request_id"], identifier, report)
         await store.save_sources(state["request_id"], [*registry(state).values(), *methods])
         await store.set_status(state["request_id"], "waiting_for_expert", state["owner_user_id"])
         return {"interrupt_id": identifier, "interview_session_id": interview_id,
-                "gap_report": report, "status": "waiting_for_expert"}
+                "gap_report": report, "status": "waiting_for_expert", "interview_source_notices": notices}
 
     async def interview(state: GraphState) -> dict:
         answer = interrupt({"interrupt_id": state["interrupt_id"], "interview_session_id": state["interview_session_id"],
@@ -276,7 +316,9 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     async def factcheck(state: GraphState) -> dict:
         answer = state["interview_answers"][-1]
         topic = " ".join(state["course_meta"]["title"].split())[:300]
-        fresh = await evidence.search("factcheck", f"{topic}: рабочие задачи, инструменты, результаты и критерии качества")
+        fresh = await evidence.search("factcheck", f"{topic}: рабочие задачи, инструменты, результаты и критерии качества",
+                                      owner_scope=state["owner_user_id"])
+        notices = getattr(fresh, "notices", [])
         combined = merge_records(state.get("sources", []), [item.model_dump(mode="json") for item in fresh])
         independent = {item["source_id"]: SourceRecord.model_validate(item) for item in combined
                        if item["source_type"] in INDEPENDENT_EXPERT_SOURCE_TYPES}
@@ -286,7 +328,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                                          "sources": [item.model_dump(mode="json") for item in independent.values()]},
                                         {"sources": independent}, flash=True)
             report = result.model_dump(mode="json")
-        except (ValidationError, YandexModeratedResponse):
+        except (ValidationError, YandexModeratedResponse, ExternalUnavailable):
             report = {"claims": [], "assessment": "unavailable"}
         verified = [claim["claim"] for claim in report["claims"] if claim["verification_status"] == "verified"]
         records = [source_record("expert", f"{settings.public_origin}/teacher?course={state['request_id']}&interview={state['interview_session_id']}",
@@ -294,6 +336,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         await store.save_sources(state["request_id"], [*fresh, *records])
         await store.record_verification(state["interview_session_id"], report)
         return {"verification": report,
+                "factcheck_source_notices": list(dict.fromkeys([*state.get("factcheck_source_notices", []), *notices])),
                 "sources": [item.model_dump(mode="json") for item in [*fresh, *records]]}
 
     async def design(state: GraphState) -> dict:
@@ -321,7 +364,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         scheduled = state.get("mode") == "relevance"
         gaps = state["gap_report"]
         evidence_gaps = {key: gaps[key] for key in ("gap_types", "business_coverage", "science_coverage") if key in gaps}
-        await store.save_draft(state["request_id"], identifier, program, scheduled, state["applied_activity"], evidence_gaps)
+        await store.save_draft(state["request_id"], identifier, program, scheduled, state["applied_activity"],
+                               evidence_gaps=evidence_gaps, source_notices=run_source_notices(state))
         return {"version_id": identifier, "status": "pending_update_review" if scheduled else "waiting_for_review"}
 
     async def review(state: GraphState) -> dict:

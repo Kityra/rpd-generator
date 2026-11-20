@@ -128,6 +128,8 @@ async def course_detail(actor, settings, factory, users, course, notices):
         if gap_types:
             gaps = ", ".join(GAP_LABELS.get(kind, kind) for kind in gap_types)
             st.warning(f"Требуют проверки преподавателя — {gaps}.")
+        for notice in version.content.get("source_notices", []):
+            st.caption(notice)
         for index, subject in enumerate(program["subjects"]):
             with st.expander(subject["title"], expanded=index == 0):
                 st.html(block_html(subject, registry))
