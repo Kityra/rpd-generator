@@ -10,10 +10,10 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from jsonschema import SchemaError
-from langgraph.types import Command
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from check_yandex_indexes import content_indexes
 from rpd_graph import RpdRequest, build_rpd_graph
 from rpd_specialists import PROFILE_SCHEMA, PROFILES, ProfileName, SourceFragment, SpecialistReport, analyse_fragments
 from science_literature import Article, find_course_articles, normalise_doi
@@ -76,9 +76,11 @@ def read_answer(prompt: str) -> str:
 
 def yandex_settings() -> dict[str, str]:
     load_dotenv(ROOT / ".env", encoding="utf-8-sig", interpolate=False)
+    indexes = content_indexes()
     required = ("YANDEX_API_KEY", "YANDEX_FOLDER_ID", "YANDEX_MODEL_URI", "YANDEX_VECTOR_STORE_ID_RPD")
     settings = {name: os.environ.get(name, "").strip() for name in required}
-    missing = [name for name, value in settings.items() if not value]
+    settings.update(indexes)
+    missing = [name for name in required if not settings[name]]
     if missing:
         raise ValueError("Заполните .env: " + ", ".join(missing))
     base_url = os.environ.get("YANDEX_BASE_URL", YANDEX_BASE_URL).strip().rstrip("/")
@@ -87,7 +89,8 @@ def yandex_settings() -> dict[str, str]:
     for key in ("YANDEX_VECTOR_STORE_ID_BOOKS", "YANDEX_VECTOR_STORE_ID_HH",
                 "YANDEX_VECTOR_STORE_ID_PRIKLAD", "YANDEX_VECTOR_STORE_ID_INTERVIEW",
                 *(f"YANDEX_MODEL_URI_{role.upper()}" for role in PROFILES)):
-        settings[key] = os.environ.get(key, "").strip()
+        if key not in indexes:
+            settings[key] = os.environ.get(key, "").strip()
     return settings
 
 
@@ -222,13 +225,10 @@ def main(argv: list[str] | None = None) -> int:
             graph = create_rpd_graph(client, settings, notify=lambda message: print(message, flush=True))
             config = {"configurable": {"thread_id": str(uuid4())}}
             result = graph.invoke({"request": request.model_dump()}, config=config)
-            while result.get("__interrupt__"):
-                print("\nУточнения для РПД")
-                for question in result["__interrupt__"][0].value["questions"]:
-                    print(f"• {question}")
-                answer = read_answer("Ответь на вопросы одним сообщением: ")
-                result = graph.invoke(Command(resume=answer), config=config)
 
+        if result.get("__interrupt__"):
+            print("Для интервью создайте курс в кабинете преподавателя.", file=sys.stderr)
+            return 1
         if not result["ready"]:
             print("РПД требует уточнения. JSON не сохранён.", file=sys.stderr)
             for question in result["questions"]:

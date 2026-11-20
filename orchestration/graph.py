@@ -3,13 +3,15 @@ from typing import Annotated, Any, Protocol, TypedDict
 from uuid import NAMESPACE_URL, uuid5
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
+from pydantic import ValidationError
 
 from auth.settings import Settings
 from domain.schemas import (AppliedActivityModel, BusinessCourseAudit, CourseProgramModel, GapReport,
                             Grounded, InterviewTurn, Model, RelevanceDecision, SourceRecord, SubjectPlan,
                             VerificationReport, all_blocks, block_value)
-from orchestration.clients import EvidenceClient, ModelClient, source_record
+from orchestration.clients import EvidenceClient, ModelClient, NoActivityEvidence, source_record
 from orchestration import prompts
 from orchestration.interview_methods import load_interview_methods
 
@@ -54,6 +56,7 @@ class GraphState(TypedDict, total=False):
     review_iteration: int
     status: str
     version_id: str
+    consumed_review_id: str
     needs_update: bool
 
 
@@ -79,11 +82,14 @@ class WorkflowStore(Protocol):
                          scheduled: bool, activity: dict) -> None:
         """Сохранить версию и уведомление."""
 
-    async def finish_review(self, course_id: str, version_id: str, action: str, actor: str) -> None:
+    async def finish_review(self, course_id: str, version_id: str, action: str, actor: str, workloads=None) -> None:
         """Утвердить либо отклонить конкретную версию."""
 
     async def defer_audit(self, course_id: str) -> None:
         """Сохранить дату следующего аудита."""
+
+    async def record_verification(self, interview_id: str, report: dict) -> None:
+        """Сохранить результаты проверки ответов эксперта."""
 
 
 def registry(state: GraphState) -> dict[str, SourceRecord]:
@@ -105,7 +111,12 @@ def context(state: GraphState) -> dict:
 
 
 def payload(state: GraphState) -> dict:
-    result = {key: value for key, value in state.items() if key not in {"interview_answers", "verification"}}
+    excluded = {"interview_answers", "verification", "owner_user_id", "request_id", "run_id",
+                "interview_session_id", "interrupt_id", "version_id", "consumed_review_id"}
+    result = {key: value for key, value in state.items() if key not in excluded}
+    if "review_feedback" in result:
+        result["review_feedback"] = [{"content": item.get("content", ""), "attachments": item.get("attachments", [])}
+                                     for item in result["review_feedback"]]
     baseline = context(state).get("baseline")
     if baseline:
         result["previous_values"] = {key: block_value(block) for key, block in all_blocks(baseline.subjects).items()}
@@ -119,12 +130,16 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             raise ValueError("Для запуска требуется устойчивый run_id.")
         await store.set_status(state["request_id"], "agents_running", state["owner_user_id"])
         return {"status": "agents_running", "interview_round": 0, "review_iteration": 0,
-                "interview_answers": [], "review_feedback": [], "revision_baseline": None}
+                "interview_answers": [], "review_feedback": [], "revision_baseline": None,
+                "applied_activity": {}, "gap_report": {}, "verification": {}, "auto_subjects": {},
+                "course_program": {}, "consumed_review_id": "", "version_id": ""}
 
     def agent(role: str):
         async def run(state: GraphState) -> dict:
             query = json.dumps(state["course_meta"], ensure_ascii=False)
             sources = await evidence.search(role, query)
+            if not sources:
+                return {f"{role}_report": {"findings": []}, "sources": []}
             source_map = {item.source_id: item for item in sources}
             report = await llm.generate(AgentReport, prompts.AGENT.format(role=role),
                                         {"course": state["course_meta"], "sources": [item.model_dump(mode="json") for item in sources]},
@@ -143,15 +158,30 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                 "status": "agents_running" if decision.requires_update else "approved"}
 
     async def formalize(state: GraphState) -> dict:
-        model = await llm.generate(AppliedActivityModel, prompts.ACTIVITY, payload(state), context(state))
+        sources = {k: s for k, s in registry(state).items()
+                   if s.source_type in {"Priklad", "HH", "Crossref", "arXiv", "expert", "documentation"}}
+        if not sources:
+            return {"applied_activity": {}}
+        activity_input = {"course": state["course_meta"], "business": state["business_report"],
+                          "science": state["science_report"], "sources": [s.model_dump(mode="json") for s in sources.values()]}
+        try:
+            model = await llm.generate(AppliedActivityModel, prompts.ACTIVITY, activity_input, {"sources": sources})
+        except NoActivityEvidence:
+            return {"applied_activity": {}}
         return {"applied_activity": model.model_dump(mode="json")}
 
     async def university_audit(state: GraphState) -> dict:
+        if not state["applied_activity"]:
+            return {"auto_subjects": {"subjects": []}}
         result = await llm.generate(SubjectPlan, prompts.UNIVERSITY, payload(state), context(state))
         return {"auto_subjects": result.model_dump(mode="json")}
 
     async def gap_analysis(state: GraphState) -> dict:
         await store.set_status(state["request_id"], "gap_analysis", state["owner_user_id"])
+        if not state["applied_activity"]:
+            report = GapReport(gap_types=["missing_tasks"], business_coverage=0, science_coverage=0,
+                               questions=["Какую рабочую задачу вы решали недавно, что сделали и как проверили результат?"])
+            return {"gap_report": report.model_dump(mode="json"), "status": "gap_analysis"}
         activity = AppliedActivityModel.model_validate(state["applied_activity"], context=context(state))
         sources = registry(state)
         count = len(activity.tasks)
@@ -163,11 +193,11 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         gaps, questions = [], []
         if count < 5 or len(activity.processes) < 3:
             gaps.append("missing_tasks")
-            questions.append("Опишите минимум пять рабочих задач и три процесса профессии.")
+            questions.append("Какие задачи вы решаете регулярно и в какие рабочие процессы они входят?")
         for field, kind, question in (
             ("stack", "missing_stack", "Какие инструменты применяются к каждой задаче?"),
             ("artifacts", "missing_artifacts", "Какие проверяемые результаты даёт каждая задача?"),
-            ("quality_criteria", "missing_quality_criteria", "Назовите минимум два критерия качества для каждой задачи."),
+            ("quality_criteria", "missing_quality_criteria", "По каким двум критериям вы оцениваете результат каждой задачи?"),
         ):
             minimum = 2 if field == "quality_criteria" else 1
             if any(len(getattr(task, field)) < minimum for task in activity.tasks):
@@ -194,10 +224,27 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         methods = await evidence.search("interview", json.dumps(state["gap_report"], ensure_ascii=False))
         local_skill = load_interview_methods(settings.interview_skill_directory, state["gap_report"]["gap_types"])
         skill = (local_skill + "\n\n" + "\n\n".join(item.content for item in methods))[:18000]
-        turn = await llm.generate(InterviewTurn, prompts.INTERVIEW.format(injected_interview_skill=skill),
-                                  {"course": state["course_meta"], "activity": state["applied_activity"],
-                                   "gap_report": state["gap_report"], "history": state.get("interview_answers", [])}, context(state))
+        try:
+            turn = await llm.generate(InterviewTurn, prompts.INTERVIEW,
+                                      {"course": state["course_meta"]["title"], "gaps": state["gap_report"]["questions"],
+                                       "tasks": [t["title"] for t in state["applied_activity"].get("tasks", [])],
+                                       "interview_methods": skill, "history": [a["content"] for a in state.get("interview_answers", [])]},
+                                      context(state), flash=True)
+            question_origin = "interviewer"
+        except ValidationError:
+            # После двух невалидных ответов задаём вопрос по реально обнаруженному пробелу.
+            for question in reversed(state["gap_report"]["questions"]):
+                try:
+                    turn = InterviewTurn(prompt=question)
+                except ValidationError:
+                    continue
+                break
+            else:
+                raise
+            question_origin = "gap_report"
         report = {**state["gap_report"], "prompt": turn.prompt,
+                  "question_origin": question_origin,
+                  "previous_interview_id": state.get("interview_session_id") if round_number else None,
                   "method_source_ids": [item.source_id for item in methods]}
         interview_id = await store.prepare_interview(state["request_id"], identifier, report)
         await store.save_sources(state["request_id"], [*registry(state).values(), *methods])
@@ -221,8 +268,10 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         result = await llm.generate(VerificationReport, prompts.FACTCHECK,
                                     {"answer": answer, "sources": combined}, ctx, flash=True)
         verified = [claim for claim in result.claims if claim.verification_status == "verified"]
-        records = [source_record("expert", f"{settings.public_origin}/api/interviews/{state['interview_session_id']}",
+        records = [source_record("expert", f"{settings.public_origin}/teacher?course={state['request_id']}&interview={state['interview_session_id']}",
                                   "Подтверждённое утверждение эксперта", claim.claim) for claim in verified]
+        await store.save_sources(state["request_id"], [*fresh, *records])
+        await store.record_verification(state["interview_session_id"], result.model_dump(mode="json"))
         return {"verification": result.model_dump(mode="json"),
                 "sources": [item.model_dump(mode="json") for item in [*fresh, *records]]}
 
@@ -260,15 +309,16 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             raise ValueError("Решение относится к устаревшей версии.")
         action = decision.get("action")
         if action in {"approve", "reject"}:
-            await store.finish_review(state["request_id"], state["version_id"], action, decision["actor_user_id"])
-            return {"status": "approved"}
+            await store.finish_review(state["request_id"], state["version_id"], action, decision["actor_user_id"], decision.get("workloads"))
+            return {"status": "approved", "consumed_review_id": state["version_id"]}
         if action != "revise" or not decision.get("content"):
             raise ValueError("Укажите правку или решение ревью.")
-        record = source_record("teacher", f"{settings.public_origin}/api/courses/{state['request_id']}/reviews/{state['version_id']}",
-                               "Правка преподавателя", decision["content"])
-        return {"review_feedback": [*state.get("review_feedback", []), decision],
+        url = f"{settings.public_origin}/teacher?course={state['request_id']}&version={state['version_id']}"
+        records = [source_record("teacher", url, "Правка преподавателя", decision["content"])]
+        records.extend(source_record("teacher", url, file["name"], file["text"]) for file in decision.get("attachments", []))
+        return {"consumed_review_id": state["version_id"], "review_feedback": [*state.get("review_feedback", []), decision],
                 "review_iteration": state.get("review_iteration", 0) + 1,
-                "revision_baseline": state["course_program"], "sources": [record.model_dump(mode="json")],
+                "revision_baseline": state["course_program"], "sources": [r.model_dump(mode="json") for r in records],
                 "status": "designing"}
 
     graph = StateGraph(GraphState)
@@ -285,6 +335,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         async def execute(state: GraphState) -> dict:
             try:
                 return await node(state)
+            except GraphBubbleUp:
+                raise
             except Exception:
                 await store.set_status(state["request_id"], "failed", state["owner_user_id"])
                 raise

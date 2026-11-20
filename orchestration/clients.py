@@ -5,14 +5,34 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Protocol, TypeVar
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, ValidationInfo, model_validator
 
-from domain.schemas import SourceRecord
+from domain.schemas import ActivityAspect, ActivityProcess, ActivityTask, AppliedActivityModel, Model, SourceRecord
 from run_rpd import ScientificSearch, collect_recent_articles, open_yandex, require_response_text
 
 
 logger = logging.getLogger(__name__)
 Output = TypeVar("Output", bound=BaseModel)
+
+
+class TaskList(Model):
+    tasks: list[ActivityTask]
+
+
+class NoActivityEvidence(ValueError):
+    """По доступным материалам не выделено ни одной рабочей задачи."""
+
+
+class ActivityStructure(Model):
+    processes: list[ActivityProcess]
+    aspects: list[ActivityAspect]
+
+    @model_validator(mode="after")
+    def known_tasks(self, info: ValidationInfo):
+        valid = set(info.context["task_ids"])
+        if any(set(part.task_ids) - valid for part in [*self.processes, *self.aspects]):
+            raise ValueError("Копируй идентификаторы задач в точности из tasks.")
+        return self
 
 
 class ModelClient(Protocol):
@@ -39,13 +59,55 @@ def output_schema(node: Any) -> Any:
     return result
 
 
+def grounded_schema(output, context):
+    schema = output_schema(output.model_json_schema())
+    allowed = [key for key, source in context.get("sources", {}).items() if source.source_type != "Interview"]
+    for item in [schema, *schema.get("$defs", {}).values()]:
+        props = item.get("properties", {})
+        if allowed and "source_ids" in props:
+            props["source_ids"]["items"]["enum"] = allowed
+            props["source_ids"]["minItems"] = 1
+        if allowed and "source_id" in props:
+            props["source_id"]["enum"] = allowed
+        if "task_ids" in props and context.get("task_ids"):
+            props["task_ids"]["items"]["enum"] = context["task_ids"]
+    return schema
+
+
 class YandexModelClient:
     def __init__(self, settings: dict[str, str]) -> None:
         self.settings = settings
 
     async def generate(self, output: type[Output], prompt: str, payload: dict[str, Any],
                        context: dict[str, Any], flash: bool = False) -> Output:
+        if output is AppliedActivityModel:
+            return await asyncio.to_thread(self._activity, prompt, payload, context)
         return await asyncio.to_thread(self._generate, output, prompt, payload, context, flash)
+
+    def _activity(self, prompt, payload, context):
+        task_list = self._generate(TaskList, prompt + " Сначала выдели только подтверждённые рабочие задачи.",
+                                   payload, context, False)
+        if not task_list.tasks:
+            raise NoActivityEvidence("Отсутствуют подтверждённые задачи.")
+        tasks = []
+        seen = set()
+        for task in task_list.tasks:
+            title = " ".join(task.title.casefold().split())
+            if title and title not in seen:
+                seen.add(title)
+                key = "t-" + hashlib.sha256(title.encode()).hexdigest()[:10]
+                tasks.append(task.model_copy(update={"id": key}).model_dump(mode="json"))
+        structure = {"processes": [], "aspects": []}
+        if tasks:
+            short_ids = {f"T{i}": task["id"] for i, task in enumerate(tasks, 1)}
+            catalog = [{**task, "id": key} for key, task in zip(short_ids, tasks, strict=True)]
+            parts = self._generate(ActivityStructure,
+                prompt + " Сгруппируй переданные задачи в реальные процессы и аспекты. Копируй task_ids из каталога tasks.",
+                {**payload, "tasks": catalog}, {**context, "task_ids": list(short_ids)}, False)
+            structure = parts.model_dump(mode="json")
+            for part in [*structure["processes"], *structure["aspects"]]:
+                part["task_ids"] = [short_ids[key] for key in part["task_ids"]]
+        return AppliedActivityModel.model_validate({"tasks": tasks, **structure, "source_ids": []}, context=context)
 
     def _generate(self, output: type[Output], prompt: str, payload: dict[str, Any],
                   context: dict[str, Any], flash: bool) -> Output:
@@ -58,7 +120,7 @@ class YandexModelClient:
                     model=model, instructions=prompt,
                     input=json.dumps(request, ensure_ascii=False),
                     text={"format": {"type": "json_schema", "name": output.__name__,
-                                     "schema": output_schema(output.model_json_schema()), "strict": True}},
+                                     "schema": grounded_schema(output, context), "strict": True}},
                     max_output_tokens=8192 if flash else 16384, store=False,
                 )
                 raw = require_response_text(response)
@@ -75,7 +137,7 @@ class YandexModelClient:
 
 def source_record(kind: str, url: str, title: str, content: str) -> SourceRecord:
     digest = hashlib.sha256(content.encode()).hexdigest()
-    key = hashlib.sha256(f"{kind}\n{url}\n{digest}".encode()).hexdigest()
+    key = kind + "-" + hashlib.sha256(f"{kind}\n{url}\n{digest}".encode()).hexdigest()[:20]
     return SourceRecord(source_id=key, source_type=kind, url=url, title=title,
                         retrieved_at=datetime.now(timezone.utc), raw_hash=digest, content=content)
 

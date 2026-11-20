@@ -10,6 +10,14 @@ RUN python -m pip install --no-cache-dir -r requirements.txt \
 
 COPY .streamlit .streamlit
 COPY *.py final_schema.json ./
+COPY auth/ auth/
+COPY domain/ domain/
+COPY orchestration/ orchestration/
+COPY storage/ storage/
+COPY apps/ apps/
+COPY workers/ workers/
+COPY alembic.ini ./
+RUN mkdir -p /app/data && chown appuser:appuser /app/data
 
 USER appuser
 EXPOSE 8501

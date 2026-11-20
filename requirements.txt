@@ -18,3 +18,4 @@ langgraph-checkpoint-sqlite>=3.0.1,<4
 langgraph-checkpoint-postgres>=3,<4
 psycopg[binary,pool]>=3.2,<4
 sympy>=1.13,<2
+PyYAML>=6,<7

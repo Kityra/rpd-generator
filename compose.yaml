@@ -1,8 +1,37 @@
+x-runtime: &runtime
+  build: .
+  env_file: .env
+  volumes:
+    - course-data:/app/data
+
 services:
+  migrate:
+    <<: *runtime
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    healthcheck:
+      disable: true
   app:
-    build: .
-    env_file:
-      - .env
+    <<: *runtime
+    depends_on: &migrated
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "127.0.0.1:8501:8501"
     restart: unless-stopped
+  worker:
+    <<: *runtime
+    depends_on: *migrated
+    command: ["python", "-m", "workers.course_worker"]
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+  scheduler:
+    <<: *runtime
+    depends_on: *migrated
+    command: ["python", "-m", "workers.relevance_scheduler"]
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
+volumes:
+  course-data:
