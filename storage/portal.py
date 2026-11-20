@@ -63,6 +63,31 @@ async def decide(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, 
         course.status = "review_queued"
 
 
+async def finish_without_answer(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str,
+                                interview_id: str) -> None:
+    require_teacher(actor)
+    async with write_transaction(factory) as db:
+        interview = await db.scalar(select(Interview).where(Interview.id == interview_id,
+                                    Interview.course_id == course_id).with_for_update())
+        course = await db.scalar(select(Course).where(Course.id == course_id,
+                                   Course.owner_user_id == actor.id).with_for_update())
+        if course is None or interview is None:
+            raise PermissionError("Интервью недоступно.")
+        key = f"interview:{interview.id}:{interview.interrupt_id}"
+        existing = await db.get(WorkflowCommand, key)
+        if existing and existing.payload.get("action") == "finish_without_answer":
+            return
+        if existing or interview.status != "invited" or course.status != "waiting_for_expert":
+            raise ValueError("Курс уже продолжил обработку. Обновите страницу.")
+        await db.execute(update(ExpertInvitation).where(ExpertInvitation.interview_id == interview_id,
+                         ExpertInvitation.status == "active").values(status="revoked"))
+        interview.status = "closed"
+        course.status = "queued"
+        db.add(WorkflowCommand(id=key, course_id=course.id, kind="resume",
+                               payload={"interrupt_id": interview.interrupt_id, "actor_user_id": actor.id,
+                                        "action": "finish_without_answer"}))
+
+
 async def acknowledge(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str) -> None:
     require_teacher(actor)
     async with write_transaction(factory) as db:
@@ -92,7 +117,9 @@ async def retry_command(factory: async_sessionmaker[AsyncSession], actor: Curren
                                   WorkflowCommand.status == "failed").order_by(WorkflowCommand.created_at.desc()))
         if command is None:
             raise ValueError("Лимит уточнений исчерпан. Создайте заявку с уточнённой темой.")
-        command.status, course.status = "pending", "queued"
+        command.status = "pending"
+        expert_reply = command.kind == "resume" and command.payload.get("action") != "finish_without_answer"
+        course.status = "answer_queued" if expert_reply else "queued"
 
 
 def assigned_interviews(actor: CurrentUser, *, token_hash: str | None = None):

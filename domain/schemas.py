@@ -10,6 +10,7 @@ class Model(BaseModel):
 
 
 SourceType = Literal["HH", "Priklad", "Crossref", "arXiv", "Books", "RPD", "Interview", "expert", "teacher", "documentation"]
+INDEPENDENT_EXPERT_SOURCE_TYPES = frozenset({"HH", "Priklad", "Books", "Crossref", "arXiv", "documentation"})
 ChangeStatus = Literal["unchanged", "added", "modified", "fundamental_protected"]
 GapType = Literal["missing_tasks", "missing_stack", "missing_quality_criteria", "missing_artifacts", "conflicting_evidence"]
 
@@ -126,6 +127,7 @@ class AppliedActivityModel(Grounded):
 
 
 class ExpertClaimVerification(Grounded):
+    source_ids: list[str]
     claim: str
     verification_status: Literal["verified", "needs_clarification", "rejected_hallucination"]
     explanation: str
@@ -135,10 +137,10 @@ class ExpertClaimVerification(Grounded):
     def check_verification(self, info: ValidationInfo) -> "ExpertClaimVerification":
         if self.verification_status == "needs_clarification" and not self.clarification_question:
             raise ValueError("Нужен уточняющий вопрос.")
-        if self.verification_status == "verified":
+        if self.verification_status in {"verified", "rejected_hallucination"}:
             records = [info.context["sources"][key] for key in self.source_ids]
-            if not any(source.source_type in {"HH", "Priklad", "Books", "Crossref", "arXiv", "documentation"} for source in records):
-                raise ValueError("Подтверждение требует независимого источника.")
+            if not any(source.source_type in INDEPENDENT_EXPERT_SOURCE_TYPES for source in records):
+                raise ValueError("Подтверждение или опровержение требует независимого источника.")
         return self
 
 
@@ -179,8 +181,14 @@ class LearningAssignment(ChangedBlock):
 
 
 class Topic(ChangedBlock):
-    activity_task_ids: list[str] = Field(min_length=1)
+    activity_task_ids: list[str]
     assignments: list[LearningAssignment]
+
+    @model_validator(mode="after")
+    def check_activity_link(self, info: ValidationInfo) -> "Topic":
+        if not self.activity_task_ids and not (info.context or {}).get("allow_incomplete_activity"):
+            raise ValueError("Привяжи тему к подтверждённой задаче деятельности.")
+        return self
 
 
 class CourseSubject(ChangedBlock):
@@ -267,9 +275,11 @@ class CourseProgramModel(Grounded):
             if len(matching) != 1 or not matching[0].is_fundamental or not matching[0].locked:
                 raise ValueError(f"Не сохранён фундаментальный предмет {name}.")
         activity = context.get("activity")
-        if activity:
-            activity.require_complete()
-            task_ids = {task.id for task in activity.tasks}
+        allow_incomplete = context.get("allow_incomplete_activity")
+        if activity or (allow_incomplete and "activity" not in context):
+            if activity and not allow_incomplete:
+                activity.require_complete()
+            task_ids = {task.id for task in activity.tasks} if activity else set()
             for subject in self.subjects:
                 for topic in subject.topics:
                     if not set(topic.activity_task_ids) <= task_ids:

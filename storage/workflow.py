@@ -64,7 +64,7 @@ class SqlWorkflowStore:
         async with write_transaction(self.factory) as db:
             interview = await db.scalar(select(Interview).where(Interview.id == interview_id).with_for_update())
             course = await db.get(Course, interview.course_id) if interview else None
-            if course is None or course.owner_user_id != teacher.id or interview.status == "submitted":
+            if course is None or course.owner_user_id != teacher.id or interview.status != "invited":
                 raise PermissionError("Интервью недоступно.")
             active = (await db.scalars(select(ExpertInvitation).where(
                 ExpertInvitation.interview_id == interview_id, ExpertInvitation.status == "active"))).all()
@@ -83,20 +83,24 @@ class SqlWorkflowStore:
         async with write_transaction(self.factory) as db:
             locator = (ExpertInvitation.id == invitation_id if invitation_id else
                        ExpertInvitation.token_hash == hashlib.sha256(token.encode()).hexdigest())
-            invitation = await db.scalar(select(ExpertInvitation).where(locator).with_for_update())
+            invitation = await db.scalar(select(ExpertInvitation).where(locator))
             if invitation is None or invitation.expert_user_id != expert.id:
                 raise PermissionError("Приглашение недоступно.")
-            interview = await db.get(Interview, invitation.interview_id)
+            interview = await db.scalar(select(Interview).where(Interview.id == invitation.interview_id).with_for_update())
+            invitation = await db.scalar(select(ExpertInvitation).where(locator).with_for_update()
+                                         .execution_options(populate_existing=True))
             command_id = f"interview:{interview.id}:{interrupt_id}"
             existing = await db.get(WorkflowCommand, command_id)
             if existing:
                 expected = existing.payload
+                if expected.get("action") == "finish_without_answer":
+                    raise ValueError("Преподаватель завершил интервью и запросил черновик.")
                 if expected["submission_id"] != submission_id or expected["content"] != content or expected["attachments"] != attachments:
                     raise ValueError("Повторная отправка отличается от сохранённого ответа.")
                 return
             if invitation.status != "active" or invitation.used_at or aware(invitation.expires_at) <= at:
                 raise PermissionError("Приглашение истекло или использовано.")
-            if interview.interrupt_id != interrupt_id or interview.status == "submitted":
+            if interview.interrupt_id != interrupt_id or interview.status != "invited":
                 raise ValueError("Прерывание устарело.")
             payload = {"submission_id": submission_id, "interrupt_id": interrupt_id, "content": content,
                        "attachments": attachments, "expert_user_id": expert.id}
@@ -109,7 +113,7 @@ class SqlWorkflowStore:
             course.status = "answer_queued"
 
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
-                         scheduled: bool, activity: dict) -> None:
+                         scheduled: bool, activity: dict, evidence_gaps: dict) -> None:
         async with write_transaction(self.factory) as db:
             course = await db.scalar(select(Course).where(Course.id == course_id).with_for_update())
             if course.draft_version_id and course.draft_version_id != version_id:
@@ -119,7 +123,8 @@ class SqlWorkflowStore:
                 revision = (await db.scalar(select(func.max(CourseVersion.revision)).where(
                     CourseVersion.course_id == course_id)) or 0) + 1
                 db.add(CourseVersion(id=version_id, course_id=course_id, revision=revision,
-                                     content={"program": program.model_dump(mode="json"), "activity": activity}))
+                                     content={"program": program.model_dump(mode="json"), "activity": activity,
+                                              "evidence_gaps": evidence_gaps}))
                 await db.flush()
             course.draft_version_id = version_id
             course.status = "pending_update_review" if scheduled else "waiting_for_review"

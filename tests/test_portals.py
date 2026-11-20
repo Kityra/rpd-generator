@@ -19,8 +19,8 @@ from domain.export import export_course
 from orchestration.checkpointer import open_checkpointer
 from orchestration.graph import build_course_graph
 from storage.database import make_engine
-from storage.models import Base, Course, CourseVersion, ExpertInvitation, Interview, Notification, WorkflowCommand, now
-from storage.portal import acknowledge, assigned_interviews, create_course, decide, schedule_due
+from storage.models import Base, Course, CourseVersion, ExpertInvitation, Interview, Notification, SourceRow, WorkflowCommand, now
+from storage.portal import acknowledge, assigned_interviews, create_course, decide, finish_without_answer, schedule_due
 from storage.workflow import SqlWorkflowStore
 from test_course_architecture import program, records
 from workers.course_worker import process_next
@@ -33,6 +33,7 @@ def user(role, suffix=""):
 class Model:
     def __init__(self, gap):
         self.gap, self.relevance = gap, True
+        self.claim_status = "verified"
 
     async def generate(self, output, prompt, payload, context, flash=False):
         name = output.__name__
@@ -49,7 +50,7 @@ class Model:
         elif name == "InterviewTurn":
             value = {"prompt": "Как вы проверяете отчёт?"}
         elif name == "VerificationReport":
-            value = {"claims": [{"claim": "Сверка", "verification_status": "verified", "explanation": "Есть источник",
+            value = {"claims": [{"claim": "Сверка", "verification_status": self.claim_status, "explanation": "Есть источник",
                                  "clarification_question": None, "source_ids": ["HH"]}]}
         elif name == "CourseProgramModel":
             value = program()
@@ -145,6 +146,9 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         course = await self.process()
         self.assertEqual(course.status, "waiting_for_review")
         initial = course.draft_version_id
+        factcheck_query = next(call.args[1] for call in self.evidence.search.call_args_list if call.args[0] == "factcheck")
+        self.assertTrue(factcheck_query.startswith("Курс:"))
+        self.assertNotIn("Сверка", factcheck_query)
         await decide(self.factory, self.teacher, course.id, initial, "revise", "", files)
         course = await self.process()
         self.assertNotEqual(initial, course.draft_version_id)
@@ -157,6 +161,41 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             await db.commit()
         self.assertEqual((await self.process()).draft_version_id, course.draft_version_id)
         self.assertEqual(sum(call.args[0] == "business" for call in self.evidence.search.call_args_list), 1)
+
+    async def test_rejected_expert_claim_still_produces_reviewable_draft(self):
+        self.model.gap = True
+        self.model.claim_status = "rejected_hallucination"
+        course = await self.process()
+        async with self.factory() as db:
+            interview = await db.scalar(select(Interview))
+        expert = user("expert")
+        users = AsyncMock()
+        users.get_by_id.return_value = expert
+        token = await self.store.invite(interview.id, expert.id, self.teacher, users)
+        await self.store.submit_interview(token, expert, interview.interrupt_id, "answer", "Сверка", [])
+        course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        async with self.factory() as db:
+            self.assertEqual(len((await db.scalars(select(Interview))).all()), 1)
+            stored = await db.get(Interview, interview.id)
+            self.assertEqual(stored.gap_report["verification"]["claims"][0]["verification_status"], "rejected_hallucination")
+            version = await db.get(CourseVersion, course.draft_version_id)
+            self.assertIn("missing_tasks", version.content["evidence_gaps"]["gap_types"])
+            sources = (await db.scalars(select(SourceRow))).all()
+            self.assertFalse(any(source.record["source_type"] == "expert" for source in sources))
+
+    async def test_teacher_can_finish_existing_interview_and_open_draft(self):
+        self.model.gap = True
+        course = await self.process()
+        async with self.factory() as db:
+            interview = await db.scalar(select(Interview))
+        with self.assertRaises(PermissionError):
+            await finish_without_answer(self.factory, user("teacher", "other"), course.id, interview.id)
+        await finish_without_answer(self.factory, self.teacher, course.id, interview.id)
+        await finish_without_answer(self.factory, self.teacher, course.id, interview.id)
+        self.assertEqual((await self.process()).status, "waiting_for_review")
+        async with self.factory() as db:
+            self.assertEqual((await db.get(Interview, interview.id)).status, "closed")
 
 
 class DirectoryTests(unittest.TestCase):

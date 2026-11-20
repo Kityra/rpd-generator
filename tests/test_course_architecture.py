@@ -5,11 +5,13 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import bcrypt
+import httpx
 from argon2 import PasswordHasher
 from langgraph.types import Command
+from openai import InternalServerError
 from pydantic import ValidationError
 from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -18,8 +20,9 @@ from auth.password_verifier import ExistingPasswordVerifier
 from auth.session import AuthService
 from auth.settings import Settings
 from auth.user_repository import SqlUserRepository
-from domain.schemas import CourseProgramModel, InterviewTurn, SourceRecord
+from domain.schemas import CourseProgramModel, ExpertClaimVerification, InterviewTurn, SourceRecord
 from orchestration.checkpointer import open_checkpointer
+from orchestration.clients import YandexEvidenceClient
 from orchestration.graph import build_course_graph
 from storage.models import Base, Course, CourseVersion, WorkflowCommand
 from storage.workflow import SqlWorkflowStore
@@ -50,6 +53,29 @@ def program() -> dict:
 
 
 class SchemaTests(unittest.TestCase):
+    def test_unconfirmed_claim_without_citation_requires_clarification(self):
+        claim = {"claim": "Рабочий процесс", "explanation": "Нет подтверждения", "source_ids": [],
+                 "verification_status": "needs_clarification", "clarification_question": "Как проверили результат?"}
+        context = {"sources": records()}
+        ExpertClaimVerification.model_validate(claim, context=context)
+        with self.assertRaises(ValidationError):
+            ExpertClaimVerification.model_validate(dict(claim, verification_status="verified"), context=context)
+
+    @patch("orchestration.clients.open_yandex")
+    def test_factcheck_continues_if_one_index_fails(self, open_client):
+        client = open_client.return_value.__enter__.return_value
+        search = client.with_options.return_value.vector_stores.search
+        request = httpx.Request("POST", "https://ai.api.cloud.yandex.net/v1/vector_stores/test/search")
+        error = InternalServerError("Search failed", response=httpx.Response(500, request=request), body=None)
+        result = MagicMock(data=[MagicMock(file_id="f", filename="source.txt",
+                                            content=[MagicMock(type="text", text="Evidence")])])
+        search.side_effect = [error, result, result]
+        settings = {f"YANDEX_VECTOR_STORE_ID_{name}": name for name in ("PRIKLAD", "HH", "BOOKS")}
+        with self.assertLogs("orchestration.clients", level="WARNING"):
+            sources = YandexEvidenceClient(settings)._search("factcheck", "ML-инженерия")
+        client.with_options.assert_called_once_with(max_retries=2)
+        self.assertEqual([source.source_type for source in sources], ["HH", "Books"])
+
     def test_supported_password_formats(self):
         password = "test-password"
         digest = hashlib.pbkdf2_hmac("sha256", password.encode(), b"salt", 1000)

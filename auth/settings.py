@@ -37,7 +37,6 @@ class Settings(BaseSettings):
     public_origin: str = "http://localhost:8501"
     business_coverage_threshold: float = Field(default=0.6, ge=0, le=1)
     science_coverage_threshold: float = Field(default=0.6, ge=0, le=1)
-    max_interview_rounds: int = Field(default=3, ge=1, le=10)
     interview_skill_directory: str = "skills/interview_methods"
 
     @model_validator(mode="after")

@@ -7,7 +7,7 @@ from sqlalchemy import select
 from apps.common import composer, portal
 from domain.export import HOURS, block_html, export_course
 from storage.models import Course, CourseVersion, Interview, Notification, SourceRow
-from storage.portal import acknowledge, create_course, decide, retry_command
+from storage.portal import acknowledge, create_course, decide, finish_without_answer, retry_command
 from storage.workflow import SqlWorkflowStore
 
 
@@ -17,6 +17,36 @@ STATUS = {"queued": "В очереди", "queued_audit": "В очереди на
           "waiting_for_review": "Черновик на проверке", "review_queued": "Решение принято в обработку",
           "approved": "Актуален", "pending_update_review": "Требует проверки после автообновления",
           "failed": "Работа приостановлена"}
+
+GAP_LABELS = {"missing_tasks": "рабочие задачи и процессы", "missing_stack": "применяемые инструменты",
+              "missing_artifacts": "результаты работы", "missing_quality_criteria": "критерии качества",
+              "conflicting_evidence": "подтверждение по независимым источникам"}
+
+VERIFICATION_LABELS = {"verified": "Подтверждено", "needs_clarification": "Не подтверждено",
+                       "rejected_hallucination": "Противоречит источникам"}
+
+
+def interview_results(interviews, registry):
+    reports = [interview.gap_report["verification"] for interview in reversed(interviews)
+               if "verification" in interview.gap_report]
+    if not reports:
+        return
+    with st.expander("Проверка ответов эксперта"):
+        st.caption("В программах курса используются подтверждённые сведения.")
+        for index, report in enumerate(reports, 1):
+            st.markdown(f"**Ответ {index}**")
+            if not report["claims"]:
+                reason = ("Проверку ответа не удалось завершить." if report.get("assessment") == "unavailable"
+                          else "В ответе не выделено проверяемых утверждений.")
+                st.warning(reason)
+            for claim in report["claims"]:
+                status = claim["verification_status"]
+                st.write(f"**{VERIFICATION_LABELS[status]}**")
+                st.write(claim["claim"])
+                st.caption(claim["explanation"])
+                for key in claim["source_ids"]:
+                    if key in registry:
+                        st.write(registry[key]["title"])
 
 
 async def new_course(actor, factory):
@@ -71,19 +101,11 @@ async def course_detail(actor, settings, factory, users, course, notices):
                                       .order_by(Interview.created_at.desc()))).all()
         active = await db.get(CourseVersion, course.active_version_id) if course.active_version_id else None
         draft = await db.get(CourseVersion, course.draft_version_id) if course.draft_version_id else None
-    if interviews:
-        for interview in interviews:
-            claims = interview.gap_report.get("verification", {}).get("claims", [])
-            if claims:
-                with st.expander("Результаты проверки интервью"):
-                    for claim in claims:
-                        st.write(claim["claim"], "—", claim["verification_status"])
-                        st.caption(claim["explanation"])
-                        for key in claim["source_ids"]:
-                            if key in registry:
-                                st.write(registry[key]["title"])
     if course.status == "waiting_for_expert" and interviews:
         current = interviews[0]
+        if st.button("Сформировать черновик по имеющимся данным", type="primary"):
+            await finish_without_answer(factory, actor, course.id, current.id)
+            st.rerun()
         st.subheader("Вопрос эксперту")
         st.write(current.gap_report["prompt"])
         experts = await users.list_experts()
@@ -100,9 +122,14 @@ async def course_detail(actor, settings, factory, users, course, notices):
     version = draft or active
     if version:
         program = version.content["program"]
-        st.subheader(f"Программа курса · версия {version.revision}")
-        for subject in program["subjects"]:
-            with st.expander(subject["title"]):
+        label = "Черновик РПД" if draft else "Программа курса"
+        st.subheader(f"{label} · версия {version.revision}")
+        gap_types = version.content.get("evidence_gaps", {}).get("gap_types", [])
+        if gap_types:
+            gaps = ", ".join(GAP_LABELS.get(kind, kind) for kind in gap_types)
+            st.warning(f"Требуют проверки преподавателя — {gaps}.")
+        for index, subject in enumerate(program["subjects"]):
+            with st.expander(subject["title"], expanded=index == 0):
                 st.html(block_html(subject, registry))
         audit = program.get("business_audit")
         if audit:
@@ -113,6 +140,7 @@ async def course_detail(actor, settings, factory, users, course, notices):
                     st.write(metric["name"], metric["value"], metric["unit"], metric["region"])
                 if audit["unavailable_metrics"]:
                     st.caption("Нет подтверждённых измерений — " + ", ".join(audit["unavailable_metrics"]))
+    interview_results(interviews, registry)
     if draft and course.status in {"waiting_for_review", "pending_update_review"}:
         update = bool(active)
         loads = workload_form(draft.content["program"]["subjects"], draft.id, active.content.get("workloads", {}) if active else {})

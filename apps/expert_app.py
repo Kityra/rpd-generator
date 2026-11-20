@@ -45,7 +45,7 @@ async def render(actor, settings, factory, users):
                     if message.attachments:
                         st.caption(", ".join(f["name"] for f in message.attachments))
         inv, interview, _ = chat[-1]
-    if inv.status == "active" and interview.status != "submitted":
+    if inv.status == "active" and interview.status == "invited":
         pending_key = f"draft-answer-{interview.id}"
         reply = composer("Ваш ответ и материалы к вопросу", f"answer-{interview.id}")
         if reply:
@@ -63,7 +63,7 @@ async def render(actor, settings, factory, users):
             del st.session_state[pending_key]
             st.rerun()
     else:
-        st.success("Ответ сохранён. Здесь появятся уточняющие вопросы, если они понадобятся.")
+        st.success("Ответ сохранён. Преподаватель увидит результаты проверки в карточке курса.")
     st.button("Обновить интервью")
 
 

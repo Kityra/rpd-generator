@@ -9,11 +9,12 @@ from pydantic import ValidationError
 
 from auth.settings import Settings
 from domain.schemas import (AppliedActivityModel, BusinessCourseAudit, CourseProgramModel, GapReport,
-                            Grounded, InterviewTurn, Model, RelevanceDecision, SourceRecord, SubjectPlan,
+                            Grounded, INDEPENDENT_EXPERT_SOURCE_TYPES, InterviewTurn, Model, RelevanceDecision, SourceRecord, SubjectPlan,
                             VerificationReport, all_blocks, block_value)
 from orchestration.clients import EvidenceClient, ModelClient, NoActivityEvidence, source_record
 from orchestration import prompts
 from orchestration.interview_methods import load_interview_methods
+from run_rpd import YandexModeratedResponse
 
 
 def merge_records(previous: list[dict], additions: list[dict]) -> list[dict]:
@@ -46,6 +47,7 @@ class GraphState(TypedDict, total=False):
     gap_report: dict
     interview_session_id: str
     interrupt_id: str
+    closed_interview_id: str
     interview_answers: list[dict]
     interview_round: int
     verification: dict
@@ -79,7 +81,7 @@ class WorkflowStore(Protocol):
         """Идемпотентно создать интервью."""
 
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
-                         scheduled: bool, activity: dict) -> None:
+                         scheduled: bool, activity: dict, evidence_gaps: dict) -> None:
         """Сохранить версию и уведомление."""
 
     async def finish_review(self, course_id: str, version_id: str, action: str, actor: str, workloads=None) -> None:
@@ -98,6 +100,7 @@ def registry(state: GraphState) -> dict[str, SourceRecord]:
 
 def context(state: GraphState) -> dict:
     result: dict = {"sources": registry(state), "manual_subjects": state.get("manual_subjects", []),
+                    "allow_incomplete_activity": bool(state.get("gap_report", {}).get("gap_types")),
                     "market_measurements": {}, "fundamental_subjects": [
                         subject["name"] for subject in state.get("auto_subjects", {}).get("subjects", [])
                         if subject["is_fundamental"]]}
@@ -106,17 +109,22 @@ def context(state: GraphState) -> dict:
     baseline = state.get("revision_baseline") or state.get("baseline")
     if baseline:
         result["baseline"] = CourseProgramModel.model_validate(baseline, context={
-            **result, "manual_subjects": [], "fundamental_subjects": [], "activity": None})
+            **result, "manual_subjects": [], "fundamental_subjects": [], "activity": None,
+            "allow_incomplete_activity": True})
     return result
 
 
 def payload(state: GraphState) -> dict:
     excluded = {"interview_answers", "verification", "owner_user_id", "request_id", "run_id",
-                "interview_session_id", "interrupt_id", "version_id", "consumed_review_id"}
+                "interview_session_id", "interrupt_id", "version_id", "consumed_review_id", "closed_interview_id"}
     result = {key: value for key, value in state.items() if key not in excluded}
     if "review_feedback" in result:
         result["review_feedback"] = [{"content": item.get("content", ""), "attachments": item.get("attachments", [])}
                                      for item in result["review_feedback"]]
+    if "gap_report" in result:
+        # В генерацию попадает описание пробелов без вопросов, цитирующих неподтверждённый ответ.
+        report = result["gap_report"]
+        result["gap_report"] = {key: report[key] for key in ("gap_types", "business_coverage", "science_coverage") if key in report}
     baseline = context(state).get("baseline")
     if baseline:
         result["previous_values"] = {key: block_value(block) for key, block in all_blocks(baseline.subjects).items()}
@@ -132,7 +140,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         return {"status": "agents_running", "interview_round": 0, "review_iteration": 0,
                 "interview_answers": [], "review_feedback": [], "revision_baseline": None,
                 "applied_activity": {}, "gap_report": {}, "verification": {}, "auto_subjects": {},
-                "course_program": {}, "consumed_review_id": "", "version_id": ""}
+                "course_program": {}, "consumed_review_id": "", "closed_interview_id": "", "version_id": ""}
 
     def agent(role: str):
         async def run(state: GraphState) -> dict:
@@ -217,9 +225,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def prepare_interview(state: GraphState) -> dict:
         round_number = state.get("interview_round", 0)
-        if round_number >= settings.max_interview_rounds:
-            await store.set_status(state["request_id"], "failed", state["owner_user_id"])
-            return {"status": "failed"}
+        if round_number:
+            return {"status": "designing"}
         identifier = str(uuid5(NAMESPACE_URL, f"{state['request_id']}/{state['run_id']}/interview/{round_number}"))
         methods = await evidence.search("interview", json.dumps(state["gap_report"], ensure_ascii=False))
         local_skill = load_interview_methods(settings.interview_skill_directory, state["gap_report"]["gap_types"])
@@ -255,24 +262,38 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     async def interview(state: GraphState) -> dict:
         answer = interrupt({"interrupt_id": state["interrupt_id"], "interview_session_id": state["interview_session_id"],
                             "prompt": state["gap_report"]["prompt"], "kind": "expert"})
-        if not isinstance(answer, dict) or answer.get("interrupt_id") != state["interrupt_id"] or not answer.get("content"):
+        if not isinstance(answer, dict) or answer.get("interrupt_id") != state["interrupt_id"]:
             raise ValueError("Ответ не соответствует текущему интервью.")
+        if answer.get("action") == "finish_without_answer":
+            if answer.get("actor_user_id") != state["owner_user_id"]:
+                raise PermissionError("Завершение интервью доступно владельцу курса.")
+            return {"closed_interview_id": state["interrupt_id"]}
+        if not answer.get("content"):
+            raise ValueError("Ответ эксперта пуст.")
         return {"interview_answers": [*state.get("interview_answers", []), answer],
                 "interview_round": state.get("interview_round", 0) + 1}
 
     async def factcheck(state: GraphState) -> dict:
         answer = state["interview_answers"][-1]
-        fresh = await evidence.search("factcheck", answer["content"][:3000])
+        topic = " ".join(state["course_meta"]["title"].split())[:300]
+        fresh = await evidence.search("factcheck", f"{topic}: рабочие задачи, инструменты, результаты и критерии качества")
         combined = merge_records(state.get("sources", []), [item.model_dump(mode="json") for item in fresh])
-        ctx = context({**state, "sources": combined})
-        result = await llm.generate(VerificationReport, prompts.FACTCHECK,
-                                    {"answer": answer, "sources": combined}, ctx, flash=True)
-        verified = [claim for claim in result.claims if claim.verification_status == "verified"]
+        independent = {item["source_id"]: SourceRecord.model_validate(item) for item in combined
+                       if item["source_type"] in INDEPENDENT_EXPERT_SOURCE_TYPES}
+        try:
+            result = await llm.generate(VerificationReport, prompts.FACTCHECK,
+                                        {"answer": {"content": answer["content"], "attachments": answer.get("attachments", [])},
+                                         "sources": [item.model_dump(mode="json") for item in independent.values()]},
+                                        {"sources": independent}, flash=True)
+            report = result.model_dump(mode="json")
+        except (ValidationError, YandexModeratedResponse):
+            report = {"claims": [], "assessment": "unavailable"}
+        verified = [claim["claim"] for claim in report["claims"] if claim["verification_status"] == "verified"]
         records = [source_record("expert", f"{settings.public_origin}/teacher?course={state['request_id']}&interview={state['interview_session_id']}",
-                                  "Подтверждённое утверждение эксперта", claim.claim) for claim in verified]
+                                  "Подтверждённое утверждение эксперта", claim) for claim in verified]
         await store.save_sources(state["request_id"], [*fresh, *records])
-        await store.record_verification(state["interview_session_id"], result.model_dump(mode="json"))
-        return {"verification": result.model_dump(mode="json"),
+        await store.record_verification(state["interview_session_id"], report)
+        return {"verification": report,
                 "sources": [item.model_dump(mode="json") for item in [*fresh, *records]]}
 
     async def design(state: GraphState) -> dict:
@@ -298,7 +319,9 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         await store.save_sources(state["request_id"], list(registry(state).values()))
         program = CourseProgramModel.model_validate(state["course_program"], context=context(state))
         scheduled = state.get("mode") == "relevance"
-        await store.save_draft(state["request_id"], identifier, program, scheduled, state["applied_activity"])
+        gaps = state["gap_report"]
+        evidence_gaps = {key: gaps[key] for key in ("gap_types", "business_coverage", "science_coverage") if key in gaps}
+        await store.save_draft(state["request_id"], identifier, program, scheduled, state["applied_activity"], evidence_gaps)
         return {"version_id": identifier, "status": "pending_update_review" if scheduled else "waiting_for_review"}
 
     async def review(state: GraphState) -> dict:
@@ -349,9 +372,11 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     graph.add_conditional_edges("relevance", lambda state: "formalize" if state["needs_update"] else END)
     graph.add_edge("formalize", "university_audit")
     graph.add_edge("university_audit", "gap_analysis")
-    graph.add_conditional_edges("gap_analysis", lambda state: "prepare_interview" if state["gap_report"]["gap_types"] else "design")
-    graph.add_conditional_edges("prepare_interview", lambda state: END if state["status"] == "failed" else "interview")
-    graph.add_edge("interview", "factcheck")
+    graph.add_conditional_edges("gap_analysis", lambda state: "prepare_interview"
+                                if state["gap_report"]["gap_types"] and not state.get("interview_round") else "design")
+    graph.add_conditional_edges("prepare_interview", lambda state: "design" if state.get("interview_round") else "interview")
+    graph.add_conditional_edges("interview", lambda state: "design"
+                                if state.get("closed_interview_id") == state["interrupt_id"] else "factcheck")
     graph.add_edge("factcheck", "formalize")
     graph.add_edge("design", "business_audit")
     graph.add_edge("business_audit", "persist_review")

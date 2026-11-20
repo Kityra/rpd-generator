@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Protocol, TypeVar
 
+from openai import APIConnectionError, InternalServerError, RateLimitError
 from pydantic import BaseModel, ValidationError, ValidationInfo, model_validator
 
 from domain.schemas import ActivityAspect, ActivityProcess, ActivityTask, AppliedActivityModel, Model, SourceRecord
@@ -60,13 +61,17 @@ def output_schema(node: Any) -> Any:
 
 
 def grounded_schema(output, context):
-    schema = output_schema(output.model_json_schema())
+    original = output.model_json_schema()
+    schema = output_schema(original)
     allowed = [key for key, source in context.get("sources", {}).items() if source.source_type != "Interview"]
-    for item in [schema, *schema.get("$defs", {}).values()]:
+    for item, original_item in zip([schema, *schema.get("$defs", {}).values()],
+                                   [original, *original.get("$defs", {}).values()], strict=True):
         props = item.get("properties", {})
         if allowed and "source_ids" in props:
             props["source_ids"]["items"]["enum"] = allowed
-            props["source_ids"]["minItems"] = 1
+            minimum = original_item["properties"]["source_ids"].get("minItems")
+            if minimum is not None:
+                props["source_ids"]["minItems"] = minimum
         if allowed and "source_id" in props:
             props["source_id"]["enum"] = allowed
         if "task_ids" in props and context.get("task_ids"):
@@ -159,11 +164,19 @@ class YandexEvidenceClient:
             raise ValueError(f"Неизвестная роль поиска {role}.")
         records = []
         with open_yandex(self.settings) as client:
+            search_client = client.with_options(max_retries=2) if role == "factcheck" else client
             for index in indexes[role]:
                 store = self.settings.get(f"YANDEX_VECTOR_STORE_ID_{index.upper()}")
                 if not store:
                     raise ValueError(f"Для {role} требуется индекс {index}.")
-                result = client.vector_stores.search(store, query=query, max_num_results=4, timeout=30)
+                try:
+                    result = search_client.vector_stores.search(store, query=query, max_num_results=4, timeout=30)
+                except (APIConnectionError, InternalServerError, RateLimitError) as error:
+                    if role != "factcheck":
+                        raise
+                    logger.warning("Индекс %s временно недоступен для проверки ответа: %s",
+                                   index, getattr(error, "status_code", type(error).__name__))
+                    continue
                 for hit in result.data:
                     text = "\n".join(part.text for part in hit.content if part.type == "text" and part.text)
                     if text.strip():
