@@ -88,6 +88,8 @@ SCIENCE_CONTEXT = """
 Подборка служит для методических предложений и не меняет официальные сведения учебного плана.
 """
 
+MAX_INTERVIEW_ANSWERS = 3
+
 
 def include_scientific_suggestions(document: dict, suggestions: list[ArticleSuggestion]) -> None:
     if not suggestions:
@@ -287,7 +289,7 @@ def build_rpd_graph(
         return {"answers": [*answers, answer]}
 
     def after_review(state: RpdState) -> str:
-        if state["ready"] or len(state.get("answers", [])) >= 3:
+        if state["ready"] or len(state.get("answers", [])) >= MAX_INTERVIEW_ANSWERS:
             return END
         return "interview"
 
