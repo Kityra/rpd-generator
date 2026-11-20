@@ -6,7 +6,7 @@
 
 В корне проекта заполните .env по .env.example. SESSION_SIGNING_KEY — постоянный случайный секрет длиной от 32 символов. В production задайте HTTPS-адрес PUBLIC_ORIGIN для ссылок-приглашений.
 
-В PowerShell один раз примените миграцию к БД приложения.
+Кабинеты и воркеры при запуске сами создают таблицы в пустой БД приложения (по умолчанию `data/application.sqlite`). Существующую базу они не изменяют. Миграцию можно применить и вручную:
 
 ```powershell
 .\.venv\Scripts\python.exe -m alembic upgrade head

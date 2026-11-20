@@ -1,16 +1,17 @@
 import asyncio
 import os
-from pathlib import Path
 
 from alembic import context
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from storage.database import prepare_sqlite_folder
 from storage.models import Base
 
 
 load_dotenv(encoding="utf-8-sig", interpolate=False)
-url = os.environ.get("APP_DATABASE_URL", "sqlite+aiosqlite:///./data/application.sqlite")
+url = context.config.attributes.get("database_url") or os.environ.get(
+    "APP_DATABASE_URL", "sqlite+aiosqlite:///./data/application.sqlite")
 
 
 def configure(connection) -> None:
@@ -21,8 +22,7 @@ def configure(connection) -> None:
 
 
 async def online() -> None:
-    if url.startswith("sqlite"):
-        Path("data").mkdir(exist_ok=True)
+    prepare_sqlite_folder(url)
     engine = create_async_engine(url)
     async with engine.connect() as connection:
         await connection.run_sync(configure)
