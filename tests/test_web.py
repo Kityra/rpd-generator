@@ -1,12 +1,13 @@
 from io import BytesIO
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from zipfile import ZipFile
 
 from streamlit.testing.v1 import AppTest
 
-from app import download_package
+from app import download_package, show_revisions
 from rpd_graph import build_rpd_graph
 from run_course import Discipline
 from test_pipeline import ROOT, SCHEMA, proposal
@@ -38,6 +39,26 @@ class WebPreviewTests(unittest.TestCase):
             patcher = patch(target, **options)
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def test_revision_composer_accepts_attachment_without_text_and_limits_files(self):
+        batch_id = self.preview.create_batch("Базы данных", "Вуз", "2026/2027",
+                                             [Discipline("Базы данных")], "", kind="single")
+        task = self.preview.batches[batch_id].tasks[0]
+        file = SimpleNamespace(name="plan.txt", getvalue=lambda: "Добавить SQL".encode())
+        preview = MagicMock()
+        with patch("app.st") as ui:
+            ui.chat_input.return_value = SimpleNamespace(text="", files=[file])
+            show_revisions(preview, task)
+            attachments = preview.advance.call_args.args[2]
+            self.assertEqual(preview.advance.call_args.args[1], "")
+            self.assertEqual(attachments[0].text, "Добавить SQL")
+            ui.rerun.assert_called_once()
+
+            preview.reset_mock()
+            ui.chat_input.return_value = SimpleNamespace(text="Правка", files=[file] * 4)
+            show_revisions(preview, task)
+            preview.advance.assert_not_called()
+            ui.error.assert_called_with("Можно приложить до трёх файлов.")
 
     def test_failed_revision_preserves_document_and_retry_invalidates_approval(self):
         self.generate.side_effect = [
@@ -145,8 +166,7 @@ class WebPreviewTests(unittest.TestCase):
         self.assertEqual(self.generate.call_args.args[2]["required"], ["document"])
         button(app, "Утвердить дисциплину").click().run()
         self.assertIn("Утверждена", app.expander[0].label)
-        app.text_area[0].set_value("Добавь архитектурную диаграмму")
-        button(app, "Применить правку").click().run()
+        app.chat_input[0].set_value("Добавь архитектурную диаграмму").run()
         self.assertFalse(app.exception)
         self.assertIn("РПД готова", app.expander[0].label)
         self.assertTrue(any("Составить архитектурную диаграмму" in item.value for item in app.text))

@@ -85,6 +85,7 @@ def yandex_settings() -> dict[str, str]:
     if base_url != YANDEX_BASE_URL:
         raise ValueError(f"Укажите в YANDEX_BASE_URL адрес {YANDEX_BASE_URL}")
     for key in ("YANDEX_VECTOR_STORE_ID_BOOKS", "YANDEX_VECTOR_STORE_ID_HH",
+                "YANDEX_VECTOR_STORE_ID_PRIKLAD", "YANDEX_VECTOR_STORE_ID_INTERVIEW",
                 *(f"YANDEX_MODEL_URI_{role.upper()}" for role in PROFILES)):
         settings[key] = os.environ.get(key, "").strip()
     return settings
@@ -187,7 +188,7 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
     def generate(instructions: str, payload: str, response_schema: dict[str, Any]) -> str:
         notify("Собираю черновик РПД…")
         return request_json(settings["YANDEX_MODEL_URI"], instructions, payload,
-                            response_schema, "rpd_draft", 8_192, 120)
+                            response_schema, "rpd_draft", 16_384, 120)
 
     return build_rpd_graph(ROOT / "final_schema.json", research, generate, checkpointer=checkpointer,
                            draft_first=draft_first)

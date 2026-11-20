@@ -242,21 +242,26 @@ def show_revisions(preview: PreviewSession, task: Task) -> None:
         if revision.applied:
             with st.chat_message("assistant"):
                 st.text("Правка обработана. Текущая версия РПД выше.")
-    with st.form(f"revision_{task.id}_{len(task.revisions)}"):
-        edit = st.text_area("Что изменить или уточнить", max_chars=6000,
-                            placeholder="Например, добавьте практическое занятие по архитектурным диаграммам.")
-        files = st.file_uploader("Подтверждающие материалы", type=("txt", "docx", "pdf"), accept_multiple_files=True,
-                                 help="До трёх файлов, до 10 МБ каждый. Для PDF нужен текстовый слой или пояснение.")
-        if st.form_submit_button("Применить правку", type="primary", disabled=bool(task.error)):
-            try:
-                if len(files) > 3:
-                    raise ValueError("Можно приложить до трёх файлов.")
-                attachments = tuple(read_attachment(file.name, file.getvalue()) for file in files)
-                with st.spinner("Продолжаю подготовку РПД…"):
-                    preview.advance(task, edit, attachments)
-                st.rerun()
-            except ValueError as error:
-                st.error(str(error))
+    edit = st.chat_input(
+        "Что изменить или уточнить",
+        key=f"revision_{task.id}_{len(task.revisions)}",
+        max_chars=6000,
+        accept_file="multiple",
+        file_type=["txt", "docx", "pdf"],
+        max_upload_size=10,
+        disabled=bool(task.error),
+    )
+    st.caption("Файлы можно прикрепить скрепкой: до трёх TXT, DOCX или PDF по 10 МБ.")
+    if edit is not None:
+        try:
+            if len(edit.files) > 3:
+                raise ValueError("Можно приложить до трёх файлов.")
+            attachments = tuple(read_attachment(file.name, file.getvalue()) for file in edit.files)
+            with st.spinner("Продолжаю подготовку РПД…"):
+                preview.advance(task, edit.text, attachments)
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
 
 
 def main() -> None:

@@ -10,6 +10,8 @@ INDEX_SETTINGS = {
     "rpd": "YANDEX_VECTOR_STORE_ID_RPD",
     "books": "YANDEX_VECTOR_STORE_ID_BOOKS",
     "hh": "YANDEX_VECTOR_STORE_ID_HH",
+    "priklad": "YANDEX_VECTOR_STORE_ID_PRIKLAD",
+    "interview": "YANDEX_VECTOR_STORE_ID_INTERVIEW",
 }
 YANDEX_BASE_URL = "https://ai.api.cloud.yandex.net/v1"
 

@@ -58,7 +58,7 @@ class RpdPipelineTests(unittest.TestCase):
         Draft202012Validator.check_schema(projected)
         self.assertEqual(
             {role: [search.index for search in profile.searches] for role, profile in PROFILES.items()},
-            {"university": ["RPD", "Books"], "science": ["Books"], "business": ["HH"]},
+            {"university": ["RPD", "Books"], "science": ["Books"], "business": ["Priklad", "HH"]},
         )
         draft_schema = projected["properties"]["document"]
         self.assertEqual(draft_schema["required"], list(draft_schema["properties"]))
