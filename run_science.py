@@ -8,6 +8,7 @@ import sys
 from dotenv import load_dotenv
 from openai import APIConnectionError, APIStatusError, OpenAI
 
+from orchestration.yandex_calls import model_response
 from run_rpd import require_response_text
 from rpd_specialists import PROFILE_SCHEMA, PROFILES, analyse_fragments
 from science_literature import FRONTIER_WINDOW_DAYS, IT_AREAS, normalise_doi, search_frontier
@@ -50,14 +51,15 @@ def review_cards(cards):
     if not key or not folder:
         raise ValueError("Для обзора Science заполните YANDEX_API_KEY и YANDEX_FOLDER_ID.")
     model = os.environ.get("YANDEX_MODEL_URI_SCIENCE", "").strip() or f"gpt://{folder}/aliceai-llm-flash"
+    settings = {"YANDEX_API_KEY": key, "YANDEX_FOLDER_ID": folder}
     with OpenAI(api_key=key, project=folder, base_url="https://ai.api.cloud.yandex.net/v1",
                 timeout=35, max_retries=0) as client:
         def generate(instructions: str, payload: str) -> str:
-            response = client.responses.create(
+            response = model_response(client, settings,
                 model=model, instructions=instructions, input=payload,
                 text={"format": {"type": "json_schema", "name": "science_frontier",
                                  "schema": PROFILE_SCHEMA, "strict": True}},
-                max_output_tokens=1_024, store=False,
+                max_output_tokens=1_024, store=False, budget=35,
             )
             return require_response_text(response)
 

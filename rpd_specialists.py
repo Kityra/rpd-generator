@@ -30,6 +30,7 @@ class SpecialistReport(TypedDict):
     fragments: list[SourceFragment]
     findings: list[dict]
     articles: NotRequired[list["ArticleSuggestion"]]
+    source_notices: NotRequired[list[str]]
 
 
 class ArticleSuggestion(TypedDict):

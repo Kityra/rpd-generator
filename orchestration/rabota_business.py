@@ -12,7 +12,7 @@ from threading import BoundedSemaphore
 from time import monotonic
 from typing import TYPE_CHECKING, Callable
 
-from domain.schemas import SourceRecord
+from domain.schemas import EvidenceResults, SourceRecord
 from rabota_it import BusinessAPI, VacancyStore
 from rabota_it.normalise import vacancy_url
 from rpd_specialists import SourceFragment
@@ -185,4 +185,5 @@ class BusinessEvidenceClient:
         primary = await self.base.search(role, query)
         if role != "business":
             return primary
-        return [*primary, *await self.rabota.records(query, self.make_record)]
+        return EvidenceResults([*primary, *await self.rabota.records(query, self.make_record)],
+                               getattr(primary, "notices", ()))

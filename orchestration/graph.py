@@ -15,6 +15,7 @@ from orchestration.clients import EvidenceClient, ModelClient, NoActivityEvidenc
 from orchestration import prompts
 from orchestration.interview_methods import load_interview_methods
 from orchestration.rabota_business import SOURCE, SOURCE_GUIDANCE
+from orchestration.resilience import ExternalUnavailable
 
 
 def merge_records(previous: list[dict], additions: list[dict]) -> list[dict]:
@@ -43,6 +44,8 @@ class GraphState(TypedDict, total=False):
     science_report: dict
     books_report: dict
     university_report: dict
+    interview_source_notices: list[str]
+    factcheck_source_notices: list[str]
     applied_activity: dict
     gap_report: dict
     interview_session_id: str
@@ -69,6 +72,13 @@ class AgentReport(Model):
     findings: list[Finding]
 
 
+def run_source_notices(state: GraphState) -> list[str]:
+    notices = [note for role in ("business", "science", "books", "university")
+               for note in state.get(f"{role}_report", {}).get("source_notices", [])]
+    return list(dict.fromkeys([*notices, *state.get("interview_source_notices", []),
+                               *state.get("factcheck_source_notices", [])]))
+
+
 class WorkflowStore(Protocol):
     async def set_status(self, course_id: str, status: str, owner: str) -> None:
         """Сохранить статус с проверкой владельца."""
@@ -80,7 +90,7 @@ class WorkflowStore(Protocol):
         """Идемпотентно создать интервью."""
 
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
-                         scheduled: bool, activity: dict) -> None:
+                         scheduled: bool, activity: dict, *, source_notices: list[str]) -> None:
         """Сохранить версию и уведомление."""
 
     async def finish_review(self, course_id: str, version_id: str, action: str, actor: str, workloads=None) -> None:
@@ -132,6 +142,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         await store.set_status(state["request_id"], "agents_running", state["owner_user_id"])
         return {"status": "agents_running", "interview_round": 0, "review_iteration": 0,
                 "interview_answers": [], "review_feedback": [], "revision_baseline": None,
+                "interview_source_notices": [], "factcheck_source_notices": [],
                 "applied_activity": {}, "gap_report": {}, "verification": {}, "auto_subjects": {},
                 "course_program": {}, "consumed_review_id": "", "version_id": ""}
 
@@ -139,16 +150,22 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         async def run(state: GraphState) -> dict:
             query = json.dumps(state["course_meta"], ensure_ascii=False)
             sources = await evidence.search(role, query)
+            notices = getattr(sources, "notices", [])
             if not sources:
-                return {f"{role}_report": {"findings": []}, "sources": []}
+                return {f"{role}_report": {"findings": [], "source_notices": notices}, "sources": []}
             source_map = {item.source_id: item for item in sources}
             instructions = prompts.AGENT.format(role=role)
             if role == "business" and any(item.source_type == SOURCE for item in sources):
                 instructions += "\n" + SOURCE_GUIDANCE
-            report = await llm.generate(AgentReport, instructions,
-                                        {"course": state["course_meta"], "sources": [item.model_dump(mode="json") for item in sources]},
-                                        {"sources": source_map}, flash=True)
-            return {f"{role}_report": report.model_dump(mode="json"),
+            try:
+                report = await llm.generate(AgentReport, instructions,
+                                            {"course": state["course_meta"],
+                                             "sources": [item.model_dump(mode="json") for item in sources],
+                                             "source_notices": notices}, {"sources": source_map}, flash=True)
+            except ExternalUnavailable:
+                report = AgentReport(findings=[])
+                notices = [*notices, f"{role}: модель не сформировала сводку. Сохранены исходные материалы."]
+            return {f"{role}_report": {**report.model_dump(mode="json"), "source_notices": notices},
                     "sources": [item.model_dump(mode="json") for item in sources]}
         return run
 
@@ -253,11 +270,12 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                   "question_origin": question_origin,
                   "previous_interview_id": state.get("interview_session_id") if round_number else None,
                   "method_source_ids": [item.source_id for item in methods]}
+        notices = list(dict.fromkeys([*state.get("interview_source_notices", []), *getattr(methods, "notices", [])]))
         interview_id = await store.prepare_interview(state["request_id"], identifier, report)
         await store.save_sources(state["request_id"], [*registry(state).values(), *methods])
         await store.set_status(state["request_id"], "waiting_for_expert", state["owner_user_id"])
         return {"interrupt_id": identifier, "interview_session_id": interview_id,
-                "gap_report": report, "status": "waiting_for_expert"}
+                "gap_report": report, "status": "waiting_for_expert", "interview_source_notices": notices}
 
     async def interview(state: GraphState) -> dict:
         answer = interrupt({"interrupt_id": state["interrupt_id"], "interview_session_id": state["interview_session_id"],
@@ -270,16 +288,18 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     async def factcheck(state: GraphState) -> dict:
         answer = state["interview_answers"][-1]
         fresh = await evidence.search("factcheck", answer["content"][:3000])
+        notices = getattr(fresh, "notices", [])
         combined = merge_records(state.get("sources", []), [item.model_dump(mode="json") for item in fresh])
         ctx = context({**state, "sources": combined})
         result = await llm.generate(VerificationReport, prompts.FACTCHECK,
-                                    {"answer": answer, "sources": combined}, ctx, flash=True)
+                                    {"answer": answer, "sources": combined, "source_notices": notices}, ctx, flash=True)
         verified = [claim for claim in result.claims if claim.verification_status == "verified"]
         records = [source_record("expert", f"{settings.public_origin}/teacher?course={state['request_id']}&interview={state['interview_session_id']}",
                                   "Подтверждённое утверждение эксперта", claim.claim) for claim in verified]
         await store.save_sources(state["request_id"], [*fresh, *records])
         await store.record_verification(state["interview_session_id"], result.model_dump(mode="json"))
         return {"verification": result.model_dump(mode="json"),
+                "factcheck_source_notices": list(dict.fromkeys([*state.get("factcheck_source_notices", []), *notices])),
                 "sources": [item.model_dump(mode="json") for item in [*fresh, *records]]}
 
     async def design(state: GraphState) -> dict:
@@ -305,7 +325,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         await store.save_sources(state["request_id"], list(registry(state).values()))
         program = CourseProgramModel.model_validate(state["course_program"], context=context(state))
         scheduled = state.get("mode") == "relevance"
-        await store.save_draft(state["request_id"], identifier, program, scheduled, state["applied_activity"])
+        await store.save_draft(state["request_id"], identifier, program, scheduled, state["applied_activity"],
+                               source_notices=run_source_notices(state))
         return {"version_id": identifier, "status": "pending_update_review" if scheduled else "waiting_for_review"}
 
     async def review(state: GraphState) -> dict:

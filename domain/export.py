@@ -76,6 +76,11 @@ def export_course(meta, version, sources):
         raise ValueError("Экспорт доступен после утверждения версии.")
     content = version.content
     program = content["program"]
+    notices = content.get("source_notices", [])
+    notices_html = ""
+    if notices:
+        items = "".join(f"<li>{escape(note)}</li>" for note in notices)
+        notices_html = f"<h2>Примечания об источниках</h2><ul>{items}</ul>"
     validator = Draft202012Validator(json.loads((Path(__file__).resolve().parents[1] / "final_schema.json").read_text(encoding="utf-8")))
     buffer = BytesIO()
     with ZipFile(buffer, "w", ZIP_DEFLATED) as archive:
@@ -96,6 +101,8 @@ def export_course(meta, version, sources):
                         "readingList": list(reading.values()), "subject": subject, "businessAudit": program["business_audit"]}
             load = content.get("workloads", {}).get(subject["id"])
             load_text = ""
+            if notices:
+                document["sourceNotes"] = notices
             if load:
                 document["workload"] = workload(load)
                 document["workloadInputs"] = load
@@ -104,5 +111,5 @@ def export_course(meta, version, sources):
             directory = f"rpd/{index:02}"
             write_json(f"{directory}/rpd.json", document)
             archive.writestr(f"{directory}/rpd.html", '<!doctype html><meta charset="utf-8"><title>' +
-                             escape(subject["title"]) + "</title>" + load_text + block_html(subject, sources))
+                             escape(subject["title"]) + "</title>" + load_text + block_html(subject, sources) + notices_html)
     return buffer.getvalue()

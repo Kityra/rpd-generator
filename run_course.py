@@ -10,10 +10,12 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from dotenv import load_dotenv
-from openai import APIConnectionError, APIStatusError, OpenAI
+from openai import APIConnectionError, APIResponseValidationError, APIStatusError, OpenAI
 from pydantic import BaseModel, ConfigDict, StrictInt
 
 import run_rpd
+from orchestration.resilience import ExternalUnavailable, snapshot_notice
+from orchestration.yandex_calls import InvalidIndexResponse, model_response, search_fragments
 
 
 class SuggestedDiscipline(BaseModel):
@@ -75,18 +77,18 @@ def discover_disciplines(
         if not store_id:
             continue
         try:
-            result = client.vector_stores.search(store_id, query=search, max_num_results=count)
-        except (APIStatusError, APIConnectionError):
+            results, taken_at = search_fragments(client, settings, index, store_id, search, count)
+        except (APIStatusError, APIResponseValidationError, ExternalUnavailable, InvalidIndexResponse):
             if index == "RPD":
                 raise
             print("Books недоступен. Перечень формируется по результатам RPD.", file=sys.stderr)
             continue
-        for hit in result.data:
-            text = "\n".join(part.text for part in hit.content if part.type == "text" and part.text).strip()
-            if text:
-                fragments.append({"number": len(fragments) + 1, "file": hit.filename,
-                                  "index": index, "text": text[:2_000]})
-    response = client.responses.create(
+        if taken_at is not None:
+            print(snapshot_notice(index, taken_at), file=sys.stderr)
+        for hit in results:
+            fragments.append({"number": len(fragments) + 1, "file": hit.title,
+                              "index": index, "text": hit.text.strip()[:2_000]})
+    response = model_response(client, settings,
         model=settings["YANDEX_MODEL_URI"], instructions=DISCOVERY_INSTRUCTIONS,
         input=json.dumps({
             "course": course, "institution": institution, "academicYear": year,
@@ -94,7 +96,7 @@ def discover_disciplines(
         }, ensure_ascii=False),
         text={"format": {"type": "json_schema", "name": "course_plan",
                          "schema": SuggestedPlan.model_json_schema(), "strict": True}},
-        max_output_tokens=3_072, store=False,
+        max_output_tokens=3_072, store=False, budget=60,
     )
     plan = SuggestedPlan.model_validate_json(run_rpd.require_response_text(response))
     return unique_disciplines([

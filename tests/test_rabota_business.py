@@ -59,9 +59,11 @@ class RpdBusinessTests(unittest.TestCase):
         settings = {
             "YANDEX_FOLDER_ID": "fixture", "YANDEX_MODEL_URI": "fixture",
             "YANDEX_VECTOR_STORE_ID_HH": "hh", "YANDEX_VECTOR_STORE_ID_PRIKLAD": "priklad",
+            "YANDEX_VECTOR_STORE_ID_RPD": "rpd",
         }
         client = MagicMock()
-        hit = SimpleNamespace(filename="existing", content=[SimpleNamespace(type="text", text="Рабочие задачи")])
+        hit = SimpleNamespace(file_id="existing", filename="existing",
+                              content=[SimpleNamespace(type="text", text="Рабочие задачи")])
         client.vector_stores.search.return_value = SimpleNamespace(data=[hit])
         calls = {}
 

@@ -109,7 +109,7 @@ class SqlWorkflowStore:
             course.status = "answer_queued"
 
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
-                         scheduled: bool, activity: dict) -> None:
+                         scheduled: bool, activity: dict, *, source_notices: list[str]) -> None:
         async with write_transaction(self.factory) as db:
             course = await db.scalar(select(Course).where(Course.id == course_id).with_for_update())
             if course.draft_version_id and course.draft_version_id != version_id:
@@ -118,8 +118,10 @@ class SqlWorkflowStore:
             if await db.get(CourseVersion, version_id) is None:
                 revision = (await db.scalar(select(func.max(CourseVersion.revision)).where(
                     CourseVersion.course_id == course_id)) or 0) + 1
-                db.add(CourseVersion(id=version_id, course_id=course_id, revision=revision,
-                                     content={"program": program.model_dump(mode="json"), "activity": activity}))
+                content = {"program": program.model_dump(mode="json"), "activity": activity}
+                if source_notices:
+                    content["source_notices"] = source_notices
+                db.add(CourseVersion(id=version_id, course_id=course_id, revision=revision, content=content))
                 await db.flush()
             course.draft_version_id = version_id
             course.status = "pending_update_review" if scheduled else "waiting_for_review"

@@ -33,6 +33,14 @@ class SourceRecord(Model):
         return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", parsed.query, ""))
 
 
+class EvidenceResults(list[SourceRecord]):
+    """List of sources with backend notices about coverage and snapshot age."""
+
+    def __init__(self, records=(), notices=()):
+        super().__init__(records)
+        self.notices = list(notices)
+
+
 class Grounded(Model):
     source_ids: list[str] = Field(min_length=1)
 

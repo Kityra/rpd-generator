@@ -34,6 +34,8 @@ def main() -> int:
     try:
         from dotenv import load_dotenv
         from openai import APIConnectionError, APIStatusError, OpenAI
+        from orchestration.resilience import EXTERNAL, ExternalUnavailable
+        from orchestration.yandex_calls import model_response
     except ImportError:
         parser.exit(2, "Install dependencies: python -m pip install openai python-dotenv\n")
 
@@ -58,14 +60,18 @@ def main() -> int:
         for name in names:
             store_id = settings[INDEX_SETTINGS[name]]
             try:
-                store = client.vector_stores.retrieve(store_id)
+                store = EXTERNAL.call(("Yandex", "diagnostic_retrieve", store_id),
+                    lambda timeout: client.vector_stores.retrieve(store_id, timeout=timeout), budget=20, read=15)
                 counts = store.file_counts
                 print(f"{name.upper()}: {store.status}, files ready {counts.completed}/{counts.total}, "
                       f"failed {counts.failed}, cancelled {counts.cancelled}, in progress {counts.in_progress}")
                 ready = store.status == "completed" and counts.total > 0 and counts.completed == counts.total
                 all_ready = all_ready and ready
                 if args.query:
-                    results = client.vector_stores.search(store_id, query=args.query, max_num_results=3)
+                    results = EXTERNAL.call(("Yandex", "diagnostic_search", store_id),
+                        lambda timeout: client.vector_stores.search(store_id, query=args.query,
+                                                                   max_num_results=3, timeout=timeout),
+                        budget=20, read=15)
                     if not results.data:
                         print("Search returned no matches.")
                         all_ready = False
@@ -74,16 +80,16 @@ def main() -> int:
             except APIStatusError as error:
                 print(f"{name.upper()}: Yandex AI Studio returned HTTP {error.status_code}.", file=sys.stderr)
                 all_ready = False
-            except APIConnectionError:
+            except (APIConnectionError, ExternalUnavailable):
                 print(f"{name.upper()}: cannot reach Yandex AI Studio.", file=sys.stderr)
                 all_ready = False
         if args.check_model:
             try:
-                response = client.responses.create(
+                response = model_response(client, settings,
                     model=settings["YANDEX_MODEL_URI"],
                     input="Ответь одним словом: готово.",
                     max_output_tokens=128,
-                    store=False,
+                    store=False, budget=20,
                 )
                 model_ok = response.status == "completed" and bool(response.output_text.strip())
                 print("Model: OK" if model_ok else "Model: no completed text response.")
@@ -91,7 +97,7 @@ def main() -> int:
             except APIStatusError as error:
                 print(f"Model: Yandex AI Studio returned HTTP {error.status_code}.", file=sys.stderr)
                 all_ready = False
-            except APIConnectionError:
+            except (APIConnectionError, ExternalUnavailable):
                 print("Model: cannot reach Yandex AI Studio.", file=sys.stderr)
                 all_ready = False
     return 0 if all_ready else 1

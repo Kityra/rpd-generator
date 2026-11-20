@@ -12,6 +12,7 @@ from langgraph.types import Command
 import run_course
 import run_rpd
 import science_literature as science
+from orchestration.resilience import Resilience
 from rpd_graph import build_rpd_graph, response_schema_for
 from rpd_specialists import PROFILES
 
@@ -127,7 +128,8 @@ class RpdPipelineTests(unittest.TestCase):
             with self.subTest(incomplete_details=incomplete_details):
                 client = MagicMock()
                 client.vector_stores.search.return_value = SimpleNamespace(data=[
-                    SimpleNamespace(filename="source.pdf", content=[SimpleNamespace(type="text", text="Материал")])
+                    SimpleNamespace(file_id="source", filename="source.pdf",
+                                    content=[SimpleNamespace(type="text", text="Материал")])
                 ])
                 client.responses.create.return_value = SimpleNamespace(
                     incomplete_details=incomplete_details, output=output, status="incomplete", output_text="",
@@ -136,7 +138,9 @@ class RpdPipelineTests(unittest.TestCase):
 
                 def build(schema_path, research, generate, checkpointer=None, draft_first=False):
                     report = research("university", run_rpd.RpdRequest(**REQUEST))
-                    self.assertEqual(report, {"fragments": [], "findings": []})
+                    self.assertEqual(report["fragments"], [])
+                    self.assertEqual(report["findings"], [])
+                    self.assertTrue(any("ограничила ответ" in note for note in report["source_notices"]))
                     return graph
 
                 graph.invoke.return_value = {"ready": False, "questions": []}
@@ -150,13 +154,12 @@ class RpdPipelineTests(unittest.TestCase):
 
 class SciencePipelineTests(unittest.TestCase):
     def test_course_retries_a_short_crossref_rate_limit(self):
-        response = httpx.Response(429, headers={"Retry-After": "1"}, request=httpx.Request("GET", science.CROSSREF))
-        error = httpx.HTTPStatusError("Rate limited", request=response.request, response=response)
-        with patch.object(science, "has_retraction", side_effect=[error, False]) as check, \
-             patch.object(science, "sleep") as sleep:
-            self.assertFalse(science.check_course_retraction(MagicMock(), "10.1234/good"))
-        sleep.assert_called_once_with(1)
-        self.assertEqual(check.call_count, 2)
+        responses = iter([httpx.Response(429, headers={"Retry-After": "1"}),
+                          httpx.Response(200, json={"message": {"total-results": 0}})])
+        with httpx.Client(transport=httpx.MockTransport(lambda _: next(responses))) as client, \
+             patch.object(science, "EXTERNAL", Resilience(wait=(wait := MagicMock()))):
+            self.assertFalse(science.has_retraction(client, "10.1234/good"))
+        wait.assert_called_once_with(1)
 
     def test_course_search_rejects_tangential_papers_and_retracted_versions(self):
         good = science.Article("Relational database query optimization", 2026, "https://doi.org/10.1234/good",
@@ -243,7 +246,8 @@ class CoursePipelineTests(unittest.TestCase):
     def test_searches_rpd_and_books_but_only_rpd_can_support_a_discipline(self):
         def hits(filename):
             return SimpleNamespace(data=[
-                SimpleNamespace(filename=filename, content=[SimpleNamespace(type="text", text="Учебный материал")]),
+                SimpleNamespace(file_id=filename, filename=filename,
+                                content=[SimpleNamespace(type="text", text="Учебный материал")]),
             ])
 
         client = MagicMock()

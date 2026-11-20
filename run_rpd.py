@@ -10,11 +10,13 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from jsonschema import SchemaError
-from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
+from openai import APIConnectionError, APIResponseValidationError, APIStatusError, APITimeoutError, OpenAI
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from check_yandex_indexes import content_indexes
 from orchestration.rabota_business import RabotaBusiness, SOURCE_GUIDANCE
+from orchestration.resilience import ExternalUnavailable, snapshot_notice
+from orchestration.yandex_calls import InvalidIndexResponse, model_response, search_fragments
 from rpd_graph import RpdRequest, build_rpd_graph
 from rpd_specialists import PROFILE_SCHEMA, PROFILES, ProfileName, SourceFragment, SpecialistReport, analyse_fragments
 from science_literature import Article, find_course_articles, normalise_doi
@@ -106,7 +108,7 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
         model: str, instructions: str, payload: str, schema: dict[str, Any],
         schema_name: str, max_tokens: int, timeout: float,
     ) -> str:
-        response = client.responses.create(
+        response = model_response(client, settings,
             model=model,
             instructions=instructions,
             input=payload,
@@ -118,7 +120,7 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
             }},
             max_output_tokens=max_tokens,
             store=False,
-            timeout=timeout,
+            budget=timeout,
         )
         return require_response_text(response)
 
@@ -128,27 +130,32 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
     def research(name: ProfileName, request: RpdRequest) -> SpecialistReport:
         profile = PROFILES[name]
         fragments: list[SourceFragment] = []
+        notices: list[str] = []
+
+        def note(message: str) -> None:
+            notices.append(message)
+            notify(message)
+
         fields = request.model_dump()
         for search in profile.searches:
             index_id = settings.get(f"YANDEX_VECTOR_STORE_ID_{search.index.upper()}", "")
             if not index_id:
-                notify(f"{profile.label}: индекс {search.index} пока не указан.")
+                if search.required:
+                    raise ValueError(f"Обязательный индекс {search.index} не настроен.")
+                note(f"{profile.label}: индекс {search.index} пока не указан.")
                 continue
             try:
-                results = client.vector_stores.search(
-                    index_id, query=search.query.format_map(fields), max_num_results=search.result_count, timeout=20
-                )
-            except (APIStatusError, APIConnectionError) as error:
+                results, taken_at = search_fragments(client, settings, search.index, index_id,
+                    search.query.format_map(fields), search.result_count, budget=20)
+            except (APIStatusError, APIResponseValidationError, ExternalUnavailable, InvalidIndexResponse):
                 if search.required:
                     raise
-                detail = f"HTTP {error.status_code}" if isinstance(error, APIStatusError) else "нет связи"
-                notify(f"{profile.label}: индекс {search.index} недоступен ({detail}).")
+                note(f"{profile.label}: индекс {search.index} недоступен.")
                 continue
-
-            for hit in results.data:
-                text = "\n".join(item.text for item in hit.content if item.type == "text" and item.text)
-                if text.strip():
-                    fragments.append(SourceFragment(file=hit.filename, text=text[:2_000], index=search.index))
+            if taken_at is not None:
+                note(snapshot_notice(search.index, taken_at))
+            for hit in results:
+                fragments.append(SourceFragment(file=hit.title, text=hit.text[:2_000], index=search.index))
 
         vacancy_fragments = rabota.fragments(request.discipline) if rabota and name == "business" else []
         fragments.extend(vacancy_fragments)
@@ -160,7 +167,7 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
                 return request_json(model, instructions, subject, ScientificSearch.model_json_schema(),
                                     "science_course_query", 384, 20)
 
-            articles = collect_recent_articles(request.discipline, plan, notify)
+            articles = collect_recent_articles(request.discipline, plan, note)
             fragments.extend(article.as_science_source(include_abstract=True) for article in articles)
 
         def summarize(instructions: str, payload: str) -> str:
@@ -173,16 +180,16 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
             else:
                 report = analyse_fragments(profile, request.discipline, fragments, summarize)
         except YandexModeratedResponse:
-            notify(f"{profile.label}: Yandex AI Studio ограничила ответ, материалы узла пропущены.")
-            return {"fragments": [], "findings": []}
+            note(f"{profile.label}: Yandex AI Studio ограничила ответ, материалы узла пропущены.")
+            return {"fragments": [], "findings": [], "source_notices": notices}
         except (APIStatusError, APIConnectionError, RuntimeError, ValidationError):
-            notify(f"{profile.label}: модель не сформировала краткий отчёт.")
-            return {"fragments": fragments if name == "university" else [], "findings": []}
+            note(f"{profile.label}: модель не сформировала краткий отчёт.")
+            return {"fragments": fragments if name == "university" else [], "findings": [], "source_notices": notices}
 
         notify(f"{profile.label}: найдено фрагментов — {len(fragments)}, "
                f"наблюдений — {len(report['findings'])}.")
         if name != "university" and not report["findings"]:
-            return {"fragments": [], "findings": []}
+            return {"fragments": [], "findings": [], "source_notices": notices}
         if articles:
             used = {}
             for finding in report["findings"]:
@@ -194,6 +201,7 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
                 report["articles"] = list(used.values())
             report["fragments"] = fragments[:book_count]
             report["findings"] = [finding for finding in report["findings"] if finding["fragment"] <= book_count]
+        report["source_notices"] = notices
         return report
 
     def generate(instructions: str, payload: str, response_schema: dict[str, Any]) -> str:

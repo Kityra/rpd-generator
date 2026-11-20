@@ -1,15 +1,15 @@
 """Look up article metadata for Science without adding files to Vector Store."""
 
 from dataclasses import dataclass, replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from html import unescape
 import re
-from time import sleep
 from urllib.parse import quote
 from xml.etree import ElementTree
 
 import httpx
 
+from orchestration.resilience import EXTERNAL, ExternalUnavailable, snapshot_notice
 from rpd_specialists import SourceFragment
 
 
@@ -18,6 +18,7 @@ ARXIV = "https://export.arxiv.org/api/query"
 SEMANTIC_SCHOLAR = "https://api.semanticscholar.org/graph/v1/paper/batch"
 ATOM = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
 FRONTIER_WINDOW_DAYS = 365
+SCIENCE_ERRORS = (ExternalUnavailable, httpx.HTTPError, ElementTree.ParseError, KeyError, TypeError, ValueError)
 IT_AREAS = {
     "ai": (("0162-8828", "1939-3539", "1533-7928"), ("cs.AI", "cs.LG", "cs.CL")),
     "data": (("2150-8097", "2836-6573"), ("cs.DB",)),
@@ -45,17 +46,37 @@ class Article:
     citation_source: str = ""
     area: str = ""
     abstract: str = ""
+    cached_at: datetime | None = None
 
-    def as_science_source(self, *, include_abstract: bool = False) -> SourceFragment:
+    def as_science_source(self, *, include_abstract: bool = False, include_snapshot_notice: bool = True) -> SourceFragment:
         text = (f"Название: {self.title}\nАвторы: {', '.join(self.authors)}\n"
                 f"Год: {self.year or 'не указан'}\nИздание: {self.venue or 'не подтверждено'}\n"
                 f"Статус: {self.status}\nОбласть: {self.area}\nСсылка: {self.url}")
         if include_abstract and self.abstract:
             text += f"\nФрагмент аннотации: {self.abstract}"
+        if include_snapshot_notice and self.cached_at is not None:
+            text += "\n" + snapshot_notice(self.citation_source or "arXiv", self.cached_at)
         return {
             "file": self.url,
             "text": text,
         }
+
+
+def _get(client: httpx.Client, service: tuple[str, str], url: str, params: dict) -> httpx.Response:
+    def request(timeout):
+        response = client.get(url, params=params, timeout=timeout)
+        response.raise_for_status()
+        return response
+
+    return EXTERNAL.call(service, request, budget=12, read=7)
+
+
+def _article_snapshot(service, key, fetch, notices):
+    articles, taken_at = EXTERNAL.search((service, *key), lambda: tuple(fetch()), max_age=6 * 3600)
+    if taken_at is not None:
+        notices.append(snapshot_notice(service, taken_at))
+        return [replace(article, cached_at=taken_at) for article in articles]
+    return list(articles)
 
 
 def crossref_articles(
@@ -73,8 +94,7 @@ def crossref_articles(
     if query:
         params.update({"query.bibliographic": query, "sort": "score", "rows": 12})
         params["select"] += ",abstract"
-    response = client.get(CROSSREF, params=params)
-    response.raise_for_status()
+    response = _get(client, ("Crossref", "search"), CROSSREF, params)
     papers = []
     for work in response.json()["message"]["items"]:
         title = next(iter(work.get("title") or []), "").strip()
@@ -104,22 +124,15 @@ def crossref_articles(
 
 
 def has_retraction(client: httpx.Client, doi: str) -> bool:
-    response = client.get(CROSSREF, params={"filter": f"updates:{doi},update-type:retraction", "rows": 0})
-    response.raise_for_status()
+    response = _get(client, ("Crossref", "retraction"), CROSSREF,
+                    {"filter": f"updates:{doi},update-type:retraction", "rows": 0})
     return response.json()["message"]["total-results"] > 0
 
 
-def check_course_retraction(client: httpx.Client, doi: str) -> bool:
-    try:
-        return has_retraction(client, doi)
-    except httpx.HTTPStatusError as error:
-        if error.response.status_code != 429:
-            raise
-        retry_after = error.response.headers.get("Retry-After", "1").strip()
-        if not retry_after.isdecimal() or int(retry_after) > 2:
-            raise
-        sleep(max(1, int(retry_after)))
-        return has_retraction(client, doi)
+def _retraction_status(client: httpx.Client, doi: str) -> tuple[bool, bool]:
+    result, taken_at = EXTERNAL.search(("Crossref", "retraction", doi),
+                                      lambda: (has_retraction(client, doi),), max_age=6 * 3600)
+    return result[0], taken_at is None
 
 
 def arxiv_articles(
@@ -130,17 +143,21 @@ def arxiv_articles(
     if terms:
         keywords = " OR ".join(f"ti:{term}" for term in terms)
         scope = f"({scope}) AND ({keywords}) AND submittedDate:[{since:%Y%m%d}0000 TO {today:%Y%m%d}2359]"
-    response = client.get(ARXIV, params={
+    response = _get(client, ("arXiv", "search"), ARXIV, {
         "search_query": scope,
         "sortBy": "relevance" if terms else "submittedDate",
         "sortOrder": "descending",
         "max_results": 8,
-    }, timeout=12)
-    response.raise_for_status()
+    })
+    feed = ElementTree.fromstring(response.content)
+    if feed.tag != f"{{{ATOM['atom']}}}feed":
+        raise ValueError("Неверный формат ленты arXiv.")
     papers = []
-    for entry in ElementTree.fromstring(response.content).findall("atom:entry", ATOM):
+    for entry in feed.findall("atom:entry", ATOM):
         title = " ".join(entry.findtext("atom:title", "", ATOM).split())
         raw_url = entry.findtext("atom:id", "", ATOM).strip()
+        if "arxiv.org/api/errors" in raw_url:
+            raise ValueError("arXiv вернул ошибку в ленте.")
         if not title or not re.fullmatch(r"https?://arxiv\.org/abs/[\w./-]+", raw_url):
             continue
         try:
@@ -182,8 +199,9 @@ def find_course_articles(query: str, *, verified_dois: set[str]) -> tuple[list[A
     selected = []
     with httpx.Client(timeout=7, headers={"User-Agent": "RPD-Science/0.1"}) as client:
         try:
-            published = crossref_articles(client, None, since, today, query=" ".join(terms))
-        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            published = _article_snapshot("Crossref", (None, since, today, terms),
+                lambda: crossref_articles(client, None, since, today, query=" ".join(terms)), unavailable)
+        except SCIENCE_ERRORS:
             published = []
             unavailable.append("Crossref")
         ranked = sorted((paper for paper in published if match(paper) >= 2),
@@ -194,15 +212,21 @@ def find_course_articles(query: str, *, verified_dois: set[str]) -> tuple[list[A
             unique.setdefault(paper.doi, paper)
         for paper in list(unique.values())[:3]:
             try:
-                if check_course_retraction(client, paper.doi):
+                retracted, current = _retraction_status(client, paper.doi)
+                if retracted:
                     continue
-            except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            except SCIENCE_ERRORS:
                 unavailable.append("Crossref: проверка отзыва")
                 break
-            selected.append(replace(paper, status="verified" if paper.doi in verified_dois else "published_candidate"))
+            if not current and "Crossref: проверка отзыва по снимку" not in unavailable:
+                unavailable.append("Crossref: проверка отзыва по снимку")
+            selected.append(replace(paper, status="verified" if current and paper.doi in verified_dois
+                                    else "published_candidate"))
         try:
-            preprints = arxiv_articles(client, tuple(IT_AREAS), since, today, terms=terms)
-        except (httpx.HTTPError, ElementTree.ParseError):
+            areas = tuple(IT_AREAS)
+            preprints = _article_snapshot("arXiv", (areas, since, today, terms),
+                lambda: arxiv_articles(client, areas, since, today, terms=terms), unavailable)
+        except SCIENCE_ERRORS:
             preprints = []
             unavailable.append("arXiv")
 
@@ -275,23 +299,17 @@ def search_frontier(
         published = []
         for current_area in areas:
             try:
-                published.extend(crossref_articles(client, current_area, since, today))
-            except (httpx.HTTPError, KeyError, TypeError, ValueError):
+                published.extend(_article_snapshot("Crossref", (current_area, since, today, ()),
+                    lambda: crossref_articles(client, current_area, since, today), unavailable))
+            except SCIENCE_ERRORS:
                 unavailable.append(f"Crossref ({current_area})")
 
         try:
-            preprints = arxiv_articles(client, areas, since, today)
-        except (httpx.HTTPError, ElementTree.ParseError) as error:
+            preprints = _article_snapshot("arXiv", (areas, since, today, ()),
+                lambda: arxiv_articles(client, areas, since, today), unavailable)
+        except SCIENCE_ERRORS:
             unavailable.append("arXiv")
             preprints = []
-            may_retry = not isinstance(error, httpx.HTTPStatusError) or error.response.status_code >= 500
-            if len(areas) > 1 and may_retry:
-                sleep(3)
-                try:
-                    preprints = arxiv_articles(client, areas[:1], since, today)
-                    unavailable[-1] = "arXiv (часть категорий)"
-                except (httpx.HTTPError, ElementTree.ParseError):
-                    pass
 
         checked = []
         seen_dois: set[str] = set()
@@ -304,11 +322,15 @@ def search_frontier(
             if paper.doi in verified_dois and remaining_checks:
                 remaining_checks -= 1
                 try:
-                    if has_retraction(client, paper.doi):
+                    retracted, current = _retraction_status(client, paper.doi)
+                    if retracted:
                         retracted_dois.add(paper.doi)
                         continue
-                    paper = replace(paper, status="verified")
-                except (httpx.HTTPError, KeyError, TypeError, ValueError):
+                    if current:
+                        paper = replace(paper, status="verified")
+                    elif "Crossref: проверка отзыва по снимку" not in unavailable:
+                        unavailable.append("Crossref: проверка отзыва по снимку")
+                except SCIENCE_ERRORS:
                     if "Crossref: проверка отзыва" not in unavailable:
                         unavailable.append("Crossref: проверка отзыва")
             checked.append(paper)

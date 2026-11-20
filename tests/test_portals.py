@@ -16,6 +16,7 @@ from auth.settings import Settings
 from auth.user_repository import CurrentUser
 from auth.yandex_users import accounts_from_text
 from domain.export import export_course
+from domain.schemas import EvidenceResults
 from orchestration.checkpointer import open_checkpointer
 from orchestration.graph import build_course_graph
 from storage.database import make_engine
@@ -91,6 +92,8 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             return await db.get(Course, "course")
 
     async def test_direct_course_review_export_and_audit(self):
+        notes = ["Books: использован сохранённый снимок."]
+        self.evidence.search.return_value = EvidenceResults(records().values(), notes)
         course = await self.process()
         self.assertEqual(course.status, "waiting_for_review")
         args = (self.factory, self.teacher, course.id, course.draft_version_id)
@@ -110,6 +113,8 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rpd["workload"]["totalCredits"], 1)
             self.assertEqual(rpd["workload"]["totalHours"], 36)
             self.assertTrue(rpd["assessmentMaterials"])
+            self.assertEqual(rpd["sourceNotes"], notes)
+            self.assertEqual(json.loads(package.read("course.json"))["source_notices"], notes)
             self.assertIn("color:", package.read("rpd/01/rpd.html").decode())
         self.assertEqual(await schedule_due(self.factory), 0)
         for needs_update in (False, True):

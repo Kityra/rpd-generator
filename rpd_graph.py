@@ -173,6 +173,8 @@ def build_rpd_graph(
 
     def draft(state: RpdState) -> dict:
         request = state["request"]
+        source_notices = list(dict.fromkeys(note for profile in PROFILES
+                                           for note in state[profile].get("source_notices", [])))
         request_data = {
             "request": request,
             "research": {
@@ -181,6 +183,8 @@ def build_rpd_graph(
             },
             "previousDraft": state.get("document"),
         }
+        if source_notices:
+            request_data["sourceNotices"] = source_notices
         revision = state.get("revision")
         scientific_suggestions = [] if revision else state["science"].get("articles", [])
         instructions = WEB_DRAFT_INSTRUCTIONS if draft_first else DRAFT_INSTRUCTIONS
@@ -238,6 +242,8 @@ def build_rpd_graph(
             request_data["schemaErrors"] = errors[:15]
         if not errors:
             include_scientific_suggestions(document, scientific_suggestions)
+            if source_notices:
+                document["sourceNotes"] = list(dict.fromkeys([*document.get("sourceNotes", []), *source_notices]))
         if draft_first:
             result = {"document": document, "ready": True, "revision": None}
             if revision:
