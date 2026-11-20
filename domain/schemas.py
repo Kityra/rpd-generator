@@ -9,7 +9,7 @@ class Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-SourceType = Literal["HH", "Priklad", "Crossref", "arXiv", "Books", "RPD", "Interview", "expert", "teacher", "documentation"]
+SourceType = Literal["HH", "Priklad", "Crossref", "arXiv", "Books", "RPD", "Interview", "expert", "teacher", "documentation", "RabotaRu"]
 ChangeStatus = Literal["unchanged", "added", "modified", "fundamental_protected"]
 GapType = Literal["missing_tasks", "missing_stack", "missing_quality_criteria", "missing_artifacts", "conflicting_evidence"]
 

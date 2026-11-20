@@ -14,6 +14,7 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from check_yandex_indexes import content_indexes
+from orchestration.rabota_business import RabotaBusiness, SOURCE_GUIDANCE
 from rpd_graph import RpdRequest, build_rpd_graph
 from rpd_specialists import PROFILE_SCHEMA, PROFILES, ProfileName, SourceFragment, SpecialistReport, analyse_fragments
 from science_literature import Article, find_course_articles, normalise_doi
@@ -122,6 +123,7 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
         return require_response_text(response)
 
     flash_uri = f"gpt://{settings['YANDEX_FOLDER_ID']}/aliceai-llm-flash"
+    rabota = RabotaBusiness.from_environment()
 
     def research(name: ProfileName, request: RpdRequest) -> SpecialistReport:
         profile = PROFILES[name]
@@ -148,6 +150,8 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
                 if text.strip():
                     fragments.append(SourceFragment(file=hit.filename, text=text[:2_000], index=search.index))
 
+        vacancy_fragments = rabota.fragments(request.discipline) if rabota and name == "business" else []
+        fragments.extend(vacancy_fragments)
         model = settings.get(f"YANDEX_MODEL_URI_{name.upper()}", "") or flash_uri
         book_count = len(fragments)
         articles: list[Article] = []
@@ -163,7 +167,11 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
             return request_json(model, instructions, payload, PROFILE_SCHEMA, f"rpd_{name}", 896, 35)
 
         try:
-            report = analyse_fragments(profile, request.discipline, fragments, summarize)
+            if vacancy_fragments:
+                report = analyse_fragments(profile, request.discipline, fragments, summarize,
+                                           scope=f"{profile.scope} {SOURCE_GUIDANCE}")
+            else:
+                report = analyse_fragments(profile, request.discipline, fragments, summarize)
         except YandexModeratedResponse:
             notify(f"{profile.label}: Yandex AI Studio ограничила ответ, материалы узла пропущены.")
             return {"fragments": [], "findings": []}

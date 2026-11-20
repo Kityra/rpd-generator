@@ -14,6 +14,7 @@ from domain.schemas import (AppliedActivityModel, BusinessCourseAudit, CoursePro
 from orchestration.clients import EvidenceClient, ModelClient, NoActivityEvidence, source_record
 from orchestration import prompts
 from orchestration.interview_methods import load_interview_methods
+from orchestration.rabota_business import SOURCE, SOURCE_GUIDANCE
 
 
 def merge_records(previous: list[dict], additions: list[dict]) -> list[dict]:
@@ -141,7 +142,10 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             if not sources:
                 return {f"{role}_report": {"findings": []}, "sources": []}
             source_map = {item.source_id: item for item in sources}
-            report = await llm.generate(AgentReport, prompts.AGENT.format(role=role),
+            instructions = prompts.AGENT.format(role=role)
+            if role == "business" and any(item.source_type == SOURCE for item in sources):
+                instructions += "\n" + SOURCE_GUIDANCE
+            report = await llm.generate(AgentReport, instructions,
                                         {"course": state["course_meta"], "sources": [item.model_dump(mode="json") for item in sources]},
                                         {"sources": source_map}, flash=True)
             return {f"{role}_report": report.model_dump(mode="json"),
@@ -159,13 +163,16 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def formalize(state: GraphState) -> dict:
         sources = {k: s for k, s in registry(state).items()
-                   if s.source_type in {"Priklad", "HH", "Crossref", "arXiv", "expert", "documentation"}}
+                   if s.source_type in {"Priklad", "HH", "Crossref", "arXiv", "expert", "documentation", SOURCE}}
         if not sources:
             return {"applied_activity": {}}
         activity_input = {"course": state["course_meta"], "business": state["business_report"],
                           "science": state["science_report"], "sources": [s.model_dump(mode="json") for s in sources.values()]}
         try:
-            model = await llm.generate(AppliedActivityModel, prompts.ACTIVITY, activity_input, {"sources": sources})
+            instructions = prompts.ACTIVITY
+            if any(source.source_type == SOURCE for source in sources.values()):
+                instructions += "\n" + SOURCE_GUIDANCE
+            model = await llm.generate(AppliedActivityModel, instructions, activity_input, {"sources": sources})
         except NoActivityEvidence:
             return {"applied_activity": {}}
         return {"applied_activity": model.model_dump(mode="json")}
@@ -188,7 +195,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         def coverage(types: set[str]) -> float:
             return sum(any(sources[key].source_type in types for key in task.source_ids)
                        for task in activity.tasks) / max(count, 1)
-        business = coverage({"HH", "Priklad"})
+        business = coverage({"HH", "Priklad", SOURCE})
         science = coverage({"Crossref", "arXiv"})
         gaps, questions = [], []
         if count < 5 or len(activity.processes) < 3:
