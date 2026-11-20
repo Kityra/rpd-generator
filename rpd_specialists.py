@@ -29,6 +29,14 @@ class Findings(BaseModel):
 class SpecialistReport(TypedDict):
     fragments: list[SourceFragment]
     findings: list[dict]
+    articles: NotRequired[list["ArticleSuggestion"]]
+
+
+class ArticleSuggestion(TypedDict):
+    title: str
+    url: str
+    status: str
+    idea: str
 
 
 ProfileName = Literal["university", "science", "business"]
@@ -67,7 +75,11 @@ PROFILES: dict[ProfileName, SpecialistProfile] = {
         "Science",
         (IndexSearch("Books", "{discipline}: учебники, научные работы, ключевые понятия и методы.", 3),),
         "Подбирай материалы к дисциплине, учебные темы, книги и научные работы. "
-        "Приводи библиографические реквизиты, только если они видны во фрагменте.",
+        "Если библиографическая карточка свежей статьи действительно релевантна, предложи конкретную тему "
+        "или практическое задание, которое можно добавить в эту РПД, и сошлись на номере именно этой карточки. "
+        "Используй доступный фрагмент аннотации для понимания темы. Сформулируй учебную идею своими словами. "
+        "По одному названию статьи не утверждай, что авторы получили какие-либо результаты. "
+        "Отличай препринты от опубликованных работ. Оставляй хотя бы одно место для релевантной свежей статьи.",
     ),
     "business": SpecialistProfile(
         "Business",

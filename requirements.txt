@@ -4,3 +4,5 @@ pydantic>=2.7,<3
 python-dotenv>=1,<2
 jsonschema>=4,<5
 httpx>=0.28,<1
+streamlit>=1.67,<2
+pypdf>=6,<7

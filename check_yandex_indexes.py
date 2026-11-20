@@ -55,7 +55,7 @@ def main() -> int:
                       f"failed {counts.failed}, cancelled {counts.cancelled}, in progress {counts.in_progress}")
                 ready = store.status == "completed" and counts.total > 0 and counts.completed == counts.total
                 all_ready = all_ready and ready
-                if args.query and ready:
+                if args.query:
                     results = client.vector_stores.search(store_id, query=args.query, max_num_results=3)
                     if not results.data:
                         print("Search returned no matches.")

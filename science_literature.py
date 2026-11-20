@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
+from html import unescape
 import re
 from time import sleep
 from urllib.parse import quote
@@ -43,27 +44,36 @@ class Article:
     citations: int | None = None
     citation_source: str = ""
     area: str = ""
+    abstract: str = ""
 
-    def as_science_source(self) -> SourceFragment:
+    def as_science_source(self, *, include_abstract: bool = False) -> SourceFragment:
         text = (f"Название: {self.title}\nАвторы: {', '.join(self.authors)}\n"
                 f"Год: {self.year or 'не указан'}\nИздание: {self.venue or 'не подтверждено'}\n"
                 f"Статус: {self.status}\nОбласть: {self.area}\nСсылка: {self.url}")
+        if include_abstract and self.abstract:
+            text += f"\nФрагмент аннотации: {self.abstract}"
         return {
             "file": self.url,
             "text": text,
         }
 
 
-def crossref_articles(client: httpx.Client, area: str, since: date, today: date) -> list[Article]:
-    issns, _ = IT_AREAS[area]
+def crossref_articles(
+    client: httpx.Client, area: str | None, since: date, today: date, *, query: str = "",
+) -> list[Article]:
+    issns = IT_AREAS[area][0] if area else ()
     filters = [*(f"issn:{issn}" for issn in issns), "type:journal-article", "type:proceedings-article",
                f"from-pub-date:{since}", f"until-pub-date:{today}"]
-    response = client.get(CROSSREF, params={
+    params = {
         "filter": ",".join(filters),
         "sort": "is-referenced-by-count", "order": "desc",
         "select": "DOI,title,container-title,issued,author,is-referenced-by-count,update-to",
         "rows": 6,
-    })
+    }
+    if query:
+        params.update({"query.bibliographic": query, "sort": "score", "rows": 12})
+        params["select"] += ",abstract"
+    response = client.get(CROSSREF, params=params)
     response.raise_for_status()
     papers = []
     for work in response.json()["message"]["items"]:
@@ -87,7 +97,8 @@ def crossref_articles(client: httpx.Client, area: str, since: date, today: date)
             ),
             citations=work.get("is-referenced-by-count"),
             citation_source="Crossref",
-            area=area,
+            area=area or "",
+            abstract=" ".join(unescape(re.sub(r"<[^>]+>", " ", work.get("abstract") or "")).split())[:800],
         ))
     return papers
 
@@ -98,12 +109,30 @@ def has_retraction(client: httpx.Client, doi: str) -> bool:
     return response.json()["message"]["total-results"] > 0
 
 
-def arxiv_articles(client: httpx.Client, areas: tuple[str, ...], since: date, today: date) -> list[Article]:
+def check_course_retraction(client: httpx.Client, doi: str) -> bool:
+    try:
+        return has_retraction(client, doi)
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code != 429:
+            raise
+        retry_after = error.response.headers.get("Retry-After", "1").strip()
+        if not retry_after.isdecimal() or int(retry_after) > 2:
+            raise
+        sleep(max(1, int(retry_after)))
+        return has_retraction(client, doi)
+
+
+def arxiv_articles(
+    client: httpx.Client, areas: tuple[str, ...], since: date, today: date, *, terms: tuple[str, ...] = (),
+) -> list[Article]:
     categories = {category: area for area in areas for category in IT_AREAS[area][1]}
     scope = " OR ".join(f"cat:{category}" for category in categories)
+    if terms:
+        keywords = " OR ".join(f"ti:{term}" for term in terms)
+        scope = f"({scope}) AND ({keywords}) AND submittedDate:[{since:%Y%m%d}0000 TO {today:%Y%m%d}2359]"
     response = client.get(ARXIV, params={
         "search_query": scope,
-        "sortBy": "submittedDate",
+        "sortBy": "relevance" if terms else "submittedDate",
         "sortOrder": "descending",
         "max_results": 8,
     }, timeout=12)
@@ -130,8 +159,59 @@ def arxiv_articles(client: httpx.Client, areas: tuple[str, ...], since: date, to
             doi=normalise_doi(entry.findtext("arxiv:doi", "", ATOM)),
             authors=tuple(author.findtext("atom:name", "", ATOM) for author in entry.findall("atom:author", ATOM)[:8]),
             area=area,
+            abstract=" ".join(entry.findtext("atom:summary", "", ATOM).split())[:800] if terms else "",
         ))
     return papers
+
+
+def find_course_articles(query: str, *, verified_dois: set[str]) -> tuple[list[Article], list[str]]:
+    """Find recent works for a particular discipline, with bounded optional lookups."""
+    ignored = {"and", "for", "with", "from", "the", "using"}
+    terms = tuple(dict.fromkeys(word for word in re.findall(r"[a-z][a-z0-9]+", query.lower())
+                               if word not in ignored))[:8]
+    if len(terms) < 2:
+        return [], []
+
+    def match(paper: Article) -> int:
+        words = {word.removesuffix("s") for word in re.findall(r"[a-z][a-z0-9]+", paper.title.lower())}
+        return sum(term.removesuffix("s") in words for term in terms)
+
+    today = date.today()
+    since = today - timedelta(days=FRONTIER_WINDOW_DAYS)
+    unavailable = []
+    selected = []
+    with httpx.Client(timeout=7, headers={"User-Agent": "RPD-Science/0.1"}) as client:
+        try:
+            published = crossref_articles(client, None, since, today, query=" ".join(terms))
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            published = []
+            unavailable.append("Crossref")
+        ranked = sorted((paper for paper in published if match(paper) >= 2),
+                        key=lambda paper: (paper.doi in verified_dois, match(paper), paper.citations or 0),
+                        reverse=True)
+        unique = {}
+        for paper in ranked:
+            unique.setdefault(paper.doi, paper)
+        for paper in list(unique.values())[:3]:
+            try:
+                if check_course_retraction(client, paper.doi):
+                    continue
+            except (httpx.HTTPError, KeyError, TypeError, ValueError):
+                unavailable.append("Crossref: проверка отзыва")
+                break
+            selected.append(replace(paper, status="verified" if paper.doi in verified_dois else "published_candidate"))
+        try:
+            preprints = arxiv_articles(client, tuple(IT_AREAS), since, today, terms=terms)
+        except (httpx.HTTPError, ElementTree.ParseError):
+            preprints = []
+            unavailable.append("arXiv")
+
+    known_titles = {paper.title.casefold() for paper in selected}
+    for paper in sorted(preprints, key=match, reverse=True):
+        if match(paper) >= 2 and paper.doi not in unique and paper.title.casefold() not in known_titles:
+            selected.append(paper)
+            break
+    return selected, unavailable
 
 
 def semantic_citations(client: httpx.Client, dois: list[str], key: str) -> dict[str, int]:
