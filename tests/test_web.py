@@ -7,7 +7,7 @@ from zipfile import ZipFile
 
 from streamlit.testing.v1 import AppTest
 
-from app import download_package, show_revisions
+from preview_app import download_package, show_revisions
 from rpd_graph import build_rpd_graph
 from run_course import Discipline
 from test_pipeline import ROOT, SCHEMA, proposal
@@ -46,7 +46,7 @@ class WebPreviewTests(unittest.TestCase):
         task = self.preview.batches[batch_id].tasks[0]
         file = SimpleNamespace(name="plan.txt", getvalue=lambda: "Добавить SQL".encode())
         preview = MagicMock()
-        with patch("app.st") as ui:
+        with patch("preview_app.st") as ui:
             ui.chat_input.return_value = SimpleNamespace(text="", files=[file])
             show_revisions(preview, task)
             attachments = preview.advance.call_args.args[2]
@@ -113,7 +113,7 @@ class WebPreviewTests(unittest.TestCase):
 
     def test_network_binding_leaves_public_generation_unavailable(self):
         with patch("streamlit.get_option", return_value="0.0.0.0"):
-            app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=20).run()
+            app = AppTest.from_file(str(ROOT / "preview_app.py"), default_timeout=20).run()
         self.assertFalse(app.exception)
         self.assertIn("после подключения облачного входа", app.info[0].value)
         self.assertFalse(app.button)
@@ -122,7 +122,7 @@ class WebPreviewTests(unittest.TestCase):
 
     def test_streamlit_course_suggestions_can_be_edited_before_submission(self):
         self.generate.return_value = web_proposal()
-        app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=20).run()
+        app = AppTest.from_file(str(ROOT / "preview_app.py"), default_timeout=20).run()
         next(item for item in app.radio if item.label == "Вид заявки").set_value("Комплект на курс").run()
         for field, value in zip(app.text_input, ("Информатика", "Вуз", "2026/2027"), strict=True):
             field.set_value(value)
@@ -151,7 +151,7 @@ class WebPreviewTests(unittest.TestCase):
         def button(app, label):
             return next(item for item in app.button if item.label == label)
 
-        app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=20).run()
+        app = AppTest.from_file(str(ROOT / "preview_app.py"), default_timeout=20).run()
         self.assertFalse(app.exception)
         self.assertEqual(app.radio(key="navigation").options, ["Новая РПД", "Черновики"])
         self.assertFalse(any(item.label == "Войти" for item in app.button))

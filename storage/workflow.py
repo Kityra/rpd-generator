@@ -39,7 +39,21 @@ class SqlWorkflowStore:
         async with write_transaction(self.factory) as db:
             if await db.get(Interview, interview_id) is None:
                 db.add(Interview(id=interview_id, course_id=course_id, interrupt_id=interrupt_id, gap_report=report))
+                previous_id = report.get("previous_interview_id")
+                if previous_id:
+                    previous = await db.scalar(select(ExpertInvitation).join(Interview).where(
+                        Interview.course_id == course_id, Interview.id == previous_id, ExpertInvitation.status == "used"))
+                    if previous:
+                        await db.flush()
+                        db.add(ExpertInvitation(interview_id=interview_id, expert_user_id=previous.expert_user_id,
+                            token_hash=hashlib.sha256(secrets.token_bytes(32)).hexdigest(), created_by=previous.created_by,
+                            expires_at=datetime.now(timezone.utc) + timedelta(days=7)))
         return interview_id
+
+    async def record_verification(self, interview_id: str, report: dict) -> None:
+        async with write_transaction(self.factory) as db:
+            row = await db.get(Interview, interview_id)
+            row.gap_report = {**row.gap_report, "verification": report}
 
     async def invite(self, interview_id: str, expert_id: str, teacher: CurrentUser,
                      users: UserRepository) -> str:
@@ -48,7 +62,7 @@ class SqlWorkflowStore:
             raise PermissionError("Требуются преподаватель и существующий эксперт.")
         token = secrets.token_urlsafe(32)
         async with write_transaction(self.factory) as db:
-            interview = await db.get(Interview, interview_id)
+            interview = await db.scalar(select(Interview).where(Interview.id == interview_id).with_for_update())
             course = await db.get(Course, interview.course_id) if interview else None
             if course is None or course.owner_user_id != teacher.id or interview.status == "submitted":
                 raise PermissionError("Интервью недоступно.")
@@ -62,13 +76,14 @@ class SqlWorkflowStore:
         return token
 
     async def submit_interview(self, token: str, expert: CurrentUser, interrupt_id: str,
-                               submission_id: str, content: str, attachments: list[dict]) -> None:
+                               submission_id: str, content: str, attachments: list[dict], *, invitation_id: str | None = None) -> None:
         if expert.role != "expert" or not content.strip() or len(content) > 16000:
             raise PermissionError("Требуется ответ авторизованного эксперта.")
         at = datetime.now(timezone.utc)
         async with write_transaction(self.factory) as db:
-            invitation = await db.scalar(select(ExpertInvitation).where(
-                ExpertInvitation.token_hash == hashlib.sha256(token.encode()).hexdigest()).with_for_update())
+            locator = (ExpertInvitation.id == invitation_id if invitation_id else
+                       ExpertInvitation.token_hash == hashlib.sha256(token.encode()).hexdigest())
+            invitation = await db.scalar(select(ExpertInvitation).where(locator).with_for_update())
             if invitation is None or invitation.expert_user_id != expert.id:
                 raise PermissionError("Приглашение недоступно.")
             interview = await db.get(Interview, invitation.interview_id)
@@ -90,11 +105,16 @@ class SqlWorkflowStore:
             db.add(WorkflowCommand(id=command_id, course_id=interview.course_id, kind="resume", payload=payload))
             interview.status, interview.submitted_at = "submitted", at
             invitation.status, invitation.used_at = "used", at
+            course = await db.get(Course, interview.course_id)
+            course.status = "answer_queued"
 
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
                          scheduled: bool, activity: dict) -> None:
         async with write_transaction(self.factory) as db:
             course = await db.scalar(select(Course).where(Course.id == course_id).with_for_update())
+            if course.draft_version_id and course.draft_version_id != version_id:
+                previous = await db.get(CourseVersion, course.draft_version_id)
+                previous.status = "archived"
             if await db.get(CourseVersion, version_id) is None:
                 revision = (await db.scalar(select(func.max(CourseVersion.revision)).where(
                     CourseVersion.course_id == course_id)) or 0) + 1
@@ -111,7 +131,7 @@ class SqlWorkflowStore:
                     db.add(Notification(user_id=course.owner_user_id, course_id=course_id, version_id=version_id,
                                         event="relevance_update", content="Курс обновлён по результатам 9-месячной проверки актуальности"))
 
-    async def finish_review(self, course_id: str, version_id: str, action: str, actor: str) -> None:
+    async def finish_review(self, course_id: str, version_id: str, action: str, actor: str, workloads=None) -> None:
         async with write_transaction(self.factory) as db:
             course = await db.scalar(select(Course).where(Course.id == course_id).with_for_update())
             if course is None or course.owner_user_id != actor:
@@ -121,9 +141,15 @@ class SqlWorkflowStore:
                 raise ValueError("Версия недоступна.")
             if action == "approve" and course.active_version_id == version_id:
                 return
+            if action == "reject" and version.status == "archived" and course.draft_version_id is None:
+                return
             if course.draft_version_id != version_id:
                 raise ValueError("Черновик изменился. Обновите страницу.")
             if action == "approve":
+                version.content = {**version.content, "workloads": workloads or {}}
+                if course.active_version_id:
+                    previous = await db.get(CourseVersion, course.active_version_id)
+                    previous.status = "archived"
                 version.status = "approved"
                 course.active_version_id = version_id
                 course.last_approved_at = datetime.now(timezone.utc)

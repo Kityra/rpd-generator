@@ -9,6 +9,10 @@ class Settings(BaseSettings):
 
     app_database_url: str = "sqlite+aiosqlite:///./data/application.sqlite"
     user_database_url: str = ""
+    teachers_index_id: str = ""
+    experts_index_id: str = ""
+    yandex_folder_id: str = ""
+    yandex_api_key: SecretStr | None = None
     user_schema_mode: Literal["single", "split", "related"] = "single"
     users_table: str = "users"
     teachers_table: str = "teachers"

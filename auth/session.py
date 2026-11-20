@@ -96,6 +96,10 @@ class AuthService:
 async def require_role(service: AuthService, roles: set[str]) -> CurrentUser:
     import streamlit as st
 
+    ip = st.context.ip_address
+    ip = ip if isinstance(ip, str) and ip else "unknown"
+    agent = st.context.headers.get("User-Agent", "")
+    agent = agent if isinstance(agent, str) else ""
     token = st.session_state.get("session_token") or st.context.cookies.get("rpd_session", "")
     user = await service.authenticate(token)
     if user is None:
@@ -105,18 +109,17 @@ async def require_role(service: AuthService, roles: set[str]) -> CurrentUser:
             submitted = st.form_submit_button("Войти")
         if submitted:
             try:
-                token = await service.login(email, password, st.context.ip_address or "unknown",
-                                            st.context.headers.get("User-Agent", ""))
+                token = await service.login(email, password, ip, agent)
                 st.session_state["session_token"] = token
                 st.rerun()
             except PermissionError as error:
                 st.error(str(error))
         st.stop()
+    if st.button("Выйти"):
+        await service.logout(token, ip, agent)
+        st.session_state.clear()
+        st.rerun()
     if user.role not in roles:
         st.error("Портал недоступен для вашей роли.")
         st.stop()
-    if st.button("Выйти"):
-        await service.logout(token, st.context.ip_address or "unknown", st.context.headers.get("User-Agent", ""))
-        st.session_state.pop("session_token", None)
-        st.rerun()
     return user

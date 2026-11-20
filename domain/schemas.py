@@ -99,6 +99,15 @@ class AppliedActivityModel(Grounded):
     processes: list[ActivityProcess]
     aspects: list[ActivityAspect]
 
+    @model_validator(mode="before")
+    @classmethod
+    def collect_activity_sources(cls, data):
+        if isinstance(data, dict) and data.get("source_ids") == []:
+            children = [*data.get("tasks", []), *data.get("processes", []), *data.get("aspects", [])]
+            references = [key for item in children if isinstance(item, dict) for key in item.get("source_ids", [])]
+            return {**data, "source_ids": list(dict.fromkeys(references))}
+        return data
+
     @model_validator(mode="after")
     def check_relations(self) -> "AppliedActivityModel":
         ids = [task.id for task in self.tasks]

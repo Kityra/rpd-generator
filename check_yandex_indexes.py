@@ -16,6 +16,12 @@ INDEX_SETTINGS = {
 YANDEX_BASE_URL = "https://ai.api.cloud.yandex.net/v1"
 
 
+def content_indexes() -> dict[str, str]:
+    aliases = {"interview": "INTERVIEW_SKILLS_INDEX_ID"}
+    return {key: os.getenv(aliases.get(name, f"{name.upper()}_INDEX_ID"), "").strip()
+            or os.getenv(key, "").strip() for name, key in INDEX_SETTINGS.items()}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--index", choices=INDEX_SETTINGS)
@@ -37,6 +43,7 @@ def main() -> int:
     if args.check_model:
         required.append("YANDEX_MODEL_URI")
     settings = {key: os.environ.get(key, "").strip() for key in required}
+    settings.update({key: value for key, value in content_indexes().items() if key in required})
     missing = [key for key, value in settings.items() if not value]
     if missing:
         parser.exit(2, "Fill in .env: " + ", ".join(missing) + "\n")
