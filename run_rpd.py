@@ -144,9 +144,15 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
                     raise ValueError(f"Обязательный индекс {search.index} не настроен.")
                 note(f"{profile.label}: индекс {search.index} пока не указан.")
                 continue
+            query = search.query.format_map(fields)
+            scope = ("local",)
+            if search.required:
+                if request.program:
+                    query += f" Образовательная программа: {request.program}."
+                scope = ("local", request.institution, request.program, request.discipline, request.academic_year)
             try:
                 results, taken_at = search_fragments(client, settings, search.index, index_id,
-                    search.query.format_map(fields), search.result_count, budget=20)
+                                                    query, search.result_count, scope=scope, budget=20)
             except (APIStatusError, APIResponseValidationError, ExternalUnavailable, InvalidIndexResponse):
                 if search.required:
                     raise
@@ -155,7 +161,8 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
             if taken_at is not None:
                 note(snapshot_notice(search.index, taken_at))
             for hit in results:
-                fragments.append(SourceFragment(file=hit.title, text=hit.text[:2_000], index=search.index))
+                fragments.append(SourceFragment(file=hit.title, text=hit.content[:2_000], index=search.index,
+                                                url=hit.url, retrieved_at=hit.retrieved_at.isoformat()))
 
         vacancy_fragments = rabota.fragments(request.discipline) if rabota and name == "business" else []
         fragments.extend(vacancy_fragments)
@@ -218,6 +225,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--discipline", help="Название дисциплины")
     parser.add_argument("--year", help="Целевой учебный год")
     parser.add_argument("--institution", help="Название вуза")
+    parser.add_argument("--program", default="", help="Название образовательной программы")
     parser.add_argument("--facts-file", type=Path, help="Файл UTF-8 с известными сведениями для РПД")
     parser.add_argument("--output", type=Path, default=ROOT / "rpd_draft.json", help="Куда сохранить черновик")
     args = parser.parse_args(argv)
@@ -234,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
             discipline=args.discipline or read_answer("Название дисциплины: "),
             academic_year=args.year or read_answer("Учебный год: "),
             institution=args.institution or read_answer("Название вуза: "),
+            program=args.program.strip(),
             facts=args.facts_file.read_text(encoding="utf-8-sig") if args.facts_file else "",
         )
 

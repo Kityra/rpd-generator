@@ -1,6 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import date
+import json
+import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Event
 from types import SimpleNamespace
 import unittest
@@ -15,6 +19,7 @@ from orchestration.graph import AgentReport
 from orchestration.resilience import ExternalUnavailable, Resilience
 import run_rpd
 import science_literature as science
+from storage.evidence_snapshots import EvidenceSnapshotStore, SNAPSHOTS
 
 
 def sdk_error(status):
@@ -99,36 +104,21 @@ class ResilienceTests(unittest.TestCase):
             self.assertTrue(recovered.result())
         self.assertEqual(self.call(lambda timeout: "closed"), "closed")
 
-    def test_snapshot_expiry_empty_success_and_auth_failure(self):
-        key = (self.service, "query")
-        fetch = MagicMock(return_value=("record",))
-        self.assertEqual(self.policy.search(key, fetch, max_age=5), (("record",), None))
-        self.now = 3
-        fetch.side_effect = ExternalUnavailable()
-        records, timestamp = self.policy.search(key, fetch, max_age=5)
-        self.assertEqual(records, ("record",))
-        self.assertIsNotNone(timestamp)
-        self.now = 6
-        with self.assertRaises(ExternalUnavailable):
-            self.policy.search(key, fetch, max_age=5)
-
-        fetch.side_effect = None
-        self.policy.search(key, fetch, max_age=5)
-        fetch.return_value = ()
-        self.assertEqual(self.policy.search(key, fetch, max_age=5), ((), None))
-        fetch.side_effect = ExternalUnavailable()
-        self.assertEqual(self.policy.search(key, fetch, max_age=5)[0], ())
-        fetch.side_effect = sdk_error(401)
-        with self.assertRaises(AuthenticationError):
-            self.policy.search(key, lambda: self.call(fetch), max_age=5)
-        fetch.side_effect = ExternalUnavailable()
-        with self.assertRaises(ExternalUnavailable):
-            self.policy.search(key, fetch, max_age=5)
-        self.assertEqual(fetch.call_count, 8)
+class DatabaseFixture:
+    def use_database(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        url = "sqlite+aiosqlite:///" + (Path(directory.name) / "snapshot.sqlite").as_posix()
+        with EvidenceSnapshotStore(url).engine.begin() as connection:
+            SNAPSHOTS.create(connection)
+        env = patch.dict(os.environ, {"APP_DATABASE_URL": url})
+        env.start()
+        self.addCleanup(env.stop)
 
 
-class YandexResilienceTests(unittest.IsolatedAsyncioTestCase):
+class YandexResilienceTests(DatabaseFixture, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.use_database()
         self.settings = {"YANDEX_FOLDER_ID": "folder", "YANDEX_API_KEY": "fixture", "YANDEX_MODEL_URI": "model",
                          "YANDEX_VECTOR_STORE_ID_RPD": "rpd", "YANDEX_VECTOR_STORE_ID_BOOKS": "books"}
         self.client = MagicMock()
@@ -156,18 +146,21 @@ class YandexResilienceTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(data=[hit]) if index == "rpd" else self.raise_unavailable())
         with patch("orchestration.clients.open_yandex", return_value=nullcontext(self.client)):
             evidence = YandexEvidenceClient(self.settings)
-            live = await evidence.search("university", "exact-course")
+            query = '{"institution":"University","title":"Databases","year":"2026/2027"}'
+            live = await evidence.search("university", query, owner_scope="owner")
             self.assertEqual([source.source_type for source in live], ["RPD"])
             self.assertIn("Books", live.notices[0])
             self.client.vector_stores.search.side_effect = sdk_error(503)
-            cached = await evidence.search("university", "exact-course")
-            self.assertEqual(cached[0].source_id, live[0].source_id)
+            cached = await YandexEvidenceClient(self.settings).search("university", query, owner_scope="owner")
+            self.assertEqual(cached[0], live[0])
             self.assertTrue(any("снимок" in note for note in cached.notices))
             with self.assertRaises(ExternalUnavailable):
-                await evidence.search("university", "other-course")
+                await evidence.search("university", query.replace("2026/2027", "2027/2028"), owner_scope="owner")
+            with self.assertRaises(ExternalUnavailable):
+                await evidence.search("university", query, owner_scope="other-owner")
             other_scope = YandexEvidenceClient({**self.settings, "YANDEX_API_KEY": "other-fixture"})
             with self.assertRaises(ExternalUnavailable):
-                await other_scope.search("university", "exact-course")
+                await other_scope.search("university", query, owner_scope="owner")
 
     @staticmethod
     def raise_unavailable():
@@ -178,8 +171,11 @@ class YandexResilienceTests(unittest.IsolatedAsyncioTestCase):
         # An earlier successful empty response does not supply evidence during an outage.
         profile_search = run_rpd.PROFILES["university"].searches[0]
         self.client.vector_stores.search.return_value = SimpleNamespace(data=[])
-        yandex_calls.search_fragments(self.client, self.settings, "RPD", "rpd",
-                                      profile_search.query.format_map(request_data), profile_search.result_count)
+        with self.assertRaises(ExternalUnavailable):
+            yandex_calls.search_fragments(self.client, self.settings, "RPD", "rpd",
+                                          profile_search.query.format_map(request_data), profile_search.result_count,
+                                          scope=("local", request_data["institution"], "", request_data["discipline"],
+                                                 request_data["academic_year"]))
         self.client.vector_stores.search.side_effect = sdk_error(503)
         self.client.responses.create.return_value = reply('{"query":""}')
         graph = run_rpd.create_rpd_graph(self.client, self.settings)
@@ -188,9 +184,43 @@ class YandexResilienceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("rpd_draft", [call.kwargs["text"]["format"]["name"]
                                       for call in self.client.responses.create.call_args_list])
 
+    def test_document_and_final_prompt_report_original_snapshot_date(self):
+        request = {"discipline": "Databases", "institution": "Test University", "academic_year": "2026/2027",
+                   "program": "Software Engineering"}
+        search = run_rpd.PROFILES["university"].searches[0]
+        query = search.query.format_map(request) + " Образовательная программа: Software Engineering."
+        scope = ("local", request["institution"], request["program"], request["discipline"], request["academic_year"])
+        hit = SimpleNamespace(file_id="fixture-plan", filename="plan.pdf", content=[
+            SimpleNamespace(type="text", text="Материалы по дисциплине Databases для 2026/2027")])
+        self.client.vector_stores.search.return_value = SimpleNamespace(data=[hit])
+        (saved,), _ = yandex_calls.search_fragments(self.client, self.settings, "RPD", "rpd", query,
+                                                    search.result_count, scope=scope)
+        self.client.vector_stores.search.side_effect = sdk_error(503)
+        calls = {}
 
-class ScienceResilienceTests(unittest.TestCase):
+        def respond(**kwargs):
+            name = kwargs["text"]["format"]["name"]
+            calls[name] = json.loads(kwargs["input"])
+            if name == "rpd_draft":
+                return reply(json.dumps({"document": {"purposeAndTasks": {"goals": ["SQL"], "tasks": ["Indexing"]},
+                    "appendices": [{"title": "Предлагаемый тематический план", "content": "SQL и индексы"}]}}))
+            return reply('{"findings": []}')
+
+        self.client.responses.create.side_effect = respond
+        with patch.object(run_rpd, "collect_recent_articles", return_value=[]):
+            graph = run_rpd.create_rpd_graph(self.client, self.settings, draft_first=True)
+            result = graph.invoke({"request": request}, config={"configurable": {"thread_id": "cached-plan"}})
+        payload = calls["rpd_draft"]
+        self.assertEqual(payload["research"]["university"]["fragments"][0]["retrieved_at"],
+                         saved.retrieved_at.isoformat())
+        snapshot_note = f"RPD: использован сохранённый снимок от {saved.retrieved_at:%Y-%m-%d %H:%M} UTC."
+        self.assertIn(snapshot_note, payload["sourceNotices"])
+        self.assertIn(snapshot_note, result["document"]["sourceNotes"])
+
+
+class ScienceResilienceTests(DatabaseFixture, unittest.TestCase):
     def test_cached_publication_is_not_verified_with_stale_retraction_check(self):
+        self.use_database()
         doi = "10.1234/test"
         published = {"message": {"items": [{"title": ["Database query optimization"], "DOI": doi,
                                              "issued": {"date-parts": [[date.today().year]]}}]}}

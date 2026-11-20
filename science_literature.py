@@ -1,14 +1,17 @@
 """Look up article metadata for Science without adding files to Vector Store."""
 
-from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from dataclasses import asdict, dataclass, replace
+from datetime import date, datetime, timedelta, timezone
 from html import unescape
 import re
 from urllib.parse import quote
 from xml.etree import ElementTree
 
 import httpx
+from pydantic import TypeAdapter
 
+from domain.schemas import SourceType
+from orchestration.evidence_cache import LITERATURE_TTL, SnapshotEvidence, search_evidence, source_record
 from orchestration.resilience import EXTERNAL, ExternalUnavailable, snapshot_notice
 from rpd_specialists import SourceFragment
 
@@ -46,6 +49,7 @@ class Article:
     citation_source: str = ""
     area: str = ""
     abstract: str = ""
+    retrieved_at: datetime | None = None
     cached_at: datetime | None = None
 
     def as_science_source(self, *, include_abstract: bool = False, include_snapshot_notice: bool = True) -> SourceFragment:
@@ -56,10 +60,16 @@ class Article:
             text += f"\nФрагмент аннотации: {self.abstract}"
         if include_snapshot_notice and self.cached_at is not None:
             text += "\n" + snapshot_notice(self.citation_source or "arXiv", self.cached_at)
-        return {
+        fragment: SourceFragment = {
             "file": self.url,
             "text": text,
         }
+        if self.retrieved_at is not None:
+            fragment["retrieved_at"] = self.retrieved_at.isoformat()
+        return fragment
+
+
+_ARTICLE = TypeAdapter(Article)
 
 
 def _get(client: httpx.Client, service: tuple[str, str], url: str, params: dict) -> httpx.Response:
@@ -71,12 +81,24 @@ def _get(client: httpx.Client, service: tuple[str, str], url: str, params: dict)
     return EXTERNAL.call(service, request, budget=12, read=7)
 
 
-def _article_snapshot(service, key, fetch, notices):
-    articles, taken_at = EXTERNAL.search((service, *key), lambda: tuple(fetch()), max_age=6 * 3600)
+def _article_snapshot(service: SourceType, key, fetch, notices: list[str]) -> list[Article]:
+    def normalized():
+        result = []
+        for article in fetch():
+            received = article.retrieved_at or datetime.now(timezone.utc)
+            record = source_record(service, article.url, article.title,
+                                   article.as_science_source(include_abstract=True, include_snapshot_notice=False)["text"],
+                                   retrieved_at=received)
+            details = asdict(article)
+            del details["retrieved_at"], details["cached_at"]
+            result.append(SnapshotEvidence(source=record, details=details))
+        return tuple(result)
+
+    records, taken_at = search_evidence((service, "search", "public"), key, normalized, ttl=LITERATURE_TTL)
     if taken_at is not None:
         notices.append(snapshot_notice(service, taken_at))
-        return [replace(article, cached_at=taken_at) for article in articles]
-    return list(articles)
+    return [replace(_ARTICLE.validate_python(item.details), retrieved_at=item.source.retrieved_at,
+                    cached_at=item.source.retrieved_at if taken_at is not None else None) for item in records]
 
 
 def crossref_articles(
@@ -95,8 +117,11 @@ def crossref_articles(
         params.update({"query.bibliographic": query, "sort": "score", "rows": 12})
         params["select"] += ",abstract"
     response = _get(client, ("Crossref", "search"), CROSSREF, params)
+    items = response.json()["message"]["items"]
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        raise ValueError("Crossref вернул некорректный список публикаций.")
     papers = []
-    for work in response.json()["message"]["items"]:
+    for work in items:
         title = next(iter(work.get("title") or []), "").strip()
         doi = normalise_doi(work.get("DOI") or "")
         updates = work.get("update-to") or []
@@ -126,13 +151,24 @@ def crossref_articles(
 def has_retraction(client: httpx.Client, doi: str) -> bool:
     response = _get(client, ("Crossref", "retraction"), CROSSREF,
                     {"filter": f"updates:{doi},update-type:retraction", "rows": 0})
-    return response.json()["message"]["total-results"] > 0
+    count = response.json()["message"]["total-results"]
+    if type(count) is not int or count < 0:
+        raise ValueError("Crossref вернул некорректный результат проверки отзыва.")
+    return count > 0
 
 
 def _retraction_status(client: httpx.Client, doi: str) -> tuple[bool, bool]:
-    result, taken_at = EXTERNAL.search(("Crossref", "retraction", doi),
-                                      lambda: (has_retraction(client, doi),), max_age=6 * 3600)
-    return result[0], taken_at is None
+    def fetch():
+        retracted = has_retraction(client, doi)
+        record = source_record("Crossref", "https://doi.org/" + quote(doi, safe="/"), "Проверка отзыва Crossref",
+                               "Отзыв найден" if retracted else "На момент проверки отзыв не найден")
+        return (SnapshotEvidence(source=record, details={"retracted": retracted}),)
+
+    result, taken_at = search_evidence(("Crossref", "retraction", "public"), (doi,), fetch, ttl=LITERATURE_TTL)
+    retracted = result[0].details.get("retracted") if len(result) == 1 else None
+    if type(retracted) is not bool:
+        raise ValueError("Некорректный статус отзыва в снимке.")
+    return retracted, taken_at is None
 
 
 def arxiv_articles(
@@ -199,7 +235,7 @@ def find_course_articles(query: str, *, verified_dois: set[str]) -> tuple[list[A
     selected = []
     with httpx.Client(timeout=7, headers={"User-Agent": "RPD-Science/0.1"}) as client:
         try:
-            published = _article_snapshot("Crossref", (None, since, today, terms),
+            published = _article_snapshot("Crossref", (None, since.isoformat(), today.isoformat(), terms),
                 lambda: crossref_articles(client, None, since, today, query=" ".join(terms)), unavailable)
         except SCIENCE_ERRORS:
             published = []
@@ -224,7 +260,7 @@ def find_course_articles(query: str, *, verified_dois: set[str]) -> tuple[list[A
                                     else "published_candidate"))
         try:
             areas = tuple(IT_AREAS)
-            preprints = _article_snapshot("arXiv", (areas, since, today, terms),
+            preprints = _article_snapshot("arXiv", (areas, since.isoformat(), today.isoformat(), terms),
                 lambda: arxiv_articles(client, areas, since, today, terms=terms), unavailable)
         except SCIENCE_ERRORS:
             preprints = []
@@ -299,13 +335,13 @@ def search_frontier(
         published = []
         for current_area in areas:
             try:
-                published.extend(_article_snapshot("Crossref", (current_area, since, today, ()),
+                published.extend(_article_snapshot("Crossref", (current_area, since.isoformat(), today.isoformat(), ()),
                     lambda: crossref_articles(client, current_area, since, today), unavailable))
             except SCIENCE_ERRORS:
                 unavailable.append(f"Crossref ({current_area})")
 
         try:
-            preprints = _article_snapshot("arXiv", (areas, since, today, ()),
+            preprints = _article_snapshot("arXiv", (areas, since.isoformat(), today.isoformat(), ()),
                 lambda: arxiv_articles(client, areas, since, today), unavailable)
         except SCIENCE_ERRORS:
             unavailable.append("arXiv")

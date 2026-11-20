@@ -46,6 +46,7 @@ DISCOVERY_INSTRUCTIONS = """Подбери состав учебного кур�
 Не утверждай, что найденные дисциплины входят в действующий учебный план. Не указывай
 часы, ЗЕТ, сроки или коды компетенций. Для каждой дисциплины предложи до трёх тем.
 Используй Books для предложений тем. При наличии дат отдавай приоритет более свежим материалам.
+Учитывай retrieved_at; это дата получения фрагмента, а не дата утверждения учебного плана.
 Не выдумывай источники или даты. Если состав курса неясен даже на уровне рекомендаций,
 верни пустой список. Давай отдельные дисциплины без нумерации и повторов.
 """
@@ -77,7 +78,8 @@ def discover_disciplines(
         if not store_id:
             continue
         try:
-            results, taken_at = search_fragments(client, settings, index, store_id, search, count)
+            results, taken_at = search_fragments(client, settings, index, store_id, search, count,
+                                                scope=("local-course-plan", institution, course, year))
         except (APIStatusError, APIResponseValidationError, ExternalUnavailable, InvalidIndexResponse):
             if index == "RPD":
                 raise
@@ -87,7 +89,8 @@ def discover_disciplines(
             print(snapshot_notice(index, taken_at), file=sys.stderr)
         for hit in results:
             fragments.append({"number": len(fragments) + 1, "file": hit.title,
-                              "index": index, "text": hit.text.strip()[:2_000]})
+                              "index": index, "text": hit.content.strip()[:2_000], "url": hit.url,
+                              "retrieved_at": hit.retrieved_at.isoformat()})
     response = model_response(client, settings,
         model=settings["YANDEX_MODEL_URI"], instructions=DISCOVERY_INSTRUCTIONS,
         input=json.dumps({
@@ -263,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
                 output = args.output_dir / f"{index:02}-rpd.json"
                 code = run_rpd.main([
                     "--discipline", item.name, "--institution", args.institution, "--year", args.year,
+                    "--program", args.course,
                     "--facts-file", str(facts), "--output", str(output),
                 ])
                 lines = [f"Черновик не сохранён: {item.name}"]

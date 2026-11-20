@@ -148,8 +148,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     def agent(role: str):
         async def run(state: GraphState) -> dict:
-            query = json.dumps(state["course_meta"], ensure_ascii=False)
-            sources = await evidence.search(role, query)
+            query = json.dumps(state["course_meta"], ensure_ascii=False, sort_keys=True)
+            sources = await evidence.search(role, query, owner_scope=state["owner_user_id"])
             notices = getattr(sources, "notices", [])
             if not sources:
                 return {f"{role}_report": {"findings": [], "source_notices": notices}, "sources": []}
@@ -245,7 +245,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             await store.set_status(state["request_id"], "failed", state["owner_user_id"])
             return {"status": "failed"}
         identifier = str(uuid5(NAMESPACE_URL, f"{state['request_id']}/{state['run_id']}/interview/{round_number}"))
-        methods = await evidence.search("interview", json.dumps(state["gap_report"], ensure_ascii=False))
+        methods = await evidence.search("interview", json.dumps(state["gap_report"], ensure_ascii=False),
+                                        owner_scope=state["owner_user_id"])
         local_skill = load_interview_methods(settings.interview_skill_directory, state["gap_report"]["gap_types"])
         skill = (local_skill + "\n\n" + "\n\n".join(item.content for item in methods))[:18000]
         try:
@@ -287,7 +288,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def factcheck(state: GraphState) -> dict:
         answer = state["interview_answers"][-1]
-        fresh = await evidence.search("factcheck", answer["content"][:3000])
+        fresh = await evidence.search("factcheck", answer["content"][:3000], owner_scope=state["owner_user_id"])
         notices = getattr(fresh, "notices", [])
         combined = merge_records(state.get("sources", []), [item.model_dump(mode="json") for item in fresh])
         ctx = context({**state, "sources": combined})

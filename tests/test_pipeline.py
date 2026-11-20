@@ -33,6 +33,23 @@ RPD_ARGS = [
 ]
 
 
+def setUpModule():
+    cache = patch("orchestration.evidence_cache.snapshot_store")
+    cache.start().return_value.read.return_value = None
+    unittest.addModuleCleanup(cache.stop)
+
+
+def index_reply(index):
+    if index != ENVIRONMENT["YANDEX_VECTOR_STORE_ID_RPD"]:
+        return SimpleNamespace(data=[])
+    return SimpleNamespace(data=[SimpleNamespace(file_id="rpd", filename="plan.pdf",
+        content=[SimpleNamespace(type="text", text="Учебный план 2026/2027")])])
+
+
+def model_reply(value):
+    return SimpleNamespace(incomplete_details=None, output=[], status="completed", output_text=value)
+
+
 def proposal(questions=()):
     return json.dumps({
         "document": {
@@ -99,10 +116,8 @@ class RpdPipelineTests(unittest.TestCase):
 
     def test_cli_saves_one_valid_rpd_without_overwriting(self):
         client = MagicMock()
-        client.vector_stores.search.return_value = SimpleNamespace(data=[])
-        client.responses.create.return_value = SimpleNamespace(
-            incomplete_details=None, output=[], status="completed", output_text=proposal(),
-        )
+        client.vector_stores.search.side_effect = lambda index, **_: index_reply(index)
+        client.responses.create.side_effect = [model_reply('{"findings": []}'), model_reply(proposal())]
         with TemporaryDirectory() as directory:
             output = Path(directory) / "rpd.json"
             with patch.dict("os.environ", ENVIRONMENT, clear=True), \
@@ -117,7 +132,7 @@ class RpdPipelineTests(unittest.TestCase):
                     run_rpd.main()
                 self.assertEqual(error.exception.code, 2)
                 self.assertEqual(output.read_text(encoding="utf-8"), original)
-                self.assertEqual(client.responses.create.call_count, 1)
+                self.assertEqual(client.responses.create.call_count, 2)
         Draft202012Validator(self.schema).validate(json.loads(original))
 
     def test_university_does_not_forward_fragments_after_moderation(self):
@@ -186,7 +201,7 @@ class SciencePipelineTests(unittest.TestCase):
     def test_only_science_sees_article_cards_and_proposals_reach_rpd(self):
         settings = {**ENVIRONMENT, "YANDEX_VECTOR_STORE_ID_BOOKS": "books"}
         client = MagicMock()
-        client.vector_stores.search.return_value = SimpleNamespace(data=[])
+        client.vector_stores.search.side_effect = lambda index, **_: index_reply(index)
         article = science.Article("Relational database query optimization", 2026, "https://doi.org/10.1234/good",
                                   "published_candidate", doi="10.1234/good", authors=("Example Author",), citations=15,
                                   abstract="The evaluation compares physical query plans.")
@@ -194,6 +209,7 @@ class SciencePipelineTests(unittest.TestCase):
         proposal_data["document"]["purposeAndTasks"]["tasks"] = ["Сравнить планы запросов"]
         responses = {
             "science_course_query": {"query": "database query optimization"},
+            "rpd_university": {"findings": []},
             "rpd_science": {"findings": [{"fragment": 1, "summary": "Сравнить планы SQL-запросов."}]},
             "rpd_draft": proposal_data,
         }
@@ -272,11 +288,13 @@ class CoursePipelineTests(unittest.TestCase):
 
     def test_batch_saves_completed_documents_and_lists_unresolved_disciplines(self):
         client = MagicMock()
-        client.vector_stores.search.return_value = SimpleNamespace(data=[])
+        client.vector_stores.search.side_effect = lambda index, **_: index_reply(index)
         document = SimpleNamespace(incomplete_details=None, output=[], status="completed", output_text=proposal())
         incomplete = SimpleNamespace(incomplete_details=SimpleNamespace(reason="max_output_tokens"),
                                      output=[], status="incomplete", output_text="")
-        client.responses.create.side_effect = [document, incomplete, document]
+        drafts = iter([document, incomplete, document])
+        client.responses.create.side_effect = lambda **request: (next(drafts)
+            if request["text"]["format"]["name"] == "rpd_draft" else model_reply('{"findings": []}'))
         with TemporaryDirectory() as directory:
             root = Path(directory)
             disciplines = root / "disciplines.txt"
@@ -302,9 +320,11 @@ class CoursePipelineTests(unittest.TestCase):
             self.assertIn("Готовых РПД: 2 из 3", summary)
             self.assertIn("Черновик не сохранён: Теория алгоритмов", summary)
             self.assertIn("Семестр 3 — SQL", summary)
-            for call in client.responses.create.call_args_list:
+            for call in (item for item in client.responses.create.call_args_list
+                         if item.kwargs["text"]["format"]["name"] == "rpd_draft"):
                 request = json.loads(call.kwargs["input"])["request"]
                 self.assertIn("курс «Информатика»", request["facts"])
+                self.assertEqual(request["program"], "Информатика")
 
 
 if __name__ == "__main__":

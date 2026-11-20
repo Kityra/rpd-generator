@@ -1,6 +1,5 @@
-"""Bounded calls and last successful snapshots for external evidence providers."""
+"""Bounded calls and a separate circuit breaker for each external operation."""
 
-from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -9,7 +8,7 @@ import logging
 from random import uniform
 from threading import BoundedSemaphore, Lock
 from time import monotonic, sleep
-from typing import Callable, Hashable, TypeVar, cast
+from typing import Callable, TypeVar
 
 import httpx
 from openai import APIConnectionError, APIStatusError
@@ -71,17 +70,15 @@ class _Circuit:
 
 class Resilience:
     def __init__(self, *, clock=monotonic, wait=sleep, jitter=uniform, invoke=_bounded_call,
-                 threshold: int = 3, cooldown: float = 30, cache_size: int = 256):
+                 threshold: int = 3, cooldown: float = 30):
         self.clock = clock
         self.wait = wait
         self.jitter = jitter
         self.invoke = invoke
         self.threshold = threshold
         self.cooldown = cooldown
-        self.cache_size = cache_size
         self._lock = Lock()
         self._circuits: dict[Service, _Circuit] = {}
-        self._snapshots: OrderedDict[Hashable, tuple[float, datetime, object]] = OrderedDict()
 
     def call(self, service: Service, request: Callable[[httpx.Timeout], T], *, budget: float, read: float) -> T:
         deadline = self.clock() + budget
@@ -137,33 +134,6 @@ class Resilience:
                     circuit.open_until = None
                     circuit.probing = False
             return result
-
-    def search(self, key: Hashable, fetch: Callable[[], tuple[T, ...]], *, max_age: float
-               ) -> tuple[tuple[T, ...], datetime | None]:
-        started = self.clock()
-        try:
-            records = fetch()
-        except ExternalUnavailable:
-            with self._lock:
-                snapshot = self._snapshots.get(key)
-                if snapshot is None or self.clock() - snapshot[0] > max_age:
-                    raise
-                self._snapshots.move_to_end(key)
-                return cast(tuple[T, ...], snapshot[2]), snapshot[1]
-        except (APIStatusError, httpx.HTTPStatusError) as error:
-            if error.response.status_code in {401, 403, 404}:
-                with self._lock:
-                    self._snapshots.pop(key, None)
-            raise
-        with self._lock:
-            previous = self._snapshots.get(key)
-            if previous is None or previous[0] <= started:
-                self._snapshots[key] = (started, datetime.now(timezone.utc), records)
-                self._snapshots.move_to_end(key)
-                if len(self._snapshots) > self.cache_size:
-                    self._snapshots.popitem(last=False)
-        return records, None
-
 
 EXTERNAL = Resilience()
 

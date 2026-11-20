@@ -181,7 +181,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_graph_persists_interrupt_and_resumes_without_agents_repeated(self):
         source_map = records()
         evidence = AsyncMock()
-        evidence.search.side_effect = lambda role, query: list(source_map.values())
+        evidence.search.side_effect = lambda role, query, **kwargs: list(source_map.values())
         llm = AsyncMock()
         activity_calls = 0
         audit_calls = 0

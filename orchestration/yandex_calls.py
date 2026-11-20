@@ -1,17 +1,12 @@
 """Shared Yandex AI Studio calls for the CLI and course graph."""
 
-from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
+from urllib.parse import quote
 
+from domain.schemas import SourceRecord, SourceType
+from orchestration.evidence_cache import ACADEMIC_TTL, MARKET_TTL, SnapshotEvidence, search_evidence, source_record
 from orchestration.resilience import EXTERNAL, ExternalUnavailable
-
-
-@dataclass(frozen=True)
-class VectorFragment:
-    file_id: str
-    title: str
-    text: str
 
 
 class InvalidIndexResponse(ValueError):
@@ -28,10 +23,10 @@ def model_response(client, settings, *, model: str, budget: float = 120, **kwarg
                          budget=budget, read=budget)
 
 
-def search_fragments(client, settings, index: str, store_id: str, query: str, count: int, *, budget: float = 30
-                     ) -> tuple[tuple[VectorFragment, ...], datetime | None]:
+def search_fragments(client, settings, index: SourceType, store_id: str, query: str, count: int, *,
+                     scope: tuple[str, ...] = ("local",), budget: float = 30
+                     ) -> tuple[tuple[SourceRecord, ...], datetime | None]:
     service = ("Yandex", "vector_search", _scope(settings), index, store_id)
-    key = (service, sha256(query.encode()).hexdigest(), count)
 
     def fetch():
         result = EXTERNAL.call(service, lambda timeout: client.vector_stores.search(
@@ -44,11 +39,20 @@ def search_fragments(client, settings, index: str, store_id: str, query: str, co
             if text.strip():
                 if not hit.file_id or not hit.filename:
                     raise InvalidIndexResponse("Во фрагменте индекса нет ссылки на файл.")
-                fragments.append(VectorFragment(hit.file_id, hit.filename, text[:6000]))
+                url = f"https://ai.api.cloud.yandex.net/v1/files/{quote(hit.file_id, safe='')}"
+                fragments.append(SnapshotEvidence(source=source_record(index, url, hit.filename, text[:6000])))
         return tuple(fragments)
 
-    hours = 24 if index in {"HH", "Priklad"} else 168
-    fragments, taken_at = EXTERNAL.search(key, fetch, max_age=hours * 3600)
-    if index == "RPD" and taken_at is not None and not fragments:
-        raise ExternalUnavailable("Индекс РПД недоступен, подтверждающих материалов в снимке нет.")
-    return fragments, taken_at
+    if index == "Interview":
+        return tuple(item.source for item in fetch()), None
+    ttl = MARKET_TTL if index in {"HH", "Priklad"} else ACADEMIC_TTL
+    try:
+        fragments, taken_at = search_evidence(service, (scope, query, count), fetch, ttl=ttl)
+    except ExternalUnavailable as error:
+        if index == "RPD":
+            raise ExternalUnavailable("Индекс РПД недоступен, пригодного снимка нет.") from error
+        raise
+    if index == "RPD" and not fragments:
+        detail = "В снимке РПД" if taken_at is not None else "В индексе РПД"
+        raise ExternalUnavailable(f"{detail} нет материалов по этому запросу.")
+    return tuple(item.source for item in fragments), taken_at

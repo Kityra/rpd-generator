@@ -35,7 +35,7 @@ def create_snapshot(directory: Path) -> Path:
 def evidence_client():
     hh = source_record("HH", "https://hh.ru/vacancy/1", "HH", "Прежний источник")
     base = AsyncMock()
-    base.search.side_effect = lambda role, query: [hh] if role == "business" else []
+    base.search.side_effect = lambda role, query, **kwargs: [hh] if role == "business" else []
     return base
 
 
@@ -84,6 +84,7 @@ class RpdBusinessTests(unittest.TestCase):
 
         client.responses.create.side_effect = reply
         with patch.dict("os.environ", {"RABOTA_IT_DATABASE": str(database)}), \
+             patch("orchestration.evidence_cache.snapshot_store"), \
              patch.object(run_rpd, "collect_recent_articles", return_value=[]):
             graph = run_rpd.create_rpd_graph(client, settings, draft_first=True)
             outcome = graph.invoke(

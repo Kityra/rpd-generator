@@ -181,8 +181,8 @@ class BusinessEvidenceClient:
         self.rabota = rabota
         self.make_record = make_record
 
-    async def search(self, role: str, query: str) -> list[SourceRecord]:
-        primary = await self.base.search(role, query)
+    async def search(self, role: str, query: str, *, owner_scope: str = "") -> list[SourceRecord]:
+        primary = await self.base.search(role, query, owner_scope=owner_scope)
         if role != "business":
             return primary
         return EvidenceResults([*primary, *await self.rabota.records(query, self.make_record)],

@@ -159,7 +159,8 @@ class PreviewSession:
                 notes += f"\nГод обучения — {study_year}. Семестр уточняется отдельно."
             if item.topics:
                 notes += "\nТемы для обсуждения: " + ", ".join(item.topics)
-            tasks.append(Task(RpdRequest(discipline=item.name, institution=institution, academic_year=year, facts=notes)))
+            tasks.append(Task(RpdRequest(discipline=item.name, institution=institution, academic_year=year,
+                                        program=title if kind == "course" else "", facts=notes)))
         batch_id = uuid4().hex
         self.batches[batch_id] = Batch(title, institution, year, kind, tasks)
         return batch_id
