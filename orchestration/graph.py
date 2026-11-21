@@ -16,6 +16,7 @@ from orchestration import prompts
 from orchestration.interview_methods import load_interview_methods
 from orchestration.rabota_business import SOURCE, SOURCE_GUIDANCE
 from orchestration.resilience import ExternalUnavailable
+from orchestration.university_request import build_university_request
 
 
 def merge_records(previous: list[dict], additions: list[dict]) -> list[dict]:
@@ -200,7 +201,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     async def university_audit(state: GraphState) -> dict:
         if not state["applied_activity"]:
             return {"auto_subjects": {"subjects": []}}
-        result = await llm.generate(SubjectPlan, prompts.UNIVERSITY, payload(state), context(state))
+        request, sources = build_university_request(state, registry(state))
+        result = await llm.generate(SubjectPlan, prompts.UNIVERSITY, request, {"sources": sources})
         return {"auto_subjects": result.model_dump(mode="json")}
 
     async def gap_analysis(state: GraphState) -> dict:
