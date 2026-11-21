@@ -10,14 +10,12 @@ from apps.common import composer, portal
 from apps.teacher_programs import knowledge_screen, my_disciplines
 from apps.presentation import course_progress, status_badge
 from domain.export import (OUTLINE_LABEL, block_html, composition_html, export_course, gap_coverage_html, generation_summary,
-                           profession_counts, profession_profile_html, rationale_report_html, source_html, subject_origin)
+                           profession_counts, rationale_report_html, source_html, subject_origin)
 from pydantic import ValidationError
 
-from domain.export import LEVEL_LABELS
+from domain.skill_mapper import TOOL_COLUMN_NOTE, competence_label, tool_labels
 from orchestration.call_log import OUTCOME_LABELS
-from orchestration.market_analysis import course_market, parse_market_file
-from domain.workload import (HOURS, MAX_HOURS, WorkloadParams, load_norms, proposal_from_loads, propose_workload,
-                             topic_hours, validate_workload)
+from orchestration.market_analysis import course_market, parse_market_file, with_competences
 from storage.models import Course, CourseVersion, Interview, Notification, SourceRow
 from storage.portal import (REBUILD_STATUSES, acknowledge, create_course, decide, finish_without_answer, rebuild_course,
                             retry_command, save_market)
@@ -70,21 +68,6 @@ async def new_course(actor, factory):
         profession = st.text_input("Профессия выпускника", max_chars=200,
                                    placeholder="Если отличается от названия курса, например «Аналитик данных»")
         manual = st.text_area("Обязательные дисциплины", placeholder="По одному предмету в строке. Можно оставить пустым.")
-        norms = load_norms()
-        st.markdown("**Учебная нагрузка** — сверьте с учебным планом")
-        programs = list(norms["program_types"])
-        left, right = st.columns(2)
-        program_type = left.selectbox("Тип программы", programs, index=programs.index(norms["defaults"]["program_type"]),
-                                      format_func=lambda key: norms["program_types"][key]["label"])
-        unit = right.radio("Объём задан в", ["з.е.", "часах"], horizontal=True)
-        volume = left.number_input("Общий объём курса", min_value=1, max_value=MAX_HOURS,
-                                   value=int(norms["program_types"][program_type]["total_credits"]))
-        rate = right.number_input("Академических часов в 1 з.е.", min_value=1, max_value=1000,
-                                  value=int(norms["defaults"]["hours_per_credit"]))
-        semesters = left.number_input("Число семестров", min_value=1, max_value=12, value=int(norms["defaults"]["semesters"]))
-        forms = list(norms["assessment_forms"])
-        form = right.selectbox("Форма аттестации по дисциплинам", forms, index=forms.index(norms["defaults"]["assessment_form"]),
-                               format_func=lambda key: norms["assessment_forms"][key]["label"])
         auto = st.form_submit_button("Добавить предметы автоматически", type="primary")
         submit = st.form_submit_button("Сформировать курс")
     if auto or submit:
@@ -93,66 +76,14 @@ async def new_course(actor, factory):
             return
         subjects = list(dict.fromkeys(s.strip() for s in manual.splitlines() if s.strip()))
         course_id = st.session_state.setdefault("new_request_id", str(uuid4()))
-        settings = {"program_type": program_type, "hours_per_credit": int(rate), "semesters": int(semesters),
-                    "assessment_form": form}
-        settings["total_credits" if unit == "з.е." else "total_hours"] = int(volume)
         meta = {"title": title.strip(), "institution": institution.strip(), "year": year.strip(),
-                "expand_subjects": auto or not subjects, "workload": settings}
+                "expand_subjects": auto or not subjects}
         if profession.strip():
             meta["profession"] = profession.strip()
         await create_course(factory, actor, course_id, meta, subjects)
         st.session_state.update(selected_course=course_id, screen="course")
         del st.session_state["new_request_id"]
         st.rerun()
-
-
-def workload_form(subjects, version_id, proposal, params):
-    loads = {}
-    norms = load_norms()
-    forms = list(norms["assessment_forms"])
-    with st.expander("Учебная нагрузка по дисциплинам"):
-        if not params.explicit:
-            st.caption(f"Параметры нагрузки курса не заданы: использован ориентир {params.total_hours} акад. ч "
-                       f"по {params.hours_per_credit} ч в з.е. Сверьте объём с учебным планом.")
-        else:
-            st.caption(f"{norms['program_types'][params.program_type]['label']} · объём курса {params.total_hours} акад. ч "
-                       f"({params.total_hours / params.hours_per_credit:g} з.е.) · семестров — {params.semesters}. "
-                       "Часы рассчитаны программой по настройкам config/workload_norms.yaml.")
-        rate = st.number_input("Академических часов в 1 з.е.", min_value=1, max_value=1000,
-                               value=proposal["hours_per_credit"], key=f"workload-rate-{version_id}")
-        for subject in subjects:
-            key = f"load-{version_id}-{subject['id']}"
-            saved = proposal["loads"][subject["id"]]
-            st.text(subject["title"])
-            if subject.get("importance") and subject["importance"] != "standard":
-                st.caption(f"Важность по оценке модели — {subject['importance']}: {subject.get('importance_reason') or ''}")
-            columns = st.columns(len(HOURS))
-            fields = {field: column.number_input(label, min_value=0, max_value=MAX_HOURS,
-                                                  value=saved.get(field, 0), key=f"{key}-{field}")
-                      for (field, label), column in zip(HOURS.items(), columns, strict=True)}
-            left, right = st.columns(2)
-            semester = left.number_input("Семестр", min_value=1, max_value=max(12, params.semesters),
-                                         value=int(saved.get("semester") or 1), key=f"{key}-semester")
-            current = saved.get("assessment_form") or params.assessment_form
-            form = right.selectbox("Форма аттестации", forms, index=forms.index(current) if current in forms else 0,
-                                   format_func=lambda item: norms["assessment_forms"][item]["label"], key=f"{key}-form")
-            total = sum(fields.values())
-            st.caption(f"{total} акад. ч. · {total / rate:.2f} з.е.")
-            row = {**saved, **fields, "hours_per_credit": rate, "semester": int(semester), "assessment_form": form}
-            if row != saved:
-                row["topics"] = topic_hours(subject, row)
-                if total % rate == 0:
-                    row["credits"] = total // rate
-                else:
-                    row.pop("credits", None)
-            loads[subject["id"]] = row
-        total = sum(row[field] for row in loads.values() for field in HOURS)
-        st.caption(f"Итого по курсу — {total} акад. ч. · {total / rate:.2f} з.е.")
-        issues = validate_workload(subjects, {**proposal, "loads": loads, "hours_per_credit": rate, "total_hours": total},
-                                   params)
-        if issues:
-            st.warning("Проверьте нагрузку до утверждения:\n\n" + "\n".join(f"- {issue}" for issue in issues))
-    return loads
 
 
 def generation_panel(program, failures):
@@ -181,21 +112,27 @@ def market_report(analysis):
         for item in analysis.warnings:
             st.info(item)
         return
+    analysis = with_competences(analysis, {})
     details = [analysis.source, f"выборка — {analysis.sample_size} вакансий" if analysis.sample_size else None,
                f"период {analysis.period}" if analysis.period else None, analysis.region or "регион не указан"]
     st.caption(" · ".join(item for item in details if item))
     if analysis.market_fit is not None:
-        st.metric("Покрытие критичных навыков курсом (расчёт)", f"{analysis.market_fit:.0%}")
+        st.metric("Покрытие критичных компетенций курсом (расчёт)", f"{analysis.market_fit:.0%}")
     for item in analysis.warnings:
         st.warning(item)
-    st.dataframe([{"Навык": row.skill,
+    st.dataframe([{"Компетенция": row.competence_name,
+                   "Инструменты": ", ".join(tool_labels(row)) or "—",
                    "Доля вакансий": f"{row.share:.0%}" if row.share is not None else "",
                    "Вакансий": row.vacancies, "Вес": row.weight, "Критичный": row.critical,
-                   "Покрытие": LEVEL_LABELS[row.level] + (" (вручную)" if row.manual else ""),
-                   "Дисциплины": ", ".join(row.subjects), "Приоритет": row.priority} for row in analysis.skills],
-                 hide_index=True)
-    if analysis.uncovered:
-        st.write("Не покрыты курсом: " + ", ".join(analysis.uncovered))
+                   "Покрытие": "покрыт темами" if row.level == "full" else "не покрыт",
+                   "Дисциплина": (", ".join(row.subjects) or "—") if row.level == "full" else "—"}
+                  for row in analysis.competences], hide_index=True,
+                 column_config={"Критичный": st.column_config.CheckboxColumn("Критичный")})
+    if any(not tool_labels(row) or row.expert_tools for row in analysis.competences):
+        st.caption(TOOL_COLUMN_NOTE)
+    uncovered = [competence_label(row) for row in analysis.competences if row.level != "full"]
+    if uncovered:
+        st.write("Не покрыты курсом: " + ", ".join(uncovered))
     if analysis.weak_subjects:
         st.write("Слабо связаны с рынком и задачами: " + ", ".join(analysis.weak_subjects))
 
@@ -259,7 +196,6 @@ async def expert_actions(actor, settings, factory, users, course, interview):
 def report_panel(version, registry, interviews, analysis=None):
     program = version.content["program"]
     if profile := version.content.get("profession_profile"):
-        st.html(profession_profile_html(profile, version.content.get("profession_market", {}), registry))
         rejected = [claim for claim in profile["claims"] if claim["verification_status"] == "rejected"]
         if rejected:
             with st.expander("Утверждения, отклонённые экспертом"):
@@ -296,12 +232,9 @@ def report_panel(version, registry, interviews, analysis=None):
     interview_results(interviews, registry)
 
 
-def course_workspace(version, registry, interviews, can_review, active, meta=None, analysis=None):
+def course_workspace(version, registry, interviews, analysis=None):
     subjects = version.content["program"]["subjects"]
-    labels = ["Программа", "Отчёт по курсу"]
-    if can_review:
-        labels.append("Учебная нагрузка")
-    tabs = st.tabs(labels)
+    tabs = st.tabs(["Программа", "Отчёт по курсу"])
     with tabs[0]:
         for index, subject in enumerate(subjects):
             label = subject["title"]
@@ -311,27 +244,17 @@ def course_workspace(version, registry, interviews, can_review, active, meta=Non
                 st.html(block_html(subject, registry))
     with tabs[1]:
         report_panel(version, registry, interviews, analysis)
-    if not can_review:
-        return None, None
-    previous = version.content.get("workload_proposal")
-    if not previous and active:
-        previous = proposal_from_loads(active.content.get("workloads", {}))
-    params = WorkloadParams.from_meta(meta)
-    proposal = propose_workload(subjects, previous, params)
-    with tabs[2]:
-        return workload_form(subjects, version.id, proposal, params), proposal
 
 
-async def review_actions(actor, factory, course, draft, active, loads, proposal):
+async def review_actions(actor, factory, course, draft, active):
     st.subheader("Правки и утверждение")
     with st.container():
         change = composer("Что изменить или уточнить", f"edit-{draft.id}")
     if change:
-        await decide(factory, actor, course.id, draft.id, "revise", *change,
-                     workloads=loads if loads != proposal["loads"] else None)
+        await decide(factory, actor, course.id, draft.id, "revise", *change)
         st.rerun()
     if st.button("Утвердить изменения" if active else "Утвердить курс", type="primary", width="stretch"):
-        await decide(factory, actor, course.id, draft.id, "approve", workloads=loads)
+        await decide(factory, actor, course.id, draft.id, "approve")
         st.rerun()
     if st.button("Обновить материалы и обоснования", width="stretch"):
         await decide(factory, actor, course.id, draft.id, "refresh_materials")
@@ -382,9 +305,10 @@ async def course_detail(actor, settings, factory, users, course, notices):
                     st.caption(f"Профиль профессии · подтверждено {counts['verified']} · "
                                f"требует проверки методиста {counts['needs_review']} · отклонено {counts['rejected']}")
                 analysis = course_market(course.course_meta, version.content["program"], registry,
-                                         version.content.get("vacancy_source_ids", []), version.content.get("activity"))
-                loads, proposal = course_workspace(version, registry, interviews, can_review, active, course.course_meta,
-                                                   analysis)
+                                         version.content.get("vacancy_source_ids", []), version.content.get("activity"),
+                                         mappings=version.content.get("skill_mappings"), saved=version.content.get("market_analysis"),
+                                         profile=version.content.get("profession_profile"))
+                course_workspace(version, registry, interviews, analysis)
             else:
                 st.subheader("Программа курса")
                 if waiting:
@@ -429,7 +353,7 @@ async def course_detail(actor, settings, factory, users, course, notices):
                     if not handoff:
                         await expert_actions(actor, settings, factory, users, course, interviews[0])
                 if can_review:
-                    await review_actions(actor, factory, course, draft, active, loads, proposal)
+                    await review_actions(actor, factory, course, draft, active)
                 if version:
                     await market_actions(actor, factory, course, analysis, version.content["program"]["subjects"])
                 if version and course.status in REBUILD_STATUSES:
@@ -442,7 +366,9 @@ async def course_detail(actor, settings, factory, users, course, notices):
                         st.rerun()
                 if active:
                     market = course_market(course.course_meta, active.content["program"], registry,
-                                           active.content.get("vacancy_source_ids", []), active.content.get("activity"))
+                                           active.content.get("vacancy_source_ids", []), active.content.get("activity"),
+                                           mappings=active.content.get("skill_mappings"), saved=active.content.get("market_analysis"),
+                                           profile=active.content.get("profession_profile"))
                     st.download_button(f"Скачать утверждённую версию {active.revision} · ZIP",
                                        export_course(course.course_meta, active, registry, market.model_dump(mode="json")),
                                        f"course-v{active.revision}.zip", "application/zip", width="stretch")
@@ -466,16 +392,20 @@ async def render(actor, settings, factory, users):
             st.session_state.update(screen="course", selected_course=requested)
         del st.query_params["course"]
     st.sidebar.text(actor.display_name)
-    if st.sidebar.button(f"Ваши курсы ({count})" if count else "Ваши курсы", width="stretch"):
+    screen = st.session_state.get("screen", "list")
+    if st.sidebar.button(f"Ваши курсы ({count})" if count else "Ваши курсы", icon=":material/folder_open:",
+                         type="secondary" if screen == "list" else "tertiary", width="stretch"):
         st.session_state.screen = "list"
+        st.rerun()
     if st.sidebar.button("Создать курс", type="primary", icon=":material/add:", width="stretch"):
         st.session_state.screen = "create"
+        st.rerun()
     if st.sidebar.button("Мои дисциплины в программах", icon=":material/school:", width="stretch",
-                         type="secondary" if st.session_state.get("screen") == "programs" else "tertiary"):
+                         type="secondary" if screen == "programs" else "tertiary"):
         st.session_state.screen = "programs"
         st.rerun()
     if st.sidebar.button("Карта знаний", icon=":material/hub:", width="stretch",
-                         type="secondary" if st.session_state.get("screen") == "map" else "tertiary"):
+                         type="secondary" if screen == "map" else "tertiary"):
         st.session_state.screen = "map"
         st.rerun()
     screen = st.session_state.get("screen", "list")
@@ -507,7 +437,7 @@ async def render(actor, settings, factory, users):
     with st.container(key="course-workspace"):
         for offset in range(0, len(courses), 2):
             for column, course in zip(st.columns(2, gap="medium"), courses[offset:offset + 2]):
-                with column.container(border=True):
+                with column.container(border=True, key=f"portal-card-course-{course.id}"):
                     st.html(status_badge(course.status))
                     st.subheader(course.course_meta["title"])
                     if info := course_context(course.course_meta):
@@ -521,7 +451,7 @@ async def render(actor, settings, factory, users):
 
 
 def main():
-    portal("Кабинет преподавателя", {"teacher", "admin"}, render)
+    portal("Кабинет методиста", {"teacher", "admin"}, render)
 
 
 if __name__ == "__main__":

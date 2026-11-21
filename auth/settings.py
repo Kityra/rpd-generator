@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     user_database_url: str = ""
     teachers_index_id: str = ""
     experts_index_id: str = ""
-    # Справочник руководителей образовательных программ (третий файл в Yandex AI Studio, формат как у преподавателей).
+    # Справочник руководителей образовательных программ (третий файл в Yandex AI Studio, формат как у методистов).
     program_heads_index_id: str = ""
     # Локальный файл учётных записей для разработки и демо (только при APP_ENV=development). Формат — local_users.example.txt.
     local_users_file: str = ""
@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     user_role_user_id_column: str = "user_id"
     user_role_value_column: str = "role"
     role_map: dict[str, str] = Field(default_factory=lambda: {
-        "teacher": "teacher", "expert": "expert", "admin": "admin", "program_head": "program_head",
+        "teacher": "teacher", "methodologist": "teacher", "expert": "expert", "admin": "admin", "program_head": "program_head",
     })
     hash_scheme: str = "auto"
     allow_rehash_on_login: bool = False

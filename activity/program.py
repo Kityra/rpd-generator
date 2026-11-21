@@ -1,4 +1,4 @@
-"""Сопоставление программы с моделями деятельности и правила рекомендаций R1–R7 (разделы 7.10–7.12).
+"""Сопоставление программы с моделями деятельности и правила рекомендаций R1–R5 и R7 (разделы 7.10–7.12).
 
 Чистые функции: вход — дисциплины программы и сохранённые версии моделей, выход — покрытие, рекомендации
 и баланс ЗЕТ. Пороги — config/activity_model.yaml, раздел recommendations.
@@ -17,7 +17,7 @@ from activity.text import AreaDictionary, jaccard, object_concepts, terms
 
 PART_LABELS = {"mandatory_fgos": "обязательная по ФГОС", "mandatory": "обязательная часть", "elective": "часть, формируемая участниками"}
 RULE_LABELS = {"R1": "Создать дисциплину", "R2": "Обновить дисциплину", "R3": "Сократить или убрать",
-               "R4": "Объединить", "R5": "Сохранить как фундамент", "R6": "Перераспределить часы",
+               "R4": "Объединить", "R5": "Сохранить как фундамент",
                "R7": "Сигнал по профилю"}
 BAD_STATUSES = frozenset({"rejected", "hypothesis"})
 SIGNAL_LABELS = {"risk": "Профиль под риском", "transforming": "Профиль трансформируется", "stable": "Профиль устойчив"}
@@ -45,7 +45,6 @@ class ProgramInput:
     disciplines: list[Discipline]
     models: dict[str, dict]  # profession_id → content of the latest model version
     overrides: dict[tuple[str, str], str] = field(default_factory=dict)  # (discipline_id, task_id) → full | partial | none
-    hours_per_zet: int = 36
 
 
 def _terms(task_name: str) -> set[str]:
@@ -79,7 +78,7 @@ def coverage(discipline: Discipline, task: dict, config: dict, override: str | N
     outcome_hits = match(task["name"], discipline.outcomes + discipline.assignments, share)
     if override in ("full", "partial"):
         return {"coverage": override, "method": "manual", "topics": [i for i, _ in topic_hits],
-                "reason": "задано вручную методистом или преподавателем"}
+                "reason": "задано вручную методистом или руководителем программы"}
     if not topic_hits and not outcome_hits:
         return None
     words = sorted({word for _, common in topic_hits + outcome_hits for word in common})
@@ -111,34 +110,30 @@ def stable_key(rule: str, target: str, items: list[str]) -> str:
     return hashlib.sha256(json.dumps([rule, target, sorted(items)], ensure_ascii=False).encode()).hexdigest()[:32]
 
 
-def allocate(discipline: Discipline, covered: dict[str, dict]) -> tuple[dict[str, float], float]:
-    """Часы дисциплины поровну на темы, часы темы — поровну на покрытые ею пункты (приближение MVP).
-
-    Пункты, связанные вручную без совпадения с темой, делят часы тем, не покрывающих ничего. Возвращает часы
-    по пунктам и часы «ни на что».
-    """
+def topic_shares(discipline: Discipline, covered: dict[str, dict]) -> tuple[dict[str, float], float]:
+    """Доли содержания по задачам и доля тем без связи. Каждая тема имеет одинаковый вес."""
     topics = discipline.topics or (discipline.name,)
-    per_topic = discipline.hours / len(topics)
+    per_topic = 1 / len(topics)
     members = {index: [key for key, link in covered.items() if index in link["topics"]] for index in range(len(topics))}
     floating = [key for key, link in covered.items() if not any(key in group for group in members.values())]
     if floating:
         empty = [index for index, group in members.items() if not group] or list(members)
         for index in empty:
             members[index] = members[index] + floating
-    hours: dict[str, float] = {key: 0.0 for key in covered}
+    shares = dict.fromkeys(covered, 0.0)
     nothing = 0.0
-    for index, group in members.items():
+    for group in members.values():
         if group:
             for key in group:
-                hours[key] += per_topic / len(group)
+                shares[key] += per_topic / len(group)
         else:
             nothing += per_topic
-    return hours, nothing
+    return shares, nothing
 
 
 def analyse(program: ProgramInput, all_models: dict[str, dict] | None = None, config: dict | None = None,
             areas: list[dict] | None = None) -> dict:
-    """Покрытие дисциплин, рекомендации R1–R7 и баланс ЗЕТ."""
+    """Покрытие дисциплин, рекомендации R1–R5 и R7 и баланс ЗЕТ."""
     config = config or load_config()
     rules = config["recommendations"]
     area_dictionary = AreaDictionary(areas or load_areas())
@@ -161,10 +156,7 @@ def analyse(program: ProgramInput, all_models: dict[str, dict] | None = None, co
     for discipline_id, covered in links.items():
         for key in covered:
             covered_by.setdefault(key, []).append(discipline_id)
-    hours: dict[str, dict[str, float]] = {}
-    nothing: dict[str, float] = {}
-    for discipline in program.disciplines:
-        hours[discipline.id], nothing[discipline.id] = allocate(discipline, links[discipline.id])
+    topic_coverage = {d.id: topic_shares(d, links[d.id]) for d in program.disciplines}
     by_id = {d.id: d for d in program.disciplines}
     recommendations = []
 
@@ -198,34 +190,34 @@ def analyse(program: ProgramInput, all_models: dict[str, dict] | None = None, co
             "Без дисциплины задачи профессии останутся без фундаментальной основы.", {"frees": 0, "needs": 0},
             [task["id"] for task in involved]))
 
-    # R3. Сократить или убрать: доля часов на отклонённое, исчезающее, гипотезы или ни на что.
+    # R3. Сократить или убрать: доля содержания, которое не поддержано моделью деятельности.
     reductions: list[str] = []
     removed: set[str] = set()
     for discipline in program.disciplines:
-        if discipline.part == "mandatory_fgos" or discipline.id in protected or discipline.hours <= 0:
+        if discipline.part == "mandatory_fgos" or discipline.id in protected:
             continue
-        bad_keys = [key for key in hours[discipline.id] if tasks[key][1]["status"] in BAD_STATUSES
+        shares, unlinked = topic_coverage[discipline.id]
+        bad_keys = [key for key in shares if tasks[key][1]["status"] in BAD_STATUSES
                     or tasks[key][1]["trend"] == "disappearing"]
-        bad_hours = nothing[discipline.id] + sum(hours[discipline.id][key] for key in bad_keys)
-        share = bad_hours / discipline.hours
+        share = unlinked + sum(shares[key] for key in bad_keys)
         if share < rules["reduce_share"] - 1e-9:
             continue
         remove = share >= rules["remove_share"] - 1e-9
         frees = discipline.zet if remove else round(discipline.zet * share * 2) / 2
         involved = [evidence_task(*tasks[key]) for key in bad_keys]
-        lines = [f"{percent(share)} часов ({bad_hours:.0f} из {discipline.hours} ч) приходятся на отклонённое, исчезающее, "
-                 f"гипотезы или ни на что (часы делятся поровну между темами — приближение)."]
-        if nothing[discipline.id]:
-            lines.append(f"Темы без связи с задачами профессии: {nothing[discipline.id]:.0f} ч.")
+        lines = [f"{percent(share)} содержания приходится на отклонённые, исчезающие, непроверенные задачи "
+                 "или на темы без связи с задачами. Темы имеют одинаковый вес."]
+        if unlinked:
+            lines.append(f"Доля тем без связи с задачами профессии — {percent(unlinked)}.")
         for task in involved:
             lines.append(f"«{task['name']}» — {task['status_label'].lower()}, тренд {TREND_LABELS[task['trend']]}.")
         statuses = [tasks[key][1]["status"] for key in bad_keys]
-        confidence = "high" if statuses and all(s == "rejected" for s in statuses) and not nothing[discipline.id] else "medium"
+        confidence = "high" if statuses and all(s == "rejected" for s in statuses) and not unlinked else "medium"
         action = (f"Убрать или переработать «{discipline.name}»" if remove else f"Сократить «{discipline.name}»")
         recommendations.append(recommendation(
             "R3", discipline.name, f"{action}: освобождается ≈ {frees:g} ЗЕТ.", lines, involved, confidence,
-            "Часы останутся на содержании, которого нет в деятельности профессии.", {"frees": frees, "needs": 0},
-            [discipline.id, *bad_keys], weight=bad_hours))
+            "В программе останется содержание, не подтверждённое моделью деятельности.", {"frees": frees, "needs": 0},
+            [discipline.id, *bad_keys], weight=share * discipline.zet))
         reductions.append(discipline.name)
         if remove:
             removed.add(discipline.id)
@@ -262,7 +254,7 @@ def analyse(program: ProgramInput, all_models: dict[str, dict] | None = None, co
             lines.append(f"Объём ≈ {zet} ЗЕТ = округл.({share:.2f} × {rules['elective_zet_pool']}) в пределах "
                          f"[{rules['zet_min']}; {rules['zet_max']}].")
             if reductions:
-                lines.append("Источник часов — кандидаты на сокращение: " + ", ".join(f"«{name}»" for name in reductions))
+                lines.append("Кандидаты на сокращение: " + ", ".join(f"«{name}»" for name in reductions))
             recommendations.append(recommendation(
                 "R1", function["name"], f"Создать дисциплину или модуль «{function['name']}» (≈ {zet} ЗЕТ).", lines,
                 involved, confidence_of([task["status"] for task in uncovered]),
@@ -338,41 +330,6 @@ def analyse(program: ProgramInput, all_models: dict[str, dict] | None = None, co
                 "Одно и то же содержание будет преподаваться дважды.", {"frees": frees, "needs": 0},
                 [left.id, right.id], weight=sum(weighted(key) for key in shared)))
 
-    # R6. Перераспределить часы: доля часов функции и доля её приоритета расходятся.
-    for profession_id, weight in weights.items():
-        model = program.models[profession_id]
-        function_hours, function_priority = {}, {}
-        for key, (owner, task) in tasks.items():
-            if owner != profession_id or task["status"] not in ELIGIBLE:
-                continue
-            function_priority[task["function_id"]] = function_priority.get(task["function_id"], 0) + task["priority"]
-            function_hours[task["function_id"]] = function_hours.get(task["function_id"], 0.0) + sum(
-                hours[d.id].get(key, 0.0) for d in program.disciplines)
-        total_hours, total_priority = sum(function_hours.values()), sum(function_priority.values())
-        if not total_hours or not total_priority:
-            continue
-        names = {function["id"]: function["name"] for function in model["functions"]}
-        for function_id in sorted(function_hours):
-            if function_id == OTHER_FUNCTION or not function_hours[function_id]:
-                continue
-            hours_share = function_hours[function_id] / total_hours
-            priority_share = function_priority[function_id] / total_priority
-            ratio = hours_share / priority_share
-            if 1 / rules["rebalance_ratio"] <= ratio <= rules["rebalance_ratio"]:
-                continue
-            direction = "сократить" if ratio > 1 else "увеличить"
-            members = [task for task in model["tasks"].values() if task["function_id"] == function_id and task["status"] in ELIGIBLE]
-            involved = [evidence_task(profession_id, task) for task in members]
-            recommendations.append(recommendation(
-                "R6", names.get(function_id, function_id),
-                f"Перераспределить часы: {direction} долю функции «{names.get(function_id, function_id)}».",
-                [f"Доля часов {percent(hours_share)} ({function_hours[function_id]:.0f} ч), доля приоритета "
-                 f"{percent(priority_share)}: расхождение в {max(ratio, 1 / ratio):.1f} раза "
-                 f"(порог {rules['rebalance_ratio']})."],
-                involved, confidence_of([task["status"] for task in members]),
-                "Часы программы не будут соответствовать весу задач в деятельности.", {"frees": 0, "needs": 0},
-                [profession_id, function_id, direction], weight=function_priority[function_id] * weight))
-
     # R7. Сигнал по профилю и смежные роли.
     for profession_id, weight in weights.items():
         model = program.models[profession_id]
@@ -397,7 +354,8 @@ def analyse(program: ProgramInput, all_models: dict[str, dict] | None = None, co
     matrix = coverage_matrix(program, weights, tasks, links)
     return {"recommendations": recommendations, "matrix": matrix,
             "links": {d_id: covered for d_id, covered in links.items()},
-            "hours": hours, "unallocated_hours": nothing, "protected": sorted(protected),
+            "unlinked_topic_share": {key: unlinked for key, (_, unlinked) in topic_coverage.items()},
+            "protected": sorted(protected),
             "balance": {"frees": frees, "needs": needs, "disciplines_zet": disciplines_zet,
                         "program_zet": program.total_zet, "after": disciplines_zet - frees + needs}}
 

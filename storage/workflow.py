@@ -87,7 +87,7 @@ class SqlWorkflowStore:
                      users: UserRepository) -> str:
         expert = await users.get_by_id(expert_id)
         if teacher.role not in {"teacher", "admin"} or expert is None or expert.role != "expert":
-            raise PermissionError("Требуются преподаватель и существующий эксперт.")
+            raise PermissionError("Требуются методист и существующий эксперт.")
         token = secrets.token_urlsafe(32)
         async with write_transaction(self.factory) as db:
             interview = await db.scalar(select(Interview).where(Interview.id == interview_id).with_for_update())
@@ -170,9 +170,10 @@ class SqlWorkflowStore:
 
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
                          scheduled: bool, activity: dict, *, evidence_gaps: dict, source_notices: list[str],
-                         vacancy_source_ids: list[str] | None = None, workload_proposal: dict | None = None,
+                         vacancy_source_ids: list[str] | None = None,
                          generation: dict | None = None, composition: dict | None = None,
                          profession_profile: dict | None = None, profession_market: dict | None = None,
+                         skill_mappings: dict | None = None,
                          boundary_violation_threshold: float = 0.5) -> None:
         async with write_transaction(self.factory) as db:
             course = await db.scalar(select(Course).where(Course.id == course_id).with_for_update())
@@ -194,8 +195,8 @@ class SqlWorkflowStore:
                     content["source_notices"] = source_notices
                 if vacancy_source_ids:
                     content["vacancy_source_ids"] = vacancy_source_ids
-                if workload_proposal:
-                    content["workload_proposal"] = workload_proposal
+                if skill_mappings:
+                    content["skill_mappings"] = skill_mappings
                 if generation:
                     content["generation"] = generation
                 if composition:
@@ -216,7 +217,7 @@ class SqlWorkflowStore:
                     db.add(Notification(user_id=course.owner_user_id, course_id=course_id, version_id=version_id,
                                         event="relevance_update", content="Курс обновлён по результатам 9-месячной проверки актуальности"))
 
-    async def finish_review(self, course_id: str, version_id: str, action: str, actor: str, workloads=None) -> None:
+    async def finish_review(self, course_id: str, version_id: str, action: str, actor: str) -> None:
         async with write_transaction(self.factory) as db:
             course = await db.scalar(select(Course).where(Course.id == course_id).with_for_update())
             if course is None or course.owner_user_id != actor:
@@ -231,7 +232,6 @@ class SqlWorkflowStore:
             if course.draft_version_id != version_id:
                 raise ValueError("Черновик изменился. Обновите страницу.")
             if action == "approve":
-                version.content = {**version.content, "workloads": workloads or {}}
                 if course.active_version_id:
                     previous = await db.get(CourseVersion, course.active_version_id)
                     previous.status = "archived"

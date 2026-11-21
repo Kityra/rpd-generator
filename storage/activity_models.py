@@ -242,7 +242,7 @@ class ProgramDiscipline(Base):
     hours: Mapped[int] = mapped_column(Integer, default=0)
     semester: Mapped[int | None] = mapped_column(Integer)
     part: Mapped[str] = mapped_column(String(20), default="mandatory")  # mandatory_fgos | mandatory | elective
-    # Teacher the programme head assigned to the discipline; the teacher starts RPD generation.
+    # Methodologist assigned by the programme head to prepare the discipline's RPD.
     teacher_user_id: Mapped[str | None] = mapped_column(String(256), index=True)
     teacher_name: Mapped[str] = mapped_column(String(300), default="")
     course_id: Mapped[str | None] = mapped_column(String(36))

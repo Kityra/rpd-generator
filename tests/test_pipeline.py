@@ -81,10 +81,11 @@ class RpdPipelineTests(unittest.TestCase):
         draft_schema = projected["properties"]["document"]
         self.assertEqual(draft_schema["required"], list(draft_schema["properties"]))
         self.assertFalse(draft_schema["additionalProperties"])
+        self.assertNotIn("workload", draft_schema["properties"])
 
     def test_repairs_schema_and_resumes_without_searching_again(self):
         invalid = json.loads(proposal())
-        invalid["document"]["workload"]["unknownField"] = 30
+        invalid["document"]["metadata"]["unknownField"] = 30
         generate = MagicMock(side_effect=[
             json.dumps(invalid), proposal(("Какую форму аттестации указать?", "|", ".")), proposal((".",)),
         ])
@@ -92,7 +93,7 @@ class RpdPipelineTests(unittest.TestCase):
         paused = graph.invoke({"request": REQUEST}, config=self.config)
         self.assertEqual(paused["__interrupt__"][0].value["questions"], ["Какую форму аттестации указать?"])
         retry_payload = json.loads(generate.call_args_list[1].args[1])
-        self.assertTrue(any("$.workload" in error for error in retry_payload["schemaErrors"]))
+        self.assertTrue(any("$.metadata" in error for error in retry_payload["schemaErrors"]))
         answer = "Зачёт."
         result = graph.invoke(Command(resume=answer), config=self.config)
         resume_payload = json.loads(generate.call_args_list[2].args[1])
@@ -100,6 +101,7 @@ class RpdPipelineTests(unittest.TestCase):
         self.assertCountEqual([call.args[0] for call in self.research.call_args_list], PROFILES)
         self.assertTrue(result["ready"])
         self.assertNotIn("sourceFiles", result["document"]["metadata"])
+        self.assertNotIn("workload", result["document"])
         Draft202012Validator(self.schema).validate(result["document"])
 
     def test_stops_after_three_unresolved_answers(self):

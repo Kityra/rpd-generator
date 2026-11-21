@@ -618,8 +618,7 @@ async def create_program(factory: Factory, actor, name: str, *, level: str = "ba
     async with write_transaction(factory) as db:
         row = Program(head_user_id=actor.id, name=" ".join(name.split()), level=level, total_zet=total_zet,
                       institution=institution.strip(), academic_year=academic_year.strip(),
-                      target_professions=targets or [], is_demo=is_demo,
-                      hours_per_zet=load_config()["coverage"]["hours_per_zet"])
+                      target_professions=targets or [], is_demo=is_demo)
         db.add(row)
         await db.flush()
         return row.id
@@ -662,7 +661,8 @@ async def save_disciplines(factory: Factory, actor, program_id: str, rows: list[
                 raise ValueError(f"Неизвестная часть программы: {part}.")
             discipline.name, discipline.part, discipline.position = name, part, position
             discipline.zet = float(row.get("zet") or 0)
-            discipline.hours = int(row.get("hours") or round(discipline.zet * 36))
+            if "hours" in row:
+                discipline.hours = int(row["hours"] or 0)
             discipline.semester = int(row["semester"]) if row.get("semester") not in (None, "") else None
             await db.flush()
             keep.add(discipline.id)
@@ -697,7 +697,7 @@ async def set_coverage(factory: Factory, actor, discipline_id: str, item_id: str
     async with write_transaction(factory) as db:
         discipline = await db.get(ProgramDiscipline, discipline_id)
         if actor.role == "teacher" and discipline.teacher_user_id != actor.id:
-            raise PermissionError("Дисциплина закреплена за другим преподавателем.")
+            raise PermissionError("Дисциплина закреплена за другим методистом.")
         await db.execute(delete(DisciplineLink).where(DisciplineLink.discipline_id == discipline_id,
                                                       DisciplineLink.item_id == item_id))
         if coverage:
@@ -713,7 +713,7 @@ async def program_input(db: AsyncSession, program: Program) -> tuple[ProgramInpu
     contents = await latest_contents(db)
     targets = [(item["profession_id"], float(item.get("weight") or 0)) for item in program.target_professions or []]
     data = ProgramInput(
-        id=program.id, name=program.name, total_zet=program.total_zet, hours_per_zet=program.hours_per_zet,
+        id=program.id, name=program.name, total_zet=program.total_zet,
         targets=targets, models={pid: contents[pid] for pid, _ in targets if pid in contents},
         disciplines=[Discipline(id=d.id, name=d.name, zet=d.zet, hours=d.hours, part=d.part, semester=d.semester,
                                 topics=tuple((d.content or {}).get("topics", [])),

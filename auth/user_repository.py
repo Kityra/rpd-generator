@@ -29,7 +29,7 @@ class UserRepository(Protocol):
         """Выбрать существующих экспертов."""
 
     async def list_teachers(self) -> list[CurrentUser]:
-        """Выбрать существующих преподавателей."""
+        """Выбрать существующих методистов."""
 
 
 class SqlUserRepository:

@@ -1,4 +1,4 @@
-"""Кабинет преподавателя: дисциплины, закреплённые руководителем программы, и карта знаний."""
+"""Кабинет методиста: дисциплины, закреплённые руководителем программы, и карта знаний."""
 
 from uuid import uuid4
 
@@ -9,7 +9,6 @@ from activity.program import PART_LABELS, analyse
 from activity.rpd_bridge import course_snapshot
 from apps.activity_ui import demo_banner, status_chip, trend_chip
 from apps.head_app import knowledge_map
-from domain.workload import load_norms
 from storage.portal import create_course
 
 
@@ -36,7 +35,7 @@ async def my_disciplines(actor, factory) -> None:
         snapshot = course_snapshot(models, analysis["links"].get(discipline.id, {}),
                                    program={"id": program.id, "name": program.name},
                                    discipline={"id": discipline.id, "name": discipline.name})
-        with st.container(border=True):
+        with st.container(border=True, key=f"portal-card-discipline-{discipline.id}"):
             demo_banner(program.is_demo)
             st.subheader(discipline.name)
             st.caption(f"Программа «{program.name}» · {discipline.zet:g} ЗЕТ · семестр {discipline.semester or '—'} · "
@@ -75,11 +74,7 @@ async def my_disciplines(actor, factory) -> None:
 
 async def create_rpd(actor, factory, discipline, program, snapshot: dict, institution: str, year: str) -> None:
     """Курс из одной дисциплины программы: задачи деятельности берутся из модели профессии (раздел 7.14)."""
-    norms = load_norms()["defaults"]
     meta = {"title": discipline.name, "institution": institution.strip(), "year": year.strip(), "expand_subjects": False,
-            "workload": {"program_type": norms["program_type"], "hours_per_credit": int(program.hours_per_zet),
-                         "semesters": 1, "assessment_form": norms["assessment_form"],
-                         "total_credits": max(1, int(round(discipline.zet)))},
             "program": {"id": program.id, "name": program.name, "discipline_id": discipline.id}}
     if snapshot["professions"]:
         meta["profession"] = ", ".join(item["name"] for item in snapshot["professions"])

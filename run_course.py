@@ -117,10 +117,10 @@ def discover_disciplines(
 
 SECTION_LABELS = {
     "metadata": "Сведения о документе", "discipline": "Дисциплина", "programs": "Направления подготовки",
-    "purposeAndTasks": "Цели и задачи", "competencies": "Компетенции", "workload": "Трудоёмкость",
+    "purposeAndTasks": "Цели и задачи", "competencies": "Компетенции",
     "assessment": "Аттестация", "curriculum": "Тематический план", "assessmentMaterials": "Оценочные средства",
     "readingList": "Литература", "facilities": "Материально-техническое обеспечение", "title": "Название",
-    "semester": "Семестр", "topics": "Темы", "totalHours": "Всего часов", "totalCredits": "Всего ЗЕТ",
+    "semester": "Семестр", "topics": "Темы",
     "institution": "Вуз", "academicYear": "Учебный год", "programCode": "Код направления",
     "programName": "Название направления", "code": "Код", "goals": "Цели", "tasks": "Задачи",
     "eSignature": "Электронная подпись", "sourceNotes": "Примечания к исходным документам",
@@ -277,8 +277,6 @@ def main(argv: list[str] | None = None) -> int:
                     readable = output.with_suffix(".txt")
                     readable.write_text(render_rpd(document, schema), encoding="utf-8")
                     lines = [f"Готово: {item.name}", f"РПД — {output.name} и {readable.name}."]
-                    workload = document.get("workload", {})
-                    lines.append(f"Объём — {workload['totalHours']} ч, {workload['totalCredits']} ЗЕТ.")
                     goals = document.get("purposeAndTasks", {}).get("goals") or []
                     if goals:
                         lines.append("Цели — " + " / ".join(goals))

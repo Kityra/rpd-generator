@@ -22,7 +22,7 @@ METHOD_STEPS = [
     "Доведите задачи с высоким приоритетом до статуса «Подтверждено». Спорные отправьте во второй раунд.",
     "Сформулируйте ПК из функций (ОТФ/ТФ), а индикаторы достижения — из задач и знаний.",
     "Сопоставьте дисциплины, разберите рекомендации и зафиксируйте решения с комментариями.",
-    "Закрепите за каждым преподавателем задачи и знания его дисциплины. Это вход для генерации РПД.",
+    "Закрепите за каждым методистом задачи и знания его дисциплины. Это вход для генерации РПД.",
     "Назначьте пересмотр раз в 6–12 месяцев: обновите вакансии и повторно опросите экспертов по спорным и растущим задачам.",
 ]
 FGOS_NOTE = ("ФГОС ВО 3++ требует формировать профессиональные компетенции на основе профессиональных стандартов, анализа "
@@ -247,11 +247,10 @@ def program_document(program: dict, analysis: dict, decisions: list[dict], model
         comment = f" — {decision['comment']}" if decision.get("comment") else ""
         doc.p(f"Решение руководителя: {DECISION_LABELS[decision.get('decision')]}{comment}.")
     doc.h(1, "Дисциплины программы")
-    hours = analysis["hours"]
-    doc.table(["Дисциплина", "ЗЕТ", "Часть", "Преподаватель", "Покрыто задач", "Часы без связи с задачами"],
+    doc.table(["Дисциплина", "ЗЕТ", "Часть", "Методист", "Покрыто задач", "Доля тем без связи с задачами"],
               [[d["name"], f"{d['zet']:g}", PART_LABELS.get(d["part"], d["part"]), d.get("teacher_name") or "—",
-                len(analysis["links"].get(d["id"], {})), f"{analysis['unallocated_hours'].get(d['id'], 0):.0f}"]
-               for d in program["disciplines"] if d["id"] in hours])
+                len(analysis["links"].get(d["id"], {})), percent(analysis["unlinked_topic_share"].get(d["id"], 0))]
+               for d in program["disciplines"]])
     doc.h(1, "Сигнал по профилю")
     for model in models.values():
         signal = model["profile_signal"]

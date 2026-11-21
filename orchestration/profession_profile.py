@@ -2,6 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from domain.schemas import ExpertToolLink
+
 
 SourceKind = Literal["rag_chunk", "market_cluster", "expert_interview", "methodologist_input"]
 ExpertStatus = Literal["unreviewed", "confirmed_by_expert", "edited_by_expert", "rejected_by_expert"]
@@ -54,6 +56,7 @@ class ProfessionProfile(Contract):
     rejected_noise_turns: list[int] = Field(default_factory=list)
     unresolved_slots: list[str] = Field(default_factory=list)
     judge_unavailable: bool = False
+    expert_tool_links: list[ExpertToolLink] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def unique_claim_ids(self):

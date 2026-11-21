@@ -14,7 +14,7 @@ VERDICT_LABELS = {"regular": "Да, регулярно", "sometimes": "Да, и�
                   "outdated": "Устарело, так уже не делают", "dont_know": "Не знаю"}
 FORECAST_LABELS = {"more": "станет важнее", "same": "не изменится", "less": "станет менее важной",
                    "automated": "в основном будет автоматизирована"}
-ROLE_KIND_LABELS = {"practitioner": "практик", "lead": "тимлид", "hr": "HR", "teacher": "преподаватель"}
+ROLE_KIND_LABELS = {"practitioner": "практик", "lead": "тимлид", "hr": "HR", "teacher": "методист"}
 COMPANY_SIZE_LABELS = {"small": "малая компания", "medium": "средняя компания", "large": "крупная компания"}
 DEMAND_LABELS = {"more": "спрос вырастет", "same": "не изменится", "less": "спрос снизится"}
 EXCLUSION_LABELS = {"foreign": "ответ «да» на «чужие» задачи", "duplicates": "противоречия в дублях",

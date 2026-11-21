@@ -1,0 +1,26 @@
+ДЕМО: учётные записи для входа (только локальная разработка, APP_ENV=development)
+
+Адрес: http://localhost:8501
+Перед запуском: в .env должны быть APP_ENV=development и LOCAL_USERS_FILE=data/local_users.txt
+
+Руководитель программы (кабинет /head)
+  Логин:  head@demo.local
+  Пароль: demo-head-2026
+
+Преподаватель (кабинет /teacher)
+  Логин:  teacher@demo.local
+  Пароль: demo-teacher-2026
+
+Эксперт (кабинет /expert)
+  Логин:  expert@demo.local
+  Пароль: demo-expert-2026
+
+Запуск:
+  .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+  Copy-Item .env.example .env   (и заполнить ключи Yandex)
+  Copy-Item local_users.example.txt data\local_users.txt
+  .\.venv\Scripts\python.exe -m scripts.seed_activity_demo --reset
+  .\.venv\Scripts\python.exe -m streamlit run app.py
+  .\.venv\Scripts\python.exe -m workers.course_worker   (воркер генерации РПД, отдельное окно)
+
+Файл .env с ключами в архив не включён.

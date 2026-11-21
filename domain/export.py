@@ -6,13 +6,14 @@ from urllib.parse import urlsplit
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from jsonschema import Draft202012Validator
-from domain.workload import HOURS, assessment_label, by_semester, curriculum, workload
-from orchestration.interviewer_turn import SLOT_HINTS
+from domain.schemas import MarketAnalysis
+from domain.skill_mapper import TOOL_COLUMN_NOTE, competence_label, tool_labels
+from orchestration.market_analysis import course_market, with_competences, with_expert_tools
 from orchestration.profession_profile import ProfessionProfile
 
 REASONS = {"market_demand": "Спрос работодателей", "scientific_trend": "Научные результаты",
            "expert_practice": "Практика эксперта", "fundamental_core": "Фундаментальная подготовка",
-           "teacher_review": "Правка преподавателя", "scheduled_relevance_update": "Плановая проверка актуальности"}
+           "teacher_review": "Правка методиста", "scheduled_relevance_update": "Плановая проверка актуальности"}
 
 
 OUTLINE_LABEL = "Собрано шаблоном, нужна проверка методиста"
@@ -157,9 +158,6 @@ def composition_html(check: dict | None) -> str:
     return "\n".join(parts)
 
 
-LEVEL_LABELS = {"full": "покрыт темами", "partial": "частично (только в заданиях)", "none": "не покрыт"}
-
-
 def market_html(analysis: dict | None) -> str:
     """Отчёт по навыкам рынка (расчёт кодом)."""
     if not analysis:
@@ -172,20 +170,26 @@ def market_html(analysis: dict | None) -> str:
                f"период {analysis['period']}" if analysis.get("period") else None,
                f"регион {analysis['region']}" if analysis.get("region") else "регион не указан"]
     parts.append("<p>" + escape(" · ".join(item for item in details if item)) + "</p>")
-    if analysis.get("market_fit") is not None:
-        parts.append(f"<p>Покрытие критичных навыков курсом (расчёт) — {analysis['market_fit']:.0%}</p>")
-    parts.extend(f"<p>{escape(item)}</p>" for item in analysis.get("warnings", []))
-    parts.append("<table><tr><th>Навык</th><th>Доля вакансий</th><th>Критичный</th><th>Покрытие</th>"
-                 "<th>Дисциплины</th><th>Приоритет</th></tr>")
-    for row in analysis["skills"]:
-        share = f"{row['share']:.0%} ({row['vacancies']})" if row.get("share") is not None else (
-            f"вес {row['weight']:g}" if row.get("weight") is not None else "—")
-        parts.append(f"<tr><td>{escape(row['skill'])}</td><td>{share}</td><td>{'да' if row['critical'] else 'нет'}</td>"
-                     f"<td>{LEVEL_LABELS[row['level']]}{' (вручную)' if row.get('manual') else ''}</td>"
-                     f"<td>{escape(', '.join(row['subjects']))}</td><td>{row['priority']:.2f}</td></tr>")
+    report = with_competences(MarketAnalysis.model_validate(analysis), {})
+    if report.market_fit is not None:
+        parts.append(f"<p>Покрытие критичных компетенций курсом (расчёт) — {report.market_fit:.0%}</p>")
+    parts.extend(f"<p>{escape(item)}</p>" for item in report.warnings)
+    parts.append("<table><tr><th>Компетенция</th><th>Инструменты</th><th>Доля вакансий</th><th>Вакансий</th>"
+                 "<th>Вес</th><th>Критичный</th><th>Покрытие</th><th>Дисциплина</th></tr>")
+    for row in report.competences:
+        share = f"{row.share:.0%}" if row.share is not None else "—"
+        count = row.vacancies if row.vacancies is not None else "—"
+        covered = row.level == "full"
+        subjects = ", ".join(row.subjects) if covered else ""
+        parts.append(f"<tr><td>{escape(row.competence_name)}</td><td>{escape(', '.join(tool_labels(row)) or '—')}</td>"
+                     f"<td>{share}</td><td>{count}</td><td>{(row.weight or 0):g}</td><td>{'да' if row.critical else 'нет'}</td>"
+                     f"<td>{'покрыт темами' if covered else 'не покрыт'}</td><td>{escape(subjects or '—')}</td></tr>")
     parts.append("</table>")
-    if analysis.get("uncovered"):
-        parts.append("<p>Не покрыты курсом: " + escape(", ".join(analysis["uncovered"])) + "</p>")
+    if any(not tool_labels(row) or row.expert_tools for row in report.competences):
+        parts.append(f"<p>{escape(TOOL_COLUMN_NOTE)}</p>")
+    missing = [competence_label(row) for row in report.competences if row.level != "full"]
+    if missing:
+        parts.append("<p>Не покрыты курсом: " + escape(", ".join(missing)) + "</p>")
     if analysis.get("weak_subjects"):
         parts.append("<p>Слабо связаны с рынком и задачами: " + escape(", ".join(analysis["weak_subjects"])) + "</p>")
     return "\n".join(parts)
@@ -197,7 +201,6 @@ def course_report_html(content: dict, sources: dict, notices_html: str, market: 
     parts = ['<!doctype html><html lang="ru"><meta charset="utf-8">',
              f"<title>{title}</title><h1>{title}</h1>",
              generation_summary_html(program),
-             profession_profile_html(content.get("profession_profile"), content.get("profession_market", {}), sources),
              gap_coverage_html(content.get("evidence_gaps")),
              boundary_report_html(content.get("profession_boundaries", []), program),
              composition_html(content.get("composition_check")),
@@ -298,51 +301,6 @@ def profession_counts(profile: dict) -> dict:
     return counts
 
 
-def profession_profile_html(profile: dict | None, market: dict, sources: dict) -> str:
-    if not profile:
-        return ""
-    counts = profile.get("counts") or profession_counts(profile)
-    parts = ["<h2>Профиль профессии</h2>", "<p>"
-             f"Подтверждено: {counts['verified']} · Требует проверки методиста: {counts['needs_review']} · "
-             f"Отклонено экспертом: {counts['rejected']}</p>"]
-    if profile["sample_adequacy"] == "empty_external_data":
-        parts.append("<p>Внешних данных о рабочих задачах и измерений рынка нет.</p>")
-    elif profile["sample_adequacy"] == "low_sample":
-        parts.append("<p>Внешняя выборка ограничена.</p>")
-    if profile["missing_slots"]:
-        parts.append(f"<p>Требуется уточнить: {escape(', '.join(profile['missing_slots']))}.</p>")
-    if profile.get("rejected_noise_turns"):
-        numbers = ", ".join(str(number) for number in profile["rejected_noise_turns"])
-        parts.append(f"<p>Реплики без сведений по запросу: {escape(numbers)}.</p>")
-    if profile.get("unresolved_slots"):
-        labels = ", ".join(SLOT_HINTS.get(slot, (slot, ""))[0] for slot in profile["unresolved_slots"])
-        parts.append(f"<p>Поля интервью для проверки методистом: {escape(labels)}.</p>")
-    parts.append("<ul>")
-    for claim in profile["claims"]:
-        if claim["verification_status"] == "rejected":
-            continue
-        badges, fragments = [], []
-        for ref in claim["evidence"]:
-            if ref["expert_status"] in {"confirmed_by_expert", "edited_by_expert"}:
-                number = ref["source_id"].removeprefix("turn:")
-                badges.append(f"[Подтверждено экспертом, реплика #{number}]")
-            if ref["judge_verdict"] == "supports" and ref["source_type"] == "market_cluster":
-                provider = market.get(ref["source_id"], {}).get("provider", "выборка вакансий")
-                metric = ref["quote_or_metric"].replace(" (", " вакансий (", 1)
-                badges.append(f"[Рынок {provider}: {metric}, подтверждено]")
-            if ref["judge_verdict"] == "supports" and ref["source_type"] == "rag_chunk":
-                badges.append("[Подтверждено источником RAG]")
-            title = sources.get(ref["source_id"], {}).get("title")
-            fragments.append(f"<p>{escape(title + ' — ' if title else '')}{escape(ref['quote_or_metric'])}</p>")
-        if claim["verification_status"] == "needs_review":
-            badges = [PROFESSION_REVIEW_LABEL]
-        labels = " ".join(escape(label) for label in dict.fromkeys(badges))
-        details = (f"<details><summary>Основание</summary>{''.join(fragments)}</details>" if fragments else "")
-        parts.append(f"<li>{escape(claim['statement'])} <strong>{labels}</strong>{details}</li>")
-    parts.append("</ul>")
-    return "\n".join(parts)
-
-
 def child_blocks(block):
     return [*block.get("topics", []), *block.get("assignments", [])]
 
@@ -431,12 +389,22 @@ def render_block(block, numbers, level):
 def export_course(meta, version, sources, market: dict | None = None):
     if version.status != "approved":
         raise ValueError("Экспорт доступен после утверждения версии.")
-    content = version.content if market is None else {**version.content, "market_analysis": market}
+    content = version.content
+    # В старых версиях расчёты остаются в БД, но не попадают во вновь скачанные архивы.
+    content = {key: value for key, value in content.items() if key not in {"workloads", "workload_proposal"}}
     if profile := content.get("profession_profile"):
         profile = ProfessionProfile.model_validate(profile).model_dump(mode="json")
         content = {**content, "profession_profile": {**profile, "counts": profession_counts(profile),
                    "claims": [claim for claim in profile["claims"] if claim["verification_status"] != "rejected"]}}
     program = content["program"]
+    mappings = content.get("skill_mappings")
+    if market is None:
+        analysis = course_market(meta, program, sources, content.get("vacancy_source_ids", []), content.get("activity"),
+                                 mappings=mappings, saved=content.get("market_analysis"), profile=profile)
+    else:
+        analysis = with_expert_tools(with_competences(MarketAnalysis.model_validate(market), meta, mappings), profile)
+    market = analysis.model_dump(mode="json")
+    content["market_analysis"] = market
     notices = content.get("source_notices", [])
     notices_html = ""
     if notices:
@@ -477,31 +445,35 @@ def export_course(meta, version, sources, market: dict | None = None):
                     document["generationWarning"] = OUTLINE_LABEL
                     if subject.get("generation_note"):
                         document["generationNote"] = subject["generation_note"]
-            load = content.get("workloads", {}).get(subject["id"])
-            load_text = ""
             if notices:
                 document["sourceNotes"] = notices
-            if load:
-                document["workload"] = {**workload(load), "bySemester": by_semester(load)}
-                document["workloadInputs"] = load
-                if plan := curriculum(subject, load):
-                    document["curriculum"] = plan
-                if form := assessment_label(load.get("assessment_form")):
-                    document["assessment"] = {"interimForms": [form]}
-                load_text = f"<p>Нагрузка — {document['workload']['totalHours']} ч., {document['workload']['totalCredits']:g} ЗЕ"
-                semester = document["workload"]["bySemester"][0]
-                load_text += f" · семестр {semester['semester']}"
-                if form:
-                    load_text += f" · {escape(form)}"
-                load_text += "</p><ul>" + "".join(f"<li>{label} — {load.get(field, 0)} акад. ч.</li>"
-                                                  for field, label in HOURS.items()) + "</ul>"
-                if plan:
-                    load_text += "<p>Часы по темам</p><ul>" + "".join(
-                        f"<li>{escape(topic['title'])} — {sum(topic['activityHours'].values())} ч</li>"
-                        for topic in plan[0]["topics"]) + "</ul>"
+            outcomes = discipline_outcomes(subject, analysis, meta, mappings)
+            if outcomes:
+                document["competenceLearningOutcomes"] = outcomes
             validator.validate(document)
             directory = f"rpd/{index:02}"
             write_json(f"{directory}/rpd.json", document)
             archive.writestr(f"{directory}/rpd.html", '<!doctype html><meta charset="utf-8"><title>' +
-                             escape(subject["title"]) + "</title>" + load_text + block_html(subject, sources) + notices_html)
+                             escape(subject["title"]) + "</title>" + block_html(subject, sources)
+                             + discipline_outcomes_html(outcomes) + notices_html)
     return buffer.getvalue()
+
+
+def discipline_outcomes(subject: dict, analysis: MarketAnalysis, meta: dict, mappings: dict | None) -> list[dict]:
+    # Перегруппировка на уровне дисциплины исключает рыночные инструменты, которые в ней не изучаются.
+    linked = [row for row in analysis.skills or analysis.competences if subject["title"] in row.subjects]
+    result = with_competences(analysis.model_copy(update={"skills": linked, "competences": []}), meta, mappings)
+    return [{"competence_name": row.competence_name, "learningOutcomes": {"skillsAndTools": row.tools}}
+            for row in result.competences]
+
+
+def discipline_outcomes_html(outcomes: list[dict]) -> str:
+    if not outcomes:
+        return ""
+    rows = []
+    for row in outcomes:
+        tools = ", ".join(row["learningOutcomes"]["skillsAndTools"]) or "—"
+        rows.append(f"<tr><td>{escape(row['competence_name'])}</td>"
+                    f"<td><strong>Навыки и инструменты</strong><br>{escape(tools)}</td></tr>")
+    return ("<h2>Планируемые результаты обучения</h2><table><thead><tr><th>Компетенция</th>"
+            "<th>Результаты обучения</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")

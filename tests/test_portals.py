@@ -18,10 +18,12 @@ from auth.user_repository import CurrentUser
 from auth.yandex_users import accounts_from_text
 from domain.export import block_html, export_course, rationale_report_html, source_html
 from domain.schemas import EvidenceResults, block_value
+from domain.skill_mapper import ML_COMPETENCE
 from literature_parser import LiteratureSource, TopicLiterature, enrich_course_program
 from orchestration.checkpointer import open_checkpointer
 from orchestration.evidence_cache import source_record
 from orchestration.graph import build_course_graph
+from orchestration.market_analysis import course_market
 from orchestration.subject_rationale import explain_subjects
 from run_rpd import YandexModeratedResponse
 from storage.database import make_engine
@@ -151,6 +153,34 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await process_next(self.engine, self.factory, graph))
         async with self.factory() as db:
             return await db.get(Course, "course")
+
+    async def test_new_market_tags_are_normalized_and_saved_once_per_version(self):
+        vacancy = source_record("HH", "https://hh.ru/vacancy/123", "Инженер",
+                                "Навыки: SQL, NeoTool, OtherTool")
+        self.evidence.search.side_effect = lambda role, *args, **kwargs: [
+            *records().values(), *([vacancy] if role == "business" else [])]
+        base = self.model.generate
+        calls = []
+
+        async def generate(output, prompt, payload, context, **options):
+            if output.__name__ == "SkillMappingBatch":
+                calls.append(payload["raw_skills"])
+                return output.model_validate({"items": [
+                    {"raw_skill": tag, "competence_name": "Автоматизация рабочих процессов", "tool_name": tag}
+                    for tag in payload["raw_skills"]]})
+            return await base(output, prompt, payload, context, **options)
+
+        self.model.generate = generate
+        course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        self.assertEqual(len(calls), 1)
+        self.assertCountEqual(calls[0], ["NeoTool", "OtherTool"])
+        async with self.factory() as db:
+            draft = await db.get(CourseVersion, course.draft_version_id)
+            self.assertEqual(draft.content["skill_mappings"]["neotool"]["tool_name"], "NeoTool")
+        await decide(self.factory, self.teacher, course.id, draft.id, "refresh_materials")
+        self.assertEqual((await self.process()).status, "waiting_for_review")
+        self.assertEqual(len(calls), 1)
 
     async def test_rebuild_creates_model_draft_and_keeps_approved_version(self):
         course = await self.process()
@@ -289,72 +319,42 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Интервью: использован резервный вопрос по выявленному пробелу.",
                           draft.content["source_notices"])
 
-    async def test_draft_workload_is_prefilled_and_text_revision_is_exported(self):
-        # Объём берётся из параметров курса (магистратура, 30 з.е. по 36 ч, зачёт), а не из константы 2160 ч.
+    async def test_legacy_workload_does_not_block_review_or_leak_into_export(self):
         async with self.factory.begin() as db:
             stored = await db.get(Course, "course")
-            stored.course_meta = dict(stored.course_meta, workload={
-                "program_type": "master", "total_credits": 30, "hours_per_credit": 36, "semesters": 1,
-                "assessment_form": "credit"})
+            stored.course_meta = dict(stored.course_meta, workload={"total_credits": 30, "hours_per_credit": 36})
         course = await self.process()
-        async with self.factory() as db:
+        async with self.factory.begin() as db:
             draft = await db.get(CourseVersion, course.draft_version_id)
-            initial = draft.content["workload_proposal"]
-            subject = draft.content["program"]["subjects"][0]
-            self.assertEqual(initial["total_hours"], 1080)
-            self.assertEqual(initial["hours_per_credit"], 36)
-            self.assertEqual(initial["loads"][subject["id"]]["assessment"], 4)
-            self.assertEqual(initial["loads"][subject["id"]]["assessment_form"], "credit")
-
-        async def edit(output, prompt, payload, context, flash=False):
-            self.assertEqual(output.__name__, "WorkloadEdit")
-            self.assertEqual(payload["total_hours"], 1080)
-            return output.model_validate({
-                "workload_only": True, "total_hours": None, "total_credits": None,
-                "hours_per_credit": None, "distribute_evenly": False,
-                "subjects": [{"subject_id": subject["id"], "total_hours": 108, "credits": None,
-                              "lectures": None, "practice": None, "labs": 20,
-                              "independent": None, "assessment": 8}],
-            })
-
-        self.model.generate = edit
-        await decide(self.factory, self.teacher, course.id, draft.id, "revise",
-                     "Для баз данных оставь 108 академических часов, из них 20 лабораторных и 8 на аттестацию.")
+            self.assertNotIn("workload_proposal", draft.content)
+            # Черновик и команда могли остаться от приложения до удаления расчёта.
+            draft.content = {**draft.content, "workload_proposal": {"total_hours": 1080},
+                             "workloads": {"subject": {"lectures": 18}}}
+        await decide(self.factory, self.teacher, course.id, draft.id, "approve")
+        async with self.factory.begin() as db:
+            command = await db.get(WorkflowCommand, f"review:{draft.id}")
+            command.payload = {**command.payload, "workloads": draft.content["workloads"]}
+        await decide(self.factory, self.teacher, course.id, draft.id, "approve")
         course = await self.process()
-        self.assertEqual(course.status, "waiting_for_review")
-        async with self.factory() as db:
-            revised = await db.get(CourseVersion, course.draft_version_id)
-            self.assertEqual(revised.content["program"], draft.content["program"])
-            revised_load = revised.content["workload_proposal"]["loads"][subject["id"]]
-            self.assertEqual(revised.content["workload_proposal"]["total_hours"], 108)
-            self.assertEqual(revised_load["labs"], 20)
-            self.assertEqual(revised_load["assessment"], 8)
-
-        await decide(self.factory, self.teacher, course.id, revised.id, "approve")
-        course = await self.process()
+        self.assertEqual(course.status, "approved")
         async with self.factory() as db:
             active = await db.get(CourseVersion, course.active_version_id)
+            self.assertEqual(active.content["workloads"], draft.content["workloads"])
             sources = {row.source_id: row.record for row in (await db.scalars(
                 select(SourceRow).where(SourceRow.course_id == course.id))).all()}
             archive = export_course(course.course_meta, active, sources)
         with ZipFile(BytesIO(archive)) as package:
-            rpd = json.loads(package.read("rpd/01/rpd.json"))
-            self.assertEqual({key: rpd["workload"][key] for key in ("totalHours", "totalCredits")},
-                             {"totalHours": 108, "totalCredits": 3})
-            semester = rpd["workload"]["bySemester"][0]
-            self.assertEqual((semester["semester"], semester["hours"], semester["assessmentHours"],
-                              semester["laboratoryHours"], semester["assessmentForm"]), (1, 108, 8, 20, "зачет"))
-            self.assertEqual(rpd["workloadInputs"]["assessment"], 8)
-            self.assertEqual(sum(sum(topic["activityHours"].values()) for topic in rpd["curriculum"][0]["topics"]), 100)
+            for field in ("workload_proposal", "workloads"):
+                self.assertNotIn(field, json.loads(package.read("course.json")))
+            for field in ("workload", "workloadInputs"):
+                self.assertNotIn(field, json.loads(package.read("rpd/01/rpd.json")))
+            self.assertNotIn("Нагрузка", package.read("rpd/01/rpd.html").decode())
 
-    async def test_mixed_revision_updates_course_content_and_workload(self):
+    async def test_mixed_revision_updates_course_content_without_workload(self):
         course = await self.process()
         original = self.model.generate
 
         async def generate(output, prompt, payload, context, flash=False, **options):
-            if output.__name__ == "WorkloadEdit":
-                return output.model_validate({"workload_only": False, "total_hours": 216, "total_credits": None,
-                    "hours_per_credit": None, "distribute_evenly": False, "subjects": []})
             if output.__name__ == "CourseProgramModel":
                 revised = program()
                 assignment = revised["subjects"][0]["topics"][0]["assignments"][0]
@@ -371,7 +371,7 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(course.status, "waiting_for_review")
         async with self.factory() as db:
             draft = await db.get(CourseVersion, course.draft_version_id)
-            self.assertEqual(draft.content["workload_proposal"]["total_hours"], 216)
+            self.assertNotIn("workload_proposal", draft.content)
             assignment = draft.content["program"]["subjects"][0]["topics"][0]["assignments"][0]
             self.assertEqual(assignment["instructions"], "Составьте SQL-запрос и проверьте работу индекса.")
 
@@ -444,9 +444,8 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         args = (self.factory, self.teacher, course.id, course.draft_version_id)
         with self.assertRaises(PermissionError):
             await decide(self.factory, user("teacher", "other"), *args[2:], "approve")
-        hours = {"subject": dict(lectures=9, practice=9, independent=18, labs=0, hours_per_credit=36)}
-        await decide(*args, "approve", workloads=hours)
-        await decide(*args, "approve", workloads=hours)
+        await decide(*args, "approve")
+        await decide(*args, "approve")
         course = await self.process()
         self.assertEqual(course.status, "approved")
         active = course.active_version_id
@@ -461,8 +460,7 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             archive = export_course(course.course_meta, version, sources)
         with ZipFile(BytesIO(archive)) as package:
             rpd = json.loads(package.read("rpd/01/rpd.json"))
-            self.assertEqual(rpd["workload"]["totalCredits"], 1)
-            self.assertEqual(rpd["workload"]["totalHours"], 36)
+            self.assertNotIn("workload", rpd)
             self.assertTrue(rpd["assessmentMaterials"])
             self.assertEqual(rpd["sourceNotes"], notes)
             self.assertEqual(json.loads(package.read("course.json"))["source_notices"], notes)
@@ -522,6 +520,61 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             subject = json.loads(package.read("rpd/01/rpd.json"))
             self.assertIn(study.source_url, {item.get("url") for item in subject["readingList"]})
             self.assertIn(study.source_url, package.read("rpd/01/rpd.html").decode())
+
+    async def test_expert_tool_link_populates_market_table_without_adding_vacancies(self):
+        self.model.gap = True
+        vacancy = source_record("HH", "https://hh.ru/vacancy/123", "Инженер", "Навыки: машинное обучение")
+        self.evidence.search.side_effect = lambda role, *args, **kwargs: [
+            *records().values(), *([vacancy] if role == "business" else [])]
+        quote = "В PyTorch обучаю классификатор."
+        rejected = "В FictionTool проверяю прогноз."
+        original = self.model.generate
+
+        async def generate(output, prompt, payload, context, **options):
+            if output.__name__ == "InterviewerExtraction":
+                self.assertEqual(payload["tool_competence"], ML_COMPETENCE)
+                return output.model_validate({"items": [
+                    {"slot_name": "tool_stack", "statement": quote, "tool_name": "PyTorch", "operation": "обучаю классификатор"},
+                    {"slot_name": "tool_stack", "statement": rejected, "tool_name": "FictionTool", "operation": "проверяю прогноз"},
+                    {"slot_name": "tool_stack", "statement": quote, "tool_name": "Keras", "operation": "обучаю классификатор"},
+                ]})
+            if output.__name__ == "VerificationReport":
+                return output.model_validate({"claims": [
+                    {"claim": statement, "verification_status": status, "explanation": "Результат сверки",
+                     "clarification_question": None, "source_ids": ["HH"]}
+                    for statement, status in [(quote, "verified"), (rejected, "rejected_hallucination")]]}, context=context)
+            return await original(output, prompt, payload, context, **options)
+
+        self.model.generate = generate
+        self.assertEqual((await self.process()).status, "waiting_for_expert")
+        async with self.factory() as db:
+            interview = (await db.scalars(select(Interview))).one()
+        self.assertIn(ML_COMPETENCE, interview.gap_report["prompt"])
+        self.assertIn("tool_stack", interview.gap_report["requested_slots"])
+        expert = user("expert")
+        users = AsyncMock()
+        users.get_by_id.return_value = expert
+        token = await self.store.invite(interview.id, expert.id, self.teacher, users)
+        await self.store.submit_interview(token, expert, interview.interrupt_id, "tools", f"{quote} {rejected}", [])
+        course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        async with self.factory() as db:
+            version = await db.get(CourseVersion, course.draft_version_id)
+            corpus = {row.source_id: row.record for row in (await db.scalars(select(SourceRow))).all()}
+        content = version.content
+        links = content["profession_profile"]["expert_tool_links"]
+        self.assertEqual([(link["tool_name"], link["quote"], link["interview_id"]) for link in links],
+                         [("PyTorch", quote, interview.id)])
+        report = course_market(course.course_meta, content["program"], corpus, content["vacancy_source_ids"],
+                               content["activity"], profile=content["profession_profile"])
+        ml = next(row for row in report.competences if row.competence_name == ML_COMPETENCE)
+        self.assertEqual((ml.tools, ml.expert_tools, ml.vacancies, ml.share), ([], ["PyTorch"], 1, 1.0))
+        await decide(self.factory, self.teacher, course.id, version.id, "approve")
+        await self.process()
+        async with self.factory() as db:
+            approved = await db.get(CourseVersion, version.id)
+        with ZipFile(BytesIO(export_course(course.course_meta, approved, corpus))) as archive:
+            self.assertIn("PyTorch (эксперт)", archive.read("course-report.html").decode())
 
     async def test_expert_then_teacher_revision(self):
         self.model.gap = True

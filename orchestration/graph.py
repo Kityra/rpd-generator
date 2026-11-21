@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import re
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Annotated, Any, Protocol, TypedDict
@@ -9,14 +8,13 @@ from uuid import NAMESPACE_URL, uuid5
 from langgraph.graph import END, START, StateGraph
 from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
-from openai import APIResponseValidationError, APIStatusError
 from pydantic import ValidationError
 
 from auth.settings import Settings
 from domain.schemas import (AppliedActivityModel, BusinessCourseAudit, CourseProgramModel, GapReport,
                             Grounded, INDEPENDENT_EXPERT_SOURCE_TYPES, InterviewTurn, Model, RelevanceDecision, SourceRecord, SubjectPlan,
                             TopicAssignments, VerificationReport, all_blocks, block_value)
-from domain.workload import WorkloadEdit, WorkloadParams, apply_workload_edit, proposal_from_loads, propose_workload
+from domain.skill_mapper import skill_mapper
 from orchestration.call_log import (CALL_SCOPE, GENERATION_NOTES, CallScope, RecordingModelClient, classify_outcome,
                                     failure_note)
 from orchestration.clients import EvidenceClient, ModelClient, NoActivityEvidence, source_record
@@ -27,7 +25,8 @@ from orchestration.interview_methods import load_interview_methods
 from orchestration.interview_skills import FALLBACK, load_interview_skills, select_interview_method
 from orchestration.interviewer_turn import (CATEGORY_SLOT, SLOT_CATEGORY, SUBMISSION_PLACEHOLDERS, InterviewerRequest,
                                             classify_user_turn, extract_interview_claims, interview_result,
-                                            missing_profile_fields, scoped_decisions)
+                                            missing_profile_fields, scoped_decisions, verified_tool_links)
+from orchestration.market_analysis import course_market, market_vacancy_ids
 from orchestration.profession_boundaries import negative_scope, with_boundary_warnings
 from orchestration.profession_pipeline import (ACTIVITY_SOURCE_TYPES, activity_for_design, apply_expert_turn,
                                                initial_profile, manual_profile, market_evidence, with_missing_slots)
@@ -61,8 +60,7 @@ def is_truncated(error: Exception) -> bool:
         return True
     return isinstance(error, ValidationError) and any(item["type"] == "json_invalid" for item in error.errors())
 BUSINESS_SOURCE_TYPES = frozenset({"Priklad", "HH", SOURCE}) | VACANCY_SOURCE_TYPES
-WORKLOAD_REQUEST = re.compile(
-    r"\b(?:час(?:ы|ов|а|ам|ами)?|з\s*\.\s*е\.?|зе|зач[её]тн\w*\s+единиц\w*|учебн\w*\s+нагрузк\w*)\b", re.I)
+
 
 
 VOLATILE_SOURCE_FIELDS = frozenset({"retrieved_at", "relevance_score"})
@@ -121,6 +119,7 @@ class GraphState(TypedDict, total=False):
     profession_rag: dict[str, str]
     profession_market: dict
     profession_market_sample: int
+    skill_mappings: dict
     profession_turns: dict
     raw_activity: dict
     acknowledged_profession_claims: list[str]
@@ -134,9 +133,6 @@ class GraphState(TypedDict, total=False):
     review_feedback: list[dict]
     review_iteration: int
     refresh_only: bool
-    workload_only: bool
-    workload_proposal: dict | None
-    workload_notice: str
     status: str
     version_id: str
     consumed_review_id: str
@@ -172,12 +168,12 @@ class WorkflowStore(Protocol):
 
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
                          scheduled: bool, activity: dict, *, evidence_gaps: dict, source_notices: list[str],
-                         vacancy_source_ids: list[str], workload_proposal: dict, generation: dict | None = None,
+                         vacancy_source_ids: list[str], generation: dict | None = None,
                          composition: dict | None = None, profession_profile: dict | None = None,
-                         profession_market: dict | None = None) -> None:
+                         profession_market: dict | None = None, skill_mappings: dict | None = None) -> None:
         """Сохранить версию и уведомление."""
 
-    async def finish_review(self, course_id: str, version_id: str, action: str, actor: str, workloads=None) -> None:
+    async def finish_review(self, course_id: str, version_id: str, action: str, actor: str) -> None:
         """Утвердить либо отклонить конкретную версию."""
 
     async def defer_audit(self, course_id: str) -> None:
@@ -195,7 +191,7 @@ def planned_subjects(state: GraphState) -> list[dict]:
     suggestions = state.get("auto_subjects", {}).get("subjects", [])
     if not state.get("gap_report", {}).get("gap_types"):
         return suggestions
-    # Первый черновик оставляет место для решения преподавателя о расширении программы.
+    # Первый черновик оставляет место для решения методиста о расширении программы.
     unique = {}
     for subject in suggestions:
         unique.setdefault(" ".join(subject["name"].casefold().split()), subject)
@@ -228,11 +224,12 @@ def context(state: GraphState) -> dict:
 def payload(state: GraphState) -> dict:
     excluded = {"interview_answers", "verification", "owner_user_id", "request_id", "run_id",
                 "interview_session_id", "interrupt_id", "version_id", "consumed_review_id", "closed_interview_id"}
-    excluded.update({"workload_proposal", "workload_only", "workload_notice"})
-    excluded.update({"profession_profile", "profession_rag", "profession_market", "profession_market_sample", "profession_boundaries",
+    excluded.update({"profession_profile", "profession_rag", "profession_market", "profession_market_sample", "profession_boundaries", "skill_mappings",
                      "profession_turns", "raw_activity", "acknowledged_profession_claims",
                      "interview_max_turns", "interview_continue", "interview_redirect", "interview_handoff"})
     result = {key: value for key, value in state.items() if key not in excluded}
+    if "course_meta" in result:
+        result["course_meta"] = {key: value for key, value in result["course_meta"].items() if key != "workload"}
     if "review_feedback" in result:
         result["review_feedback"] = [{"content": item.get("content", ""), "attachments": item.get("attachments", [])}
                                      for item in result["review_feedback"]]
@@ -244,7 +241,7 @@ def payload(state: GraphState) -> dict:
             result["auto_subjects"] = {"subjects": planned_subjects(state)}
             result["sources"] = [{**source, "content": source["content"][:1800]} for source in state.get("sources", [])]
     if state.get("profession_profile"):
-        result["course_meta"] = {k: v for k, v in state["course_meta"].items() if k not in {"activity_model", "market"}}
+        result["course_meta"] = {k: v for k, v in result["course_meta"].items() if k not in {"activity_model", "market"}}
         for role in ("business", "science", "university", "books"):
             result.pop(f"{role}_report", None)
         result["profession_basis"] = profession_basis(state)
@@ -364,19 +361,6 @@ def subject_request(state: GraphState, names: list[str], suggestions: list[dict]
     return request, selected
 
 
-def with_importance(program: dict, suggestions: list[dict]) -> dict:
-    """Перенести ранг важности из плана дисциплин (единственный вклад модели в расчёт часов)."""
-    ranks = {" ".join(item["name"].casefold().split()): item for item in suggestions}
-    subjects = []
-    for subject in program["subjects"]:
-        match = ranks.get(" ".join(subject["title"].casefold().split()))
-        if match and not subject.get("importance"):
-            subject = {**subject, "importance": match.get("importance", "standard"),
-                       "importance_reason": match.get("importance_reason")}
-        subjects.append(subject)
-    return {**program, "subjects": subjects}
-
-
 def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceClient,
                        store: WorkflowStore, checkpointer: Any, *,
                        university_literature_enricher: Callable[[dict, dict[str, SourceRecord]], Awaitable[tuple]] | None = None,
@@ -389,8 +373,9 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             raise ValueError("Для запуска требуется устойчивый run_id.")
         await store.set_status(state["request_id"], "agents_running", state["owner_user_id"])
         return {"status": "agents_running", "interview_round": 0, "review_iteration": 0,
+                "course_meta": {key: value for key, value in state["course_meta"].items() if key != "workload"},
                 "interview_answers": [], "review_feedback": [], "revision_baseline": None,
-                "refresh_only": False, "workload_only": False, "workload_notice": "",
+                "refresh_only": False,
                 "interview_source_notices": [], "factcheck_source_notices": [], "draft_source_notices": [],
                 "literature_source_notices": [], "composition_notices": [],
                 "applied_activity": {}, "activity_origin": "", "gap_report": {}, "verification": {}, "auto_subjects": {},
@@ -429,8 +414,9 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             report_data = {**report.model_dump(mode="json"), "source_notices": notices,
                            "retrieved_source_ids": [item.source_id for item in sources]}
             if role == "business":
-                report_data["vacancy_source_ids"] = [item.source_id for item in sources
-                                                     if item.source_type in VACANCY_SOURCE_TYPES]
+                cards = [item.source_id for item in sources if item.source_type in VACANCY_SOURCE_TYPES]
+                report_data["vacancy_source_ids"] = market_vacancy_ids(
+                    {item.source_id: {"source_type": item.source_type, "url": item.url} for item in sources}, cards)
             return {f"{role}_report": report_data,
                     "sources": [item.model_dump(mode="json") for item in sources]}
         return run
@@ -513,8 +499,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             # Состав дисциплин решает руководитель программы: курс — это одна закреплённая дисциплина.
             ids = state["applied_activity"]["source_ids"]
             return {"auto_subjects": {"subjects": [
-                {"name": name, "is_fundamental": False, "conflict_with": None, "importance": "standard",
-                 "importance_reason": None, "source_ids": ids} for name in state.get("manual_subjects", [])]}}
+                {"name": name, "is_fundamental": False, "conflict_with": None,
+                 "source_ids": ids} for name in state.get("manual_subjects", [])]}}
         result = await llm.generate(SubjectPlan, prompts.UNIVERSITY, payload(state), context(state))
         # Флаг ядра: только с источником RPD/Books и в пределах доли из config/analysis.yaml.
         subjects, notes = limit_fundamental(result.model_dump(mode="json")["subjects"], registry(state))
@@ -595,9 +581,22 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         profile = ProfessionProfile.model_validate(saved) if saved else None
         limit = 1
         slots = []
+        tool_competence = None
         if profile:
             slots = (state["gap_report"].get("requested_slots", []) if redirect or handoff else
                      missing_profile_fields(profile, state["gap_report"]["gap_types"], state["applied_activity"]))
+            if redirect:
+                tool_competence = state["gap_report"].get("tool_competence")
+            elif not handoff:
+                sources = registry(state)
+                ids = state.get("business_report", {}).get("vacancy_source_ids", [])
+                cards = {key: sources[key].model_dump(mode="json") for key in ids if key in sources}
+                market = course_market(state["course_meta"], {}, cards, ids, None, profile=saved)
+                configured = skill_mapper().competences_with_tools
+                tool_competence = next((row.competence_name for row in market.competences if row.critical
+                    and not row.tools and not row.expert_tools and row.competence_name in configured), None)
+                if tool_competence and "tool_stack" not in slots:
+                    slots = [*slots, "tool_stack"]
             if not slots and not handoff:
                 return {"status": "designing"}
             pending = [claim for claim in profile.claims if claim.verification_status == "needs_review"
@@ -620,7 +619,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         request = {"course": state["course_meta"]["title"], "gaps": state["gap_report"]["questions"],
                    "interview_methods": skill}
         if profile:
-            request.update(requested_slots=slots, evidence=[
+            request.update(requested_slots=slots, tool_competence=tool_competence, evidence=[
                 {"source_id": ref.source_id, "quote_or_metric": ref.quote_or_metric}
                 for claim in profile.claims if claim.verification_status == "verified" for ref in claim.evidence
                 if ref.judge_verdict == "supports"][:12])
@@ -647,6 +646,9 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                 logging.getLogger(__name__).warning("Интервью курса %s: использован резервный вопрос (%s).",
                                                     state["request_id"], type(error).__name__)
             question = turn.prompt
+        if tool_competence:
+            question += (f"\n\nДля компетенции «{tool_competence}» назовите инструмент, который вы применяете, "
+                         "и опишите одну рабочую операцию с ним. Если специальный инструмент не нужен, так и укажите.")
         report = {**state["gap_report"], "prompt": question,
                   "question_origin": question_origin,
                   "previous_interview_id": state.get("interview_session_id") if round_number and not handoff else None,
@@ -655,7 +657,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         if profile:
             report.update(profession_profile=profile.model_dump(mode="json"), interview_max_turns=limit,
                           profession_market=state["profession_market"],
-                          requested_slots=slots, interview_can_continue=not handoff and accepted + 1 < limit,
+                          requested_slots=slots, tool_competence=tool_competence,
+                          interview_can_continue=not handoff and accepted + 1 < limit,
                           interview_turn=round_number + 1, review_candidate_ids=[claim.claim_id for claim in pending[:20]],
                           requires_manual_input=not (synthesis_sources(state) or state.get("manual_subjects") or
                                                      state.get("applied_activity")))
@@ -715,7 +718,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             slots = gap.get("requested_slots")
             if slots is None:  # Сохранённое приглашение до появления списка полей.
                 slots = missing_profile_fields(profile, gap["gap_types"], state["applied_activity"])
-            request = InterviewerRequest(requested_slots=slots, question=gap["prompt"])
+            request = InterviewerRequest(requested_slots=slots, question=gap["prompt"], tool_competence=gap.get("tool_competence"))
             decisions, form_claims = scoped_decisions(profile, request, answer.get("profession_decisions", []))
             reply = answer.get("content", "")
             if reply in SUBMISSION_PLACEHOLDERS:
@@ -794,6 +797,11 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             profile = profile.model_copy(update={"unresolved_slots": result.unresolved_slots})
             turns = {**state.get("profession_turns", {}), turn_id: turn}
             profile = await verify_profile(profile, state["profession_rag"], state["profession_market"], turns, reuse=True)
+            blocked = {normalized(item["claim"]) for item in report["claims"] if item["verification_status"] != "verified"}
+            links = verified_tool_links(request, extracted, reply, profile, turn_id, state["interview_session_id"], blocked)
+            if links:
+                profile = profile.model_copy(update={"expert_tool_links": list(dict.fromkeys([*profile.expert_tool_links, *links]))})
+                report["expert_tool_links"] = [link.model_dump(mode="json") for link in links]
             update = project_profile(state, profile, state["raw_activity"], state["acknowledged_profession_claims"],
                                      registry(state))
             update["profession_boundaries"] = await sync_boundaries(state, update["profession_profile"])
@@ -826,7 +834,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         GENERATION_NOTES.set(notes)
         program = await llm.generate(CourseProgramModel, prompts.DESIGN, payload(state), ctx)
         marked = mark_generated(program.model_dump(mode="json"), "model", "; ".join(notes) or None)
-        return {"course_program": with_importance(marked, suggestions), "status": "designing",
+        return {"course_program": marked, "status": "designing",
                 "profession_boundaries": boundaries}
 
     async def design_batched(state: GraphState, names: list[tuple[str, str]], suggestions: list[dict],
@@ -836,7 +844,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         manual_source = None
         if manual:
             url = f"{settings.public_origin}/teacher?course={state['request_id']}"
-            manual_source = source_record("teacher", url, "Список дисциплин преподавателя", "\n".join(manual.values()))
+            manual_source = source_record("teacher", url, "Список дисциплин методиста", "\n".join(manual.values()))
             state = {**state, "sources": merge_records(state.get("sources", []), [manual_source.model_dump(mode="json")])}
 
         async def generate_split(request: dict, ctx: dict, notes: list[str]) -> CourseProgramModel:
@@ -921,7 +929,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                 subjects.append(subject)
         combined = {"title": state["course_meta"]["title"], "subjects": subjects, "business_audit": None,
                     "source_ids": list(dict.fromkeys(key for program in programs for key in program.source_ids))}
-        program = CourseProgramModel.model_validate(with_importance(combined, suggestions), context=context(state))
+        program = CourseProgramModel.model_validate(combined, context=context(state))
         outlined = sum(len(part.subjects) for part, failure, _ in completed if failure)
         notices = [f"{outlined} из {len(subjects)} дисциплин собраны шаблоном из сохранённых материалов: "
                    "модель не сформировала их. Проверьте темы и учебные источники."] if outlined else []
@@ -950,8 +958,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                 audit = await llm.generate(BusinessCourseAudit, prompts.BUSINESS_AUDIT,
                                            {**payload(state), "course_program": program.model_dump(mode="json")},
                                            context(state), flash=True)
-                regenerated = with_importance(mark_generated(program.model_dump(mode="json"), "model"),
-                                              planned_subjects(state))
+                regenerated = mark_generated(program.model_dump(mode="json"), "model")
                 updated = {**regenerated, "business_audit": audit.model_dump(mode="json")}
             except (ValidationError, RuntimeError):
                 notices = [*state.get("draft_source_notices", []), "Рыночные предложения сохранены в отчёте для проверки."]
@@ -989,7 +996,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def persist_review(state: GraphState) -> dict:
         identifier = str(uuid5(NAMESPACE_URL, f"{state['request_id']}/{state['run_id']}/version/{state.get('review_iteration', 0)}"))
-        await store.save_sources(state["request_id"], list(registry(state).values()))
+        sources = registry(state)
+        await store.save_sources(state["request_id"], list(sources.values()))
         boundaries = await current_boundaries(state)
         threshold = getattr(settings, "boundary_violation_threshold", 0.5)
         checked = with_boundary_warnings(state["course_program"], boundaries, threshold=threshold)
@@ -998,21 +1006,26 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         gaps = state["gap_report"]
         evidence_gaps = {key: gaps[key] for key in ("gap_types", "business_coverage", "science_coverage",
                                                    "formula_breakdown", "coverage_parameters") if key in gaps}
-        previous = state.get("workload_proposal")
-        proposal = propose_workload(state["course_program"]["subjects"], previous,
-                                    WorkloadParams.from_meta(state["course_meta"]))
-        notices = run_source_notices(state)
-        if notice := state.get("workload_notice"):
-            notices.append(notice)
         composition = composition_report(state["course_program"], state["course_meta"], state.get("applied_activity"))
+        vacancy_ids = state["business_report"].get("vacancy_source_ids", [])
+        meta = state["course_meta"]
+        market = course_market(meta, checked, {key: sources[key].model_dump(mode="json") for key in vacancy_ids if key in sources},
+                               vacancy_ids, state["applied_activity"])
+        token = CALL_SCOPE.set(replace(CALL_SCOPE.get(), stage="skill_mapping"))
+        try:
+            mappings = await skill_mapper().normalize_unknown(
+                [row.skill for row in market.skills], meta.get("profession") or meta["title"], llm,
+                previous=state.get("skill_mappings"))
+        finally:
+            CALL_SCOPE.reset(token)
         boundary_options = {"boundary_violation_threshold": threshold} if getattr(type(store), "get_boundaries", None) else {}
         await store.save_draft(state["request_id"], identifier, program, scheduled, state["applied_activity"],
-                               evidence_gaps=evidence_gaps, source_notices=notices,
-                               vacancy_source_ids=state["business_report"].get("vacancy_source_ids", []),
-                               workload_proposal=proposal, generation=llm.describe(), composition=composition,
+                               evidence_gaps=evidence_gaps, source_notices=run_source_notices(state),
+                               vacancy_source_ids=vacancy_ids, skill_mappings=mappings,
+                               generation=llm.describe(), composition=composition,
                                profession_profile=state.get("profession_profile"), profession_market=state.get("profession_market"),
                                **boundary_options)
-        return {"version_id": identifier, "workload_proposal": proposal,
+        return {"version_id": identifier, "skill_mappings": mappings,
                 "course_program": checked, "profession_boundaries": boundaries,
                 "status": "pending_update_review" if scheduled else "waiting_for_review"}
 
@@ -1024,51 +1037,22 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             raise ValueError("Решение относится к устаревшей версии.")
         action = decision.get("action")
         if action in {"approve", "reject"}:
-            await store.finish_review(state["request_id"], state["version_id"], action, decision["actor_user_id"], decision.get("workloads"))
+            await store.finish_review(state["request_id"], state["version_id"], action, decision["actor_user_id"])
             return {"status": "approved", "consumed_review_id": state["version_id"]}
         if action == "refresh_materials":
             await store.set_status(state["request_id"], "collecting_literature", state["owner_user_id"])
-            return {"consumed_review_id": state["version_id"], "refresh_only": True, "workload_only": False,
+            return {"consumed_review_id": state["version_id"], "refresh_only": True,
                     "review_iteration": state.get("review_iteration", 0) + 1,
-                    "revision_baseline": state["course_program"], "status": "collecting_literature",
-                    "workload_proposal": decision.get("workload_proposal") or state.get("workload_proposal")}
+                    "revision_baseline": state["course_program"], "status": "collecting_literature"}
         if action != "revise" or not decision.get("content"):
             raise ValueError("Укажите правку или решение ревью.")
-        subjects = state["course_program"]["subjects"]
-        proposal = propose_workload(subjects, proposal_from_loads(decision.get("workloads") or {})
-                                    or decision.get("workload_proposal") or state.get("workload_proposal"),
-                                    WorkloadParams.from_meta(state["course_meta"]))
-        workload_only = False
-        notice = ""
-        if WORKLOAD_REQUEST.search(decision["content"]):
-            edit = None
-            try:
-                edit = await llm.generate(WorkloadEdit, prompts.WORKLOAD_EDIT, {
-                    "feedback": decision["content"], "total_hours": proposal["total_hours"],
-                    "hours_per_credit": proposal["hours_per_credit"],
-                    "subjects": [{"subject_id": subject["id"], "title": subject["title"],
-                                  "hours": proposal["loads"][subject["id"]]} for subject in subjects],
-                    "attachments": [{"name": f["name"], "text": f["text"][:6000]} for f in decision.get("attachments", [])],
-                }, {}, flash=True)
-                workload_only = edit.workload_only
-                if workload_only or any((edit.subjects, edit.distribute_evenly, edit.total_hours,
-                                         edit.total_credits, edit.hours_per_credit)):
-                    proposal = apply_workload_edit(subjects, proposal, edit)
-            except ValueError as error:
-                notice = str(error) if not isinstance(error, ValidationError) else "Уточните числовые параметры нагрузки."
-                workload_only = edit is None or edit.workload_only
-            except (RuntimeError, APIStatusError, APIResponseValidationError):
-                notice = "Не удалось обработать уточнение нагрузки. Сохранена предыдущая разбивка часов."
-                workload_only = True
-        update = {"consumed_review_id": state["version_id"], "review_iteration": state.get("review_iteration", 0) + 1,
-                  "revision_baseline": state["course_program"], "status": "designing", "refresh_only": False,
-                  "workload_only": workload_only, "workload_proposal": proposal, "workload_notice": notice}
-        if workload_only:
-            return update
         url = f"{settings.public_origin}/teacher?course={state['request_id']}&version={state['version_id']}"
-        records = [source_record("teacher", url, "Правка преподавателя", decision["content"])]
+        records = [source_record("teacher", url, "Правка методиста", decision["content"])]
         records.extend(source_record("teacher", url, file["name"], file["text"]) for file in decision.get("attachments", []))
-        return {**update, "review_feedback": [*state.get("review_feedback", []), decision],
+        feedback = {"content": decision["content"], "attachments": decision.get("attachments", [])}
+        return {"consumed_review_id": state["version_id"], "review_iteration": state.get("review_iteration", 0) + 1,
+                "revision_baseline": state["course_program"], "status": "designing", "refresh_only": False,
+                "review_feedback": [*state.get("review_feedback", []), feedback],
                 "sources": [r.model_dump(mode="json") for r in records]}
 
     def guarded(name, node):
@@ -1133,8 +1117,6 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     def after_review(state):
         if state["status"] == "approved":
             return END
-        if state.get("workload_only"):
-            return "persist_review"
         return "subject_rationale" if state.get("refresh_only") else "design"
 
     graph.add_conditional_edges("review", after_review)
