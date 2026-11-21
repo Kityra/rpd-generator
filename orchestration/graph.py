@@ -24,9 +24,11 @@ from orchestration import prompts
 from orchestration.draft import make_outline
 from orchestration.interview_methods import load_interview_methods
 from orchestration.interview_skills import FALLBACK, load_interview_skills, select_interview_method
-from orchestration.profession_pipeline import (ACTIVITY_SOURCE_TYPES, activity_for_design, add_expert_proposals,
-                                               apply_expert_turn, initial_profile, manual_profile, market_evidence,
-                                               with_missing_slots)
+from orchestration.interviewer_turn import (CATEGORY_SLOT, SLOT_CATEGORY, SUBMISSION_PLACEHOLDERS, InterviewerRequest,
+                                            classify_user_turn, extract_interview_claims, interview_result,
+                                            missing_profile_fields, scoped_decisions)
+from orchestration.profession_pipeline import (ACTIVITY_SOURCE_TYPES, activity_for_design, apply_expert_turn,
+                                               initial_profile, manual_profile, market_evidence, with_missing_slots)
 from orchestration.profession_profile import ProfessionProfile
 from orchestration.profession_verifier import normalized, verify_profession_profile
 from orchestration.rabota_business import SOURCE, SOURCE_GUIDANCE
@@ -116,6 +118,8 @@ class GraphState(TypedDict, total=False):
     acknowledged_profession_claims: list[str]
     interview_max_turns: int
     interview_continue: bool
+    interview_redirect: str | None
+    interview_handoff: bool
     course_program: dict
     baseline: dict | None
     revision_baseline: dict | None
@@ -219,7 +223,7 @@ def payload(state: GraphState) -> dict:
     excluded.update({"workload_proposal", "workload_only", "workload_notice"})
     excluded.update({"profession_profile", "profession_rag", "profession_market", "profession_market_sample",
                      "profession_turns", "raw_activity", "acknowledged_profession_claims",
-                     "interview_max_turns", "interview_continue"})
+                     "interview_max_turns", "interview_continue", "interview_redirect", "interview_handoff"})
     result = {key: value for key, value in state.items() if key not in excluded}
     if "review_feedback" in result:
         result["review_feedback"] = [{"content": item.get("content", ""), "attachments": item.get("attachments", [])}
@@ -377,7 +381,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                 "literature_source_notices": [], "composition_notices": [],
                 "applied_activity": {}, "activity_origin": "", "gap_report": {}, "verification": {}, "auto_subjects": {},
                 "profession_profile": {}, "profession_turns": {}, "acknowledged_profession_claims": [],
-                "interview_max_turns": 0, "interview_continue": False,
+                "interview_max_turns": 0, "interview_continue": False, "interview_redirect": None,
+                "interview_handoff": False,
                 "course_program": {}, "consumed_review_id": "", "closed_interview_id": "", "version_id": ""}
 
     def agent(role: str):
@@ -545,15 +550,24 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     async def prepare_interview(state: GraphState) -> dict:
         round_number = state.get("interview_round", 0)
         saved = state.get("profession_profile")
-        if round_number and (not saved or round_number >= state.get("interview_max_turns", 0)):
+        accepted = round_number - len((saved or {}).get("rejected_noise_turns", []))
+        handoff = state.get("interview_handoff", False)
+        if round_number and not handoff and (not saved or accepted >= state.get("interview_max_turns", 0)):
             return {"status": "designing"}
         identifier = str(uuid5(NAMESPACE_URL, f"{state['request_id']}/{state['run_id']}/interview/{round_number}"))
-        methods = await evidence.search("interview", gap_query(state["gap_report"], GAP_QUERY_LABELS),
-                                        owner_scope=state["owner_user_id"])
+        redirect = state.get("interview_redirect")
+        methods = [] if redirect or handoff else await evidence.search(
+            "interview", gap_query(state["gap_report"], GAP_QUERY_LABELS), owner_scope=state["owner_user_id"])
         profile = ProfessionProfile.model_validate(saved) if saved else None
         limit = 1
+        slots = []
         if profile:
-            pending = [claim for claim in profile.claims if claim.verification_status == "needs_review"]
+            slots = (state["gap_report"].get("requested_slots", []) if redirect or handoff else
+                     missing_profile_fields(profile, state["gap_report"]["gap_types"], state["applied_activity"]))
+            if not slots and not handoff:
+                return {"status": "designing"}
+            pending = [claim for claim in profile.claims if claim.verification_status == "needs_review"
+                       and CATEGORY_SLOT[claim.category] in slots]
             method = profile.interview_method_used or select_interview_method(
                 sample_size=state["profession_market_sample"], rag_count=len(state["profession_rag"]),
                 has_unverified=any(ref.source_type in {"rag_chunk", "market_cluster"} for claim in pending
@@ -563,7 +577,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                 missing_slots=profile.missing_slots)
             local = load_interview_skills(settings.interview_skill_directory).get(method, FALLBACK)
             limit = state.get("interview_max_turns") or local.max_turns
-            profile = profile.model_copy(update={"interview_method_used": local.id})
+            profile = profile.model_copy(update={"interview_method_used": local.id, "unresolved_slots": slots})
             local_skill = local.instructions
         else:
             local_skill = load_interview_methods(settings.interview_skill_directory, state["gap_report"]["gap_types"])
@@ -572,35 +586,42 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         request = {"course": state["course_meta"]["title"], "gaps": state["gap_report"]["questions"],
                    "interview_methods": skill}
         if profile:
-            request.update(missing_slots=profile.missing_slots, evidence=[
+            request.update(requested_slots=slots, evidence=[
                 {"source_id": ref.source_id, "quote_or_metric": ref.quote_or_metric}
                 for claim in profile.claims if claim.verification_status == "verified" for ref in claim.evidence
                 if ref.judge_verdict == "supports"][:12])
         else:
             request["tasks"] = [t["title"] for t in state["applied_activity"].get("tasks", [])]
-        try:
-            turn = await llm.generate(InterviewTurn, prompts.INTERVIEW, request, {}, flash=True)
-            question_origin = "interviewer"
-        except (ValidationError, YandexModeratedResponse, ExternalUnavailable) as error:
-            for question in reversed(state["gap_report"]["questions"]):
-                try:
-                    turn = InterviewTurn(prompt=question)
-                except ValidationError:
-                    continue
-                break
-            else:
-                raise
-            question_origin = "gap_report"
-            notices.append("Интервью: использован резервный вопрос по выявленному пробелу.")
-            logging.getLogger(__name__).warning("Интервью курса %s: использован резервный вопрос (%s).",
-                                                state["request_id"], type(error).__name__)
-        report = {**state["gap_report"], "prompt": turn.prompt,
+        if redirect or handoff:
+            question = ("Лимит уточнений исчерпан. Оставшиеся поля переданы методисту." if handoff else redirect)
+            question_origin = "methodologist_handoff" if handoff else "interview_clarification"
+        else:
+            try:
+                turn = await llm.generate(InterviewTurn, prompts.INTERVIEW, request, {}, flash=True)
+                question_origin = "interviewer"
+            except (ValidationError, YandexModeratedResponse, ExternalUnavailable) as error:
+                for question in reversed(state["gap_report"]["questions"]):
+                    try:
+                        turn = InterviewTurn(prompt=question)
+                    except ValidationError:
+                        continue
+                    break
+                else:
+                    raise
+                question_origin = "gap_report"
+                notices.append("Интервью: использован резервный вопрос по выявленному пробелу.")
+                logging.getLogger(__name__).warning("Интервью курса %s: использован резервный вопрос (%s).",
+                                                    state["request_id"], type(error).__name__)
+            question = turn.prompt
+        report = {**state["gap_report"], "prompt": question,
                   "question_origin": question_origin,
-                  "previous_interview_id": state.get("interview_session_id") if round_number else None,
+                  "previous_interview_id": state.get("interview_session_id") if round_number and not handoff else None,
+                  "methodologist_handoff": handoff,
                   "method_source_ids": [item.source_id for item in methods]}
         if profile:
             report.update(profession_profile=profile.model_dump(mode="json"), interview_max_turns=limit,
                           profession_market=state["profession_market"],
+                          requested_slots=slots, interview_can_continue=not handoff and accepted + 1 < limit,
                           interview_turn=round_number + 1, review_candidate_ids=[claim.claim_id for claim in pending[:20]],
                           requires_manual_input=not (synthesis_sources(state) or state.get("manual_subjects") or
                                                      state.get("applied_activity")))
@@ -609,7 +630,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         await store.set_status(state["request_id"], "waiting_for_expert", state["owner_user_id"])
         return {"interrupt_id": identifier, "interview_session_id": interview_id, "interview_max_turns": limit,
                 **({"profession_profile": profile.model_dump(mode="json")} if profile else {}),
-                "gap_report": report, "status": "waiting_for_expert", "interview_source_notices": list(dict.fromkeys(notices))}
+                "gap_report": report, "status": "waiting_for_expert", "interview_redirect": None,
+                "interview_source_notices": list(dict.fromkeys(notices))}
 
     async def interview(state: GraphState) -> dict:
         answer = interrupt({"interrupt_id": state["interrupt_id"], "interview_session_id": state["interview_session_id"],
@@ -629,7 +651,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             sources = registry(state)
             if manual or state.get("manual_subjects"):
                 url = f"{settings.public_origin}/teacher?course={state['request_id']}"
-                record = source_record("teacher", url + "&input=manual", "Ручные исходные данные преподавателя",
+                record = source_record("teacher", url + "&input=methodologist", "Ручные исходные данные методиста",
                                        "\n".join([*manual, *state.get("manual_subjects", [])]))
                 sources[record.source_id] = record
                 profile = manual_profile(profile, manual, record)
@@ -642,7 +664,9 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                 projection["sources"] = [*update.get("sources", []), *projection["sources"]]
                 return {**update, **projection}
             return update
-        if not answer.get("content"):
+        if state.get("interview_handoff"):
+            raise PermissionError("Оставшиеся поля переданы методисту.")
+        if not answer.get("content") and not state.get("profession_profile"):
             raise ValueError("Ответ эксперта пуст.")
         return {"interview_answers": [*state.get("interview_answers", []), answer],
                 "interview_round": state.get("interview_round", 0) + 1,
@@ -650,6 +674,39 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def factcheck(state: GraphState) -> dict:
         answer = state["interview_answers"][-1]
+        saved_profile = state.get("profession_profile")
+        if saved_profile:
+            profile = ProfessionProfile.model_validate(saved_profile)
+            gap = state["gap_report"]
+            slots = gap.get("requested_slots")
+            if slots is None:  # Сохранённое приглашение до появления списка полей.
+                slots = missing_profile_fields(profile, gap["gap_types"], state["applied_activity"])
+            request = InterviewerRequest(requested_slots=slots, question=gap["prompt"])
+            decisions, form_claims = scoped_decisions(profile, request, answer.get("profession_decisions", []))
+            reply = answer.get("content", "")
+            if reply in SUBMISSION_PLACEHOLDERS:
+                reply = "\n".join(item["text"][:2000] for item in answer.get("attachments", [])[:2])
+            notes_quality = await classify_user_turn(request, reply, llm)
+            if notes_quality != "valid_answer":
+                reply = ""
+            typed = "\n".join(item["statement"] for item in decisions if item["statement"])
+            if typed and await classify_user_turn(request, typed, llm) != "valid_answer":
+                decisions, form_claims = scoped_decisions(profile, request,
+                    [item for item in decisions if item["action"] in {"confirm", "reject"}])
+            classification = "valid_answer" if reply or decisions else "nonsense_or_offtopic"
+            if classification == "nonsense_or_offtopic":
+                result = interview_result(request, classification, {}, reply)
+                noise_turns = [*profile.rejected_noise_turns, state["interview_round"]]
+                retry = bool(slots and len(noise_turns) <= settings.max_invalid_redirects)
+                handoff = not retry and not (synthesis_sources(state) or state.get("manual_subjects") or
+                                             state.get("applied_activity"))
+                updated = profile.model_copy(update={"rejected_noise_turns": noise_turns,
+                                                     "unresolved_slots": result.unresolved_slots})
+                await store.record_verification(state["interview_session_id"],
+                    {"claims": [], "interviewer_result": result.model_dump(mode="json"), "redirected": retry})
+                return {"profession_profile": updated.model_dump(mode="json"), "interview_continue": False,
+                        "interview_redirect": result.clarification if retry else None, "interview_handoff": handoff}
+            extracted = await extract_interview_claims(request, reply, llm)
         topic = " ".join(state["course_meta"]["title"].split())[:300]
         fresh = await evidence.search("factcheck", f"{topic}: рабочие задачи, инструменты, результаты и критерии качества",
                                       owner_scope=state["owner_user_id"])
@@ -657,24 +714,55 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         combined = merge_records(state.get("sources", []), [item.model_dump(mode="json") for item in fresh])
         independent = {item["source_id"]: SourceRecord.model_validate(item) for item in combined
                        if item["source_type"] in INDEPENDENT_EXPERT_SOURCE_TYPES}
+        reply_for_check = reply if saved_profile else answer.get("content", "")
+        attachments_for_check = answer.get("attachments", []) if reply_for_check else []
         try:
             result = await llm.generate(VerificationReport, prompts.FACTCHECK,
-                                        {"answer": {"content": answer["content"], "attachments": answer.get("attachments", [])},
+                                        {"answer": {"content": reply_for_check, "attachments": attachments_for_check},
                                          "sources": [item.model_dump(mode="json") for item in independent.values()]},
                                         {"sources": independent}, flash=True)
             report = result.model_dump(mode="json")
         except (ValidationError, YandexModeratedResponse, ExternalUnavailable):
             report = {"claims": [], "assessment": "unavailable"}
-        if state.get("profession_profile"):
+        if saved_profile:
             turn_id = f"turn:{state['interview_round']}"
-            profile, turn = apply_expert_turn(ProfessionProfile.model_validate(state["profession_profile"]),
-                                             answer.get("profession_decisions", []), turn_id)
-            if answer["content"] not in {"Решения по профилю профессии.", "Ответ в приложенных материалах."}:
-                profile = add_expert_proposals(profile, answer["content"], report["claims"], turn_id, turn)
+            contradicted = {normalized(item["claim"]) for item in report["claims"]
+                            if item["verification_status"] == "rejected_hallucination"}
+            rejected = {item["claim_id"] for item in decisions if item["action"] == "reject"}
+            contradicted.update(normalized(c.statement) for c in profile.claims
+                                if c.verification_status == "rejected" or c.claim_id in rejected)
+            extracted = extracted.model_copy(update={"items": [item for item in extracted.items
+                                                               if normalized(item.statement) not in contradicted]})
+            result = interview_result(request, classification, extracted, reply, form_claims=form_claims)
+            existing = {(CATEGORY_SLOT[item.category], normalized(item.statement)): item for item in profile.claims}
+            form_keys = {(item.slot_name, normalized(item.statement)) for item in form_claims}
+            decided = {item["claim_id"] for item in decisions}
+            verbatim = set()
+            for index, item in enumerate(result.extracted_claims, 1):
+                key = item.slot_name, normalized(item.statement)
+                old = existing.get(key)
+                if key in form_keys or (old and (old.verification_status != "needs_review" or old.claim_id in decided)):
+                    continue
+                if old:
+                    same = old.statement == item.statement
+                    decisions.append({"claim_id": old.claim_id, "action": "confirm" if same else "edit",
+                                      "statement": None if same else item.statement})
+                    if same:
+                        verbatim.add(old.claim_id)
+                else:
+                    identifier = f"extracted-{index}"
+                    while identifier in decided:
+                        identifier += "-fact"
+                    decisions.append({"claim_id": identifier, "action": "add", "statement": item.statement,
+                                      "category": SLOT_CATEGORY[item.slot_name]})
+                    decided.add(identifier)
+            profile, turn = apply_expert_turn(profile, decisions, turn_id, verbatim_confirmations=verbatim)
+            profile = profile.model_copy(update={"unresolved_slots": result.unresolved_slots})
             turns = {**state.get("profession_turns", {}), turn_id: turn}
             profile = await verify_profile(profile, state["profession_rag"], state["profession_market"], turns)
             update = project_profile(state, profile, state["raw_activity"], state["acknowledged_profession_claims"],
                                      registry(state))
+            report["interviewer_result"] = result.model_dump(mode="json")
             await store.record_verification(state["interview_session_id"], report)
             return {**update, "profession_turns": turns, "verification": report, "factcheck_source_notices": notices,
                     "sources": [*[item.model_dump(mode="json") for item in fresh], *update["sources"]]}
@@ -972,13 +1060,23 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     graph.add_conditional_edges("gap_analysis", lambda state: "prepare_interview"
                                 if state["gap_report"]["gap_types"] and not state.get("closed_interview_id") and
                                 (not state.get("interview_round") or (state.get("interview_continue") and
-                                 state["interview_round"] < state.get("interview_max_turns", 0))) else "design")
+                                 state["interview_round"] - len(state.get("profession_profile", {}).get("rejected_noise_turns", []))
+                                 < state.get("interview_max_turns", 0))) else "design")
     graph.add_conditional_edges("prepare_interview", lambda state: "interview"
                                 if state["status"] == "waiting_for_expert" else "design")
     graph.add_conditional_edges("interview", lambda state: (
         "university_audit" if state.get("acknowledged_profession_claims") else "design")
         if state.get("closed_interview_id") == state["interrupt_id"] else "factcheck")
-    graph.add_conditional_edges("factcheck", lambda state: "university_audit" if state.get("profession_profile") else "formalize")
+    def after_factcheck(state):
+        if not state.get("profession_profile"):
+            return "formalize"
+        if state.get("interview_redirect") or state.get("interview_handoff"):
+            return "prepare_interview"
+        if state["interview_round"] in state["profession_profile"].get("rejected_noise_turns", []):
+            return "design"
+        return "university_audit"
+
+    graph.add_conditional_edges("factcheck", after_factcheck)
     graph.add_edge("design", "business_audit")
     graph.add_edge("business_audit", "subject_rationale")
     graph.add_edge("subject_rationale", "literature")

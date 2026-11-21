@@ -87,6 +87,10 @@ class Model:
             value = {"findings": []}
         elif name == "ProfessionEvidenceVerdicts":
             value = {"items": [{"pair_id": pair["pair_id"], "verdict": "supports"} for pair in payload["pairs"]]}
+        elif name == "InterviewerTurnQuality":
+            value = {"classification": "valid_answer"}
+        elif name == "InterviewerExtraction":
+            value = {"items": []}
         elif name == "AppliedActivityModel":
             count = 4 if self.gap and not any(s.source_type == "expert" for s in context["sources"].values()) else 5
             value = {"tasks": [{"id": f"task{i}", "title": f"Проверяет запрос SQL на этапе {i}", "stack": ["SQL"], "artifacts": ["Отчёт"],

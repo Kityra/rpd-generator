@@ -41,6 +41,10 @@ def interview_results(interviews, registry):
             report = interview.gap_report["verification"]
             received = f" · получен {interview.submitted_at:%d.%m.%Y}" if interview.submitted_at else ""
             st.markdown(f"**Ответ {index}**{received}")
+            if report.get("interviewer_result", {}).get("classification") == "nonsense_or_offtopic":
+                st.caption("Интервьюер запросил конкретный пример." if report.get("redirected")
+                           else "Оставшиеся поля переданы методисту.")
+                continue
             if not report["claims"]:
                 reason = ("Проверку ответа не удалось завершить." if report.get("assessment") == "unavailable"
                           else "В ответе не выделено проверяемых утверждений.")
@@ -364,12 +368,12 @@ async def course_detail(actor, settings, factory, users, course, notices):
                 gap_types = version.content.get("evidence_gaps", {}).get("gap_types", [])
                 if gap_types:
                     gaps = ", ".join(GAP_LABELS.get(kind, kind) for kind in gap_types)
-                    st.warning(f"Требуют проверки преподавателя — {gaps}.")
+                    st.warning(f"Требуют проверки методиста — {gaps}.")
                 generation_panel(version.content["program"], await model_call_failures(factory, course.id))
                 if profile := version.content.get("profession_profile"):
                     counts = profession_counts(profile)
                     st.caption(f"Профиль профессии · подтверждено {counts['verified']} · "
-                               f"требует проверки {counts['needs_review']} · отклонено {counts['rejected']}")
+                               f"требует проверки методиста {counts['needs_review']} · отклонено {counts['rejected']}")
                 analysis = course_market(course.course_meta, version.content["program"], registry,
                                          version.content.get("vacancy_source_ids", []), version.content.get("activity"))
                 loads, proposal = course_workspace(version, registry, interviews, can_review, active, course.course_meta,
@@ -396,9 +400,13 @@ async def course_detail(actor, settings, factory, users, course, notices):
                     selected = st.multiselect("Включить в черновик для проверки", list(choices),
                                               format_func=choices.get, key=f"profile-check-{interviews[0].id}") if choices else []
                     manual_tasks = []
+                    handoff = report.get("methodologist_handoff")
+                    if handoff:
+                        st.info(report["prompt"])
                     if profile.get("sample_adequacy") == "empty_external_data" or report.get("requires_manual_input"):
-                        st.info("Для профиля нет внешних данных. Укажите известные вам рабочие задачи или пригласите эксперта.")
-                        template = st.text_area("Рабочие задачи преподавателя", key=f"manual-{interviews[0].id}",
+                        st.info("Укажите известные рабочие задачи." if handoff else
+                                "Для профиля нет внешних данных. Укажите известные вам рабочие задачи или пригласите эксперта.")
+                        template = st.text_area("Рабочие задачи методиста", key=f"manual-{interviews[0].id}",
                                                 placeholder="Одна задача на строку\nДействие → объект → проверяемый результат",
                                                 max_chars=16000)
                         manual_tasks = template.splitlines()
@@ -411,7 +419,8 @@ async def course_detail(actor, settings, factory, users, course, notices):
                         else:
                             st.rerun()
                     st.caption("Сборка продолжится без интервью. Оставшиеся пробелы будут отмечены в черновике.")
-                    await expert_actions(actor, settings, factory, users, course, interviews[0])
+                    if not handoff:
+                        await expert_actions(actor, settings, factory, users, course, interviews[0])
                 if can_review:
                     await review_actions(actor, factory, course, draft, active, loads, proposal)
                 if version:

@@ -17,12 +17,14 @@ from orchestration.call_log import CALL_SCOPE, CallScope, RecordingModelClient
 from orchestration.evidence_cache import source_record
 from orchestration.graph import build_course_graph
 from orchestration.interview_skills import SKILL_FILES, load_interview_skills, select_interview_method
+from orchestration.interviewer_turn import (InterviewerRequest, classify_user_turn, extract_interview_claims,
+                                            interview_result)
 from orchestration.profession_pipeline import activity_for_design, apply_expert_turn, initial_profile, market_evidence
 from orchestration.profession_profile import EvidenceRef, pending_claim
 from orchestration.profession_verifier import ProfessionEvidenceVerdicts, verify_profession_profile
 from storage.database import make_engine
 from storage.models import Base, Course, CourseVersion, Interview, ModelCall
-from storage.portal import create_course, finish_without_answer
+from storage.portal import assigned_interviews, create_course, finish_without_answer
 from storage.workflow import SqlWorkflowStore
 from test_course_architecture import program, records
 from test_portals import Model, user
@@ -68,6 +70,18 @@ class SkillTests(unittest.TestCase):
 
 
 class VerificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_blacklists_noise_even_with_a_valid_turn_entry(self):
+        text = "Оптимизирует SQL-запросы"
+        value, turn = apply_expert_turn(profile(claim("work_task:A", text)), [
+            {"claim_id": "work_task:A", "action": "confirm"}], "turn:1")
+        judge = AsyncMock()
+        with self.assertLogs("orchestration.profession_verifier", "WARNING"):
+            result = await verify_profession_profile(value, {}, {}, {"turn:1": turn}, judge, rejected_noise_turns=[1])
+        self.assertEqual(result.rejected_noise_turns, [1])
+        self.assertEqual(result.claims[0].evidence, [])
+        self.assertEqual(result.claims[0].verification_status, "needs_review")
+        judge.generate.assert_not_awaited()
+
     async def test_strips_fabricated_id_quote_and_expert_status(self):
         text = "Внедряет транзакции PostgreSQL"
         forged = claim("forgery", text, "turn:1", kind="expert_interview")
@@ -176,10 +190,141 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
                       "[Рынок HH: 42/60 вакансий (70%), подтверждено]", "[Подтверждено источником RAG]"):
             self.assertIn(badge, report)
             self.assertIn(badge, ui)
+        self.assertIn("Требует проверки методиста — нет прямого подтверждения в источниках", ui)
+        self.assertIn("Требует проверки методиста — нет прямого подтверждения в источниках", report)
+        self.assertNotIn("Требует проверки преподавателя", ui + report)
         self.assertIn("chunk", manifest)
         self.assertEqual(saved["profession_profile"]["counts"], {"verified": 3, "needs_review": 1, "rejected": 1})
         self.assertNotIn("СКРЫТЫЙ ОТКЛОНЁННЫЙ ТЕКСТ", report)
         self.assertNotIn("СКРЫТЫЙ ОТКЛОНЁННЫЙ ТЕКСТ", json.dumps(saved, ensure_ascii=False))
+
+    def test_legacy_user_input_serializes_as_methodologist_input(self):
+        ref = EvidenceRef.model_validate({"source_type": "user_input", "source_id": "manual",
+                                         "quote_or_metric": "Проверяет отчёт"})
+        self.assertEqual(ref.model_dump()["source_type"], "methodologist_input")
+
+
+class InterviewTurnTests(unittest.IsolatedAsyncioTestCase):
+    async def test_extraction_filters_slots_files_and_fabricated_quotes(self):
+        request = InterviewerRequest(requested_slots=["work_tasks"], question="Что вы делаете?")
+        answer = "Сверяет миграции PostgreSQL. Использует Python."
+        llm = AsyncMock()
+        llm.generate.return_value = {"work_tasks": ["Сверяет миграции PostgreSQL.", "Выдуманная задача"],
+                                     "tool_stack": ["Использует Python."], "extra_file": "report.docx",
+                                     "unrequested_subjects": ["Информатика"],
+                                     "extracted_claims": [{"slot_name": "tool_stack", "statement": "Использует Python.",
+                                                           "file": "unrequested.docx"}]}
+        extracted = await extract_interview_claims(request, answer, llm)
+        result = interview_result(request, "valid_answer", extracted, answer)
+        self.assertEqual(result.filled_slots, {"work_tasks": ["Сверяет миграции PostgreSQL."]})
+        self.assertEqual([item.slot_name for item in result.extracted_claims], ["work_tasks"])
+        self.assertEqual(result.unresolved_slots, [])
+        self.assertNotIn(".docx", result.model_dump_json())
+
+    async def test_filters_local_noise_and_checks_semantic_relevance(self):
+        request = InterviewerRequest(requested_slots=["work_tasks"], question="Что вы делаете?")
+        llm = AsyncMock()
+        for text in ("бла-бла-бла", "asdfgh", "сделайте красиво не знаю что", ""):
+            self.assertEqual(await classify_user_turn(request, text, llm), "nonsense_or_offtopic")
+        llm.generate.assert_not_awaited()
+        llm.generate.return_value = {"classification": "nonsense_or_offtopic"}
+        self.assertEqual(await classify_user_turn(request, "В выходные солнечная погода.", llm), "nonsense_or_offtopic")
+        llm.generate.assert_awaited_once()
+
+    async def test_noise_turn_redirects_and_valid_second_turn_binds_new_claim(self):
+        teacher, expert = user("teacher"), user("expert")
+        model, evidence, users = Model(gap=True), AsyncMock(), AsyncMock()
+        users.get_by_id.return_value = expert
+        evidence.search.return_value = list(records().values())
+        statement = "Сверяет миграции PostgreSQL по контрольной схеме."
+        original = model.generate
+
+        async def generate(output, prompt, payload, context, **options):
+            if output.__name__ == "InterviewerExtraction":
+                self.assertEqual(payload["requested_slots"], ["work_tasks"])
+                self.assertEqual(payload["answer"], statement)
+                return {"work_tasks": [statement], "extra_file": "report.docx"}
+            return await original(output, prompt, payload, context, **options)
+
+        model.generate = AsyncMock(side_effect=generate)
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = make_engine("sqlite+aiosqlite:///" + (Path(tmp) / "interview.sqlite").as_posix())
+            try:
+                async with engine.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+                factory = async_sessionmaker(engine, expire_on_commit=False)
+                store = SqlWorkflowStore(factory)
+                await create_course(factory, teacher, "course",
+                                    {"title": "Базы данных", "institution": "Вуз", "year": "2026"}, [])
+                graph = build_course_graph(Settings(_env_file=None, session_signing_key="x" * 40), model, evidence,
+                                           store, InMemorySaver())
+                await process_next(engine, factory, graph)
+                async with factory() as db:
+                    first = (await db.scalars(select(Interview))).one()
+                token = await store.invite(first.id, expert.id, teacher, users)
+                await store.submit_interview(token, expert, first.interrupt_id, "one", "бла-бла-бла", [])
+                await process_next(engine, factory, graph)
+                async with factory() as db:
+                    first = await db.get(Interview, first.id)
+                    invitation, second, _ = next(row for row in (await db.execute(assigned_interviews(expert))).all()
+                                                 if row[1].id != first.id)
+                refused = first.gap_report["verification"]["interviewer_result"]
+                self.assertEqual(refused["extracted_claims"], [])
+                self.assertEqual(refused["filled_slots"], {})
+                self.assertIn("Пожалуйста", second.gap_report["prompt"])
+                self.assertEqual(second.gap_report["interview_turn"], 2)
+                self.assertEqual(second.gap_report["profession_profile"]["rejected_noise_turns"], [1])
+                self.assertNotIn("InterviewerExtraction", [call.args[0].__name__ for call in model.generate.call_args_list])
+                await store.submit_interview("", expert, second.interrupt_id, "two", statement, [],
+                                             invitation_id=invitation.id)
+                await process_next(engine, factory, graph)
+                async with factory() as db:
+                    course = await db.get(Course, "course")
+                    self.assertEqual(course.status, "waiting_for_review")
+                    version = await db.get(CourseVersion, course.draft_version_id)
+                persisted = version.content["profession_profile"]
+                accepted = next(item for item in persisted["claims"] if item["statement"] == statement)
+                self.assertEqual(accepted["verification_status"], "verified")
+                self.assertEqual(accepted["evidence"][0]["source_id"], "turn:2")
+                self.assertEqual(persisted["rejected_noise_turns"], [1])
+                self.assertNotIn("бла-бла-бла", json.dumps(persisted, ensure_ascii=False))
+            finally:
+                await engine.dispose()
+
+    async def test_redirect_limit_passes_empty_profile_to_methodologist(self):
+        teacher, expert = user("teacher"), user("expert")
+        model, evidence, users = Model(gap=True), AsyncMock(), AsyncMock()
+        users.get_by_id.return_value = expert
+        evidence.search.return_value = []
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = make_engine("sqlite+aiosqlite:///" + (Path(tmp) / "handoff.sqlite").as_posix())
+            try:
+                async with engine.begin() as connection:
+                    await connection.run_sync(Base.metadata.create_all)
+                factory = async_sessionmaker(engine, expire_on_commit=False)
+                store = SqlWorkflowStore(factory)
+                await create_course(factory, teacher, "course", {"title": "Инженер данных"}, [])
+                settings = Settings(_env_file=None, session_signing_key="x" * 40, max_invalid_redirects=0)
+                graph = build_course_graph(settings, model, evidence, store, InMemorySaver())
+                await process_next(engine, factory, graph)
+                async with factory() as db:
+                    first = (await db.scalars(select(Interview))).one()
+                token = await store.invite(first.id, expert.id, teacher, users)
+                await store.submit_interview(token, expert, first.interrupt_id, "one", "asdfgh", [])
+                await process_next(engine, factory, graph)
+                async with factory() as db:
+                    handoff = (await db.scalars(select(Interview).where(Interview.id != first.id))).one()
+                    invites = (await db.execute(assigned_interviews(expert))).all()
+                    self.assertEqual(len(invites), 1)
+                self.assertTrue(handoff.gap_report["methodologist_handoff"])
+                saved = handoff.gap_report["profession_profile"]
+                self.assertEqual(saved["rejected_noise_turns"], [1])
+                self.assertIn("work_tasks", saved["unresolved_slots"])
+                self.assertFalse(saved["claims"])
+                with self.assertRaisesRegex(ValueError, "методисту"):
+                    await store.invite(handoff.id, expert.id, teacher, users)
+            finally:
+                await engine.dispose()
 
 
 class ColdStartTests(unittest.IsolatedAsyncioTestCase):

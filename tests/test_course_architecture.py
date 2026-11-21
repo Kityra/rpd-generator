@@ -267,6 +267,10 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                          "source_ids": ["HH"]} for i in range(3)], "aspects": [], "source_ids": ["HH"]}
             elif output.__name__ == "ProfessionEvidenceVerdicts":
                 value = {"items": [{"pair_id": pair["pair_id"], "verdict": "supports"} for pair in payload["pairs"]]}
+            elif output.__name__ == "InterviewerTurnQuality":
+                value = {"classification": "valid_answer"}
+            elif output.__name__ == "InterviewerExtraction":
+                value = {"items": []}
             elif output.__name__ == "SubjectPlan":
                 value = {"subjects": [{"name": "Базы данных", "is_fundamental": True, "conflict_with": None, "source_ids": ["Books"]}]}
             elif output.__name__ == "InterviewTurn":

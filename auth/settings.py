@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     business_coverage_threshold: float = Field(default=0.6, ge=0, le=1)
     science_coverage_threshold: float = Field(default=0.6, ge=0, le=1)
     interview_skill_directory: str = "skills/interview_methods"
+    max_invalid_redirects: int = Field(default=2, ge=0, le=10)
     literature_parser_enabled: bool = True
     literature_use_llm: bool = False
     # Повтор генерации дисциплины при таймауте или паузе выключателя, секунды через запятую.

@@ -37,7 +37,7 @@ def market_evidence(meta: dict, sources: dict[str, SourceRecord], vacancy_ids: l
     records = {key: sources[key].model_dump(mode="json") for key in ids if key in sources}
     market = course_market(meta, {}, records, ids, None)
     size = market.sample_size or 0
-    provider = "выборка преподавателя" if (meta.get("market") or {}).get("dataset") else (
+    provider = "выборка методиста" if (meta.get("market") or {}).get("dataset") else (
         "HH" if records and all(record["source_type"] == "HH" for record in records.values()) else "выборка вакансий")
     measurements = {}
     for row in market.skills:
@@ -93,7 +93,8 @@ def with_missing_slots(profile: ProfessionProfile, meta: dict) -> ProfessionProf
     return profile.model_copy(update={"missing_slots": missing})
 
 
-def apply_expert_turn(profile: ProfessionProfile, decisions: list[dict], turn_id: str) -> tuple[ProfessionProfile, dict]:
+def apply_expert_turn(profile: ProfessionProfile, decisions: list[dict], turn_id: str, *,
+                      verbatim_confirmations: set[str] | None = None) -> tuple[ProfessionProfile, dict]:
     claims = {claim.claim_id: claim for claim in profile.claims}
     turns = {}
     for raw in decisions:
@@ -108,6 +109,8 @@ def apply_expert_turn(profile: ProfessionProfile, decisions: list[dict], turn_id
         statement = decision.statement or original.statement
         quote = {"confirm": f"Подтверждаю: {statement}", "reject": f"Отклоняю: {statement}"}.get(
             decision.action, statement)
+        if decision.action == "confirm" and claim_id in (verbatim_confirmations or ()):
+            quote = statement
         status = EXPERT_ACTIONS[decision.action]
         ref = EvidenceRef(source_type="expert_interview", source_id=turn_id, quote_or_metric=quote,
                           expert_status=status)
@@ -115,30 +118,6 @@ def apply_expert_turn(profile: ProfessionProfile, decisions: list[dict], turn_id
         claims[claim_id] = pending_claim(claim_id, category, statement, [*old_refs, ref])
         turns[claim_id] = {"statement": statement, "quote": quote, "status": status}
     return profile.model_copy(update={"claims": list(claims.values())}), turns
-
-
-def add_expert_proposals(profile: ProfessionProfile, answer: str, extracted: list[dict], turn_id: str,
-                         turns: dict) -> ProfessionProfile:
-    # Комментарий из чата остаётся предложением. Интерпретация LLM не заменяет прямое решение эксперта.
-    claim_texts = [item["claim"] for item in extracted
-                   if 3 <= len(item["claim"]) <= 2000 and normalized(item["claim"]) in normalized(answer)]
-    if not claim_texts:
-        claim_texts = [line.strip() for line in answer.splitlines() if 3 <= len(line.strip()) <= 2000]
-    existing = {normalized(claim.statement) for claim in profile.claims}
-    claims = list(profile.claims)
-    for index, text in enumerate(claim_texts[:20]):
-        if normalized(text) in existing:
-            continue
-        quote = re.search(r"\s+".join(re.escape(word) for word in text.split()), answer, re.IGNORECASE)
-        if quote is None:
-            continue
-        statement = quote.group()
-        claim_id = f"proposal:{turn_id}:{index}"
-        ref = EvidenceRef(source_type="expert_interview", source_id=turn_id, quote_or_metric=statement)
-        claims.append(pending_claim(claim_id, "work_task", statement, [ref]))
-        turns[claim_id] = {"statement": statement, "quote": statement, "status": "unreviewed"}
-        existing.add(normalized(text))
-    return profile.model_copy(update={"claims": claims})
 
 
 def activity_for_design(profile: ProfessionProfile, raw_activity: dict, acknowledged: list[str], url: str,
@@ -159,7 +138,7 @@ def activity_for_design(profile: ProfessionProfile, raw_activity: dict, acknowle
                 records[record.source_id] = record
                 ids.append(record.source_id)
         if claim.verification_status == "needs_review":
-            record = source_record("teacher", url, "Включено преподавателем для проверки", claim.statement)
+            record = source_record("teacher", url + "&input=acknowledged", "Включено методистом для проверки", claim.statement)
             records[record.source_id] = record
             ids = [record.source_id]
         references[claim_id] = list(dict.fromkeys(ids))
@@ -200,7 +179,7 @@ def manual_profile(profile: ProfessionProfile, tasks: list[str], record: SourceR
     for i, task in enumerate(tasks, 1):
         if normalized(task) not in seen:
             claim = pending_claim(f"manual:{i}", "work_task", task, [
-                EvidenceRef(source_type="user_input", source_id=record.source_id, quote_or_metric=task)])
-            claims.append(claim.model_copy(update={"verification_reason": "Рабочую задачу указал преподаватель."}))
+                EvidenceRef(source_type="methodologist_input", source_id=record.source_id, quote_or_metric=task)])
+            claims.append(claim.model_copy(update={"verification_reason": "Рабочую задачу указал методист."}))
             seen.add(normalized(task))
     return profile.model_copy(update={"claims": claims})

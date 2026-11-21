@@ -1,9 +1,9 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-SourceKind = Literal["rag_chunk", "market_cluster", "expert_interview", "user_input"]
+SourceKind = Literal["rag_chunk", "market_cluster", "expert_interview", "methodologist_input"]
 ExpertStatus = Literal["unreviewed", "confirmed_by_expert", "edited_by_expert", "rejected_by_expert"]
 Verdict = Literal["supports", "weak", "unrelated"]
 Category = Literal["duty_area", "work_task", "work_artifact", "tool_stack", "domain_constraint"]
@@ -19,6 +19,11 @@ class EvidenceRef(Contract):
     quote_or_metric: str = Field(min_length=1)
     expert_status: ExpertStatus = "unreviewed"
     judge_verdict: Literal["pending", "supports", "weak", "unrelated"] = "pending"
+
+    @field_validator("source_type", mode="before")
+    @classmethod
+    def legacy_user_input(cls, value):
+        return "methodologist_input" if value == "user_input" else value
 
 
 class ProfessionClaim(Contract):
@@ -46,6 +51,8 @@ class ProfessionProfile(Contract):
     sample_adequacy: Literal["sufficient", "low_sample", "empty_external_data"]
     missing_slots: list[str]
     interview_method_used: str | None = None
+    rejected_noise_turns: list[int] = Field(default_factory=list)
+    unresolved_slots: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def unique_claim_ids(self):

@@ -7,6 +7,8 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from jsonschema import Draft202012Validator
 from domain.workload import HOURS, assessment_label, by_semester, curriculum, workload
+from orchestration.interviewer_turn import SLOT_HINTS
+from orchestration.profession_profile import ProfessionProfile
 
 REASONS = {"market_demand": "Спрос работодателей", "scientific_trend": "Научные результаты",
            "expert_practice": "Практика эксперта", "fundamental_core": "Фундаментальная подготовка",
@@ -14,7 +16,7 @@ REASONS = {"market_demand": "Спрос работодателей", "scientific
 
 
 OUTLINE_LABEL = "Собрано шаблоном, нужна проверка"
-PROFESSION_REVIEW_LABEL = "[Требует проверки преподавателя — нет прямого подтверждения в источниках]"
+PROFESSION_REVIEW_LABEL = "[Требует проверки методиста — нет прямого подтверждения в источниках]"
 # Так помечал обоснование шаблон make_outline до появления поля generated_by.
 LEGACY_OUTLINE_SUMMARY = "Тема предложена для проверки преподавателем по приложенным материалам."
 
@@ -231,7 +233,7 @@ def profession_profile_html(profile: dict | None, market: dict, sources: dict) -
         return ""
     counts = profile.get("counts") or profession_counts(profile)
     parts = ["<h2>Профиль профессии</h2>", "<p>"
-             f"Подтверждено: {counts['verified']} · Требует проверки: {counts['needs_review']} · "
+             f"Подтверждено: {counts['verified']} · Требует проверки методиста: {counts['needs_review']} · "
              f"Отклонено экспертом: {counts['rejected']}</p>"]
     if profile["sample_adequacy"] == "empty_external_data":
         parts.append("<p>Внешних данных о рабочих задачах и измерений рынка нет.</p>")
@@ -239,6 +241,12 @@ def profession_profile_html(profile: dict | None, market: dict, sources: dict) -
         parts.append("<p>Внешняя выборка ограничена.</p>")
     if profile["missing_slots"]:
         parts.append(f"<p>Требуется уточнить: {escape(', '.join(profile['missing_slots']))}.</p>")
+    if profile.get("rejected_noise_turns"):
+        numbers = ", ".join(str(number) for number in profile["rejected_noise_turns"])
+        parts.append(f"<p>Реплики без сведений по запросу: {escape(numbers)}.</p>")
+    if profile.get("unresolved_slots"):
+        labels = ", ".join(SLOT_HINTS.get(slot, (slot, ""))[0] for slot in profile["unresolved_slots"])
+        parts.append(f"<p>Поля интервью для проверки методистом: {escape(labels)}.</p>")
     parts.append("<ul>")
     for claim in profile["claims"]:
         if claim["verification_status"] == "rejected":
@@ -350,6 +358,7 @@ def export_course(meta, version, sources, market: dict | None = None):
         raise ValueError("Экспорт доступен после утверждения версии.")
     content = version.content if market is None else {**version.content, "market_analysis": market}
     if profile := content.get("profession_profile"):
+        profile = ProfessionProfile.model_validate(profile).model_dump(mode="json")
         content = {**content, "profession_profile": {**profile, "counts": profession_counts(profile),
                    "claims": [claim for claim in profile["claims"] if claim["verification_status"] != "rejected"]}}
     program = content["program"]
@@ -366,7 +375,7 @@ def export_course(meta, version, sources, market: dict | None = None):
         write_json("course.json", content)
         source_ids = set(used_sources(content)) | set(content.get("vacancy_source_ids", ()))
         source_ids.update(ref["source_id"] for claim in content.get("profession_profile", {}).get("claims", [])
-                          for ref in claim["evidence"] if ref["source_type"] in {"rag_chunk", "user_input"}
+                          for ref in claim["evidence"] if ref["source_type"] in {"rag_chunk", "methodologist_input"}
                           and ref["source_id"] in sources)
         write_json("sources.json", {k: sources[k] for k in sorted(source_ids)})
         archive.writestr("course-report.html", course_report_html(content, sources, notices_html, market))

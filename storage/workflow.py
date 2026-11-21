@@ -84,6 +84,8 @@ class SqlWorkflowStore:
             course = await db.get(Course, interview.course_id) if interview else None
             if course is None or course.owner_user_id != teacher.id or interview.status != "invited":
                 raise PermissionError("Интервью недоступно.")
+            if interview.gap_report.get("methodologist_handoff"):
+                raise ValueError("Оставшиеся поля переданы методисту.")
             active = (await db.scalars(select(ExpertInvitation).where(
                 ExpertInvitation.interview_id == interview_id, ExpertInvitation.status == "active"))).all()
             for previous in active:
@@ -96,7 +98,7 @@ class SqlWorkflowStore:
     async def submit_interview(self, token: str, expert: CurrentUser, interrupt_id: str,
                                submission_id: str, content: str, attachments: list[dict], *, invitation_id: str | None = None,
                                profession_decisions: list[dict] | None = None, continue_interview: bool = False) -> None:
-        if expert.role != "expert" or not content.strip() or len(content) > 16000:
+        if expert.role != "expert" or len(content) > 16000:
             raise PermissionError("Требуется ответ авторизованного эксперта.")
         at = datetime.now(timezone.utc)
         decisions = [ExpertDecision.model_validate(item).model_dump(mode="json") for item in profession_decisions or []]
@@ -116,7 +118,7 @@ class SqlWorkflowStore:
             if existing:
                 expected = existing.payload
                 if expected.get("action") == "finish_without_answer":
-                    raise ValueError("Преподаватель завершил интервью и запросил черновик.")
+                    raise ValueError("Методист завершил интервью и запросил черновик.")
                 if (expected["submission_id"] != submission_id or expected["content"] != content
                         or expected["attachments"] != attachments or expected.get("profession_decisions", []) != decisions
                         or expected.get("continue_interview", False) != continue_interview):
@@ -126,10 +128,15 @@ class SqlWorkflowStore:
                 raise PermissionError("Приглашение истекло или использовано.")
             if interview.interrupt_id != interrupt_id or interview.status != "invited":
                 raise ValueError("Прерывание устарело.")
+            if not content.strip() and not interview.gap_report.get("profession_profile"):
+                raise PermissionError("Требуется ответ авторизованного эксперта.")
             allowed = set(interview.gap_report.get("review_candidate_ids", []))
             if any(entry["action"] != "add" and entry["claim_id"] not in allowed for entry in decisions):
                 raise ValueError("Утверждение отсутствует в текущем интервью.")
-            if continue_interview and interview.gap_report.get("interview_turn", 1) >= interview.gap_report.get("interview_max_turns", 1):
+            report = interview.gap_report
+            can_continue = report.get("interview_can_continue",
+                                      report.get("interview_turn", 1) < report.get("interview_max_turns", 1))
+            if continue_interview and not can_continue:
                 raise ValueError("Достигнут лимит реплик по методике интервью.")
             payload = {"submission_id": submission_id, "interrupt_id": interrupt_id, "content": content,
                        "attachments": attachments, "expert_user_id": expert.id,
