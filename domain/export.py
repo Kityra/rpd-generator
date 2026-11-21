@@ -53,6 +53,11 @@ def public_source_url(source: dict) -> str | None:
 def material_key(source: dict, source_id: str) -> tuple[str, str]:
     if is_yandex_file(source):
         return "file", " ".join(source["title"].casefold().split())
+    if source["source_type"] == "Literature":
+        for line in source["content"].splitlines():
+            if line.startswith(("DOI: ", "ISBN: ")):
+                identifier, _, value = line.partition(": ")
+                return identifier, value.casefold().strip()
     if url := public_source_url(source):
         return "link", url
     return "record", source_id
@@ -71,7 +76,58 @@ def source_html(source: dict, *, number: int | None = None, fragments: list[str]
         return "\n".join([*parts, "</details>"])
     if url := public_source_url(source):
         title = f'<a href="{escape(url, quote=True)}">{title}</a>'
+    if source["source_type"] == "Literature":
+        for line in source["content"].splitlines():
+            if line.startswith("PDF: "):
+                if pdf := public_source_url({**source, "url": line.removeprefix("PDF: ")}):
+                    title += f' · <a href="{escape(pdf, quote=True)}">PDF</a>'
+                break
     return f"<p>{title}</p>"
+
+
+def rationale_report_html(program: dict, sources: dict) -> str:
+    parts = []
+    for subject in program["subjects"]:
+        parts.append(f"<h2>{escape(subject['title'])}</h2>")
+        rationale = subject.get("inclusion_rationale")
+        if not rationale:
+            parts.append("<p>В базе не подтверждено обоснование включения дисциплины в курс.</p>")
+            continue
+        parts.append(f"<p>{escape(rationale['explanation'])}</p>")
+        for item in rationale["evidence"]:
+            source = sources[item["source_id"]]
+            title = escape(source["title"])
+            if url := public_source_url(source):
+                title = f'<a href="{escape(url, quote=True)}">{title}</a>'
+            parts.append(f"<p>{title} · {escape(source['source_type'])}</p>")
+            parts.append(f"<blockquote>{escape(item['excerpt'])}</blockquote>")
+    return "\n".join(parts)
+
+
+def course_report_html(content: dict, sources: dict, notices_html: str) -> str:
+    program = content["program"]
+    title = f"Отчёт по курсу «{escape(program['title'])}»"
+    parts = ['<!doctype html><html lang="ru"><meta charset="utf-8">',
+             f"<title>{title}</title><h1>{title}</h1>",
+             rationale_report_html(program, sources)]
+    audit = program.get("business_audit")
+    vacancy_ids = content.get("vacancy_source_ids", [])
+    if audit or vacancy_ids:
+        parts.append("<h2>Оценка курса индустрией</h2>")
+    if audit:
+        parts.append(f"<p>Покрытие рабочих задач курсом (оценка модели) — {audit['market_fit_score']:.0%}</p>")
+        parts.append(f"<p>{escape(audit['evidence_summary'])}</p>")
+        for metric in audit["metrics"]:
+            part = f"{metric['name']} — {metric['value']} {metric['unit']} · {metric['region']}"
+            parts.append(f"<p>{escape(part)}</p>")
+        if audit["unavailable_metrics"]:
+            missing = escape(", ".join(audit["unavailable_metrics"]))
+            parts.append(f"<p>Нет подтверждённых измерений — {missing}</p>")
+    if vacancy_ids:
+        parts.append("<h3>Вакансии из выборки</h3>")
+        for key in vacancy_ids:
+            parts.append(source_html(sources[key]))
+    return "\n".join([*parts, notices_html, "</html>"])
 
 
 def child_blocks(block):
@@ -154,7 +210,9 @@ def export_course(meta, version, sources):
         def write_json(path, data):
             archive.writestr(path, json.dumps(data, ensure_ascii=False, indent=2))
         write_json("course.json", content)
-        write_json("sources.json", {k: sources[k] for k in sorted(set(used_sources(content)))})
+        source_ids = set(used_sources(content)) | set(content.get("vacancy_source_ids", ()))
+        write_json("sources.json", {k: sources[k] for k in sorted(source_ids)})
+        archive.writestr("course-report.html", course_report_html(content, sources, notices_html))
         for index, subject in enumerate(program["subjects"], 1):
             tasks = [a for t in subject["topics"] for a in t["assignments"]]
             refs = [ref for b in [subject, *subject["topics"], *tasks] for ref in b["learning_references"]]

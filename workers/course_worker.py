@@ -4,17 +4,20 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from auth.settings import Settings
+from literature_parser import enrich_course_program, yandex_llm_expander
 from orchestration.checkpointer import open_checkpointer
 from orchestration.clients import YandexEvidenceClient, YandexModelClient, source_record
 from orchestration.graph import build_course_graph
 from orchestration.rabota_business import BusinessEvidenceClient, RabotaBusiness
 from orchestration.resume import resume_graph
+from orchestration.vacancy_search import PublicVacancySearch
 from run_rpd import yandex_settings
 from storage.database import DatabaseSetupError, ensure_schema, make_engine, write_transaction
 from storage.models import Course, CourseVersion, WorkflowCommand
@@ -100,10 +103,18 @@ async def run(once):
     try:
         async with open_checkpointer(settings.checkpoint_url) as saver:
             evidence = YandexEvidenceClient(config)
-            if rabota := RabotaBusiness.from_environment():
-                evidence = BusinessEvidenceClient(evidence, rabota, source_record)
+            rabota = RabotaBusiness.from_environment()
+            public_search = (PublicVacancySearch(employer_careers=settings.employer_careers_enabled)
+                             if settings.public_vacancies_enabled else None)
+            if rabota or public_search:
+                evidence = BusinessEvidenceClient(evidence, rabota, source_record, public_search=public_search)
+            university_enricher = None
+            if settings.literature_parser_enabled:
+                expander = yandex_llm_expander(config) if settings.literature_use_llm else None
+                university_enricher = partial(enrich_course_program, llm_expander=expander)
             graph = build_course_graph(settings, YandexModelClient(config), evidence,
-                                       SqlWorkflowStore(factory), saver)
+                                       SqlWorkflowStore(factory), saver,
+                                       university_literature_enricher=university_enricher)
             while True:
                 worked = await process_next(engine, factory, graph)
                 if once:

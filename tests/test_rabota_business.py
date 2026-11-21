@@ -151,7 +151,8 @@ class CourseBusinessTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(state["gap_report"]["science_coverage"], 0.0)
 
         settings = SimpleNamespace(app_database_url="unused", checkpoint_url="unused",
-                                   business_coverage_threshold=0.6, science_coverage_threshold=0.6)
+                                   business_coverage_threshold=0.6, science_coverage_threshold=0.6,
+                                   literature_parser_enabled=False, public_vacancies_enabled=False)
         with patch.dict("os.environ", {"RABOTA_IT_DATABASE": str(self.path)}), \
              patch.object(course_worker, "Settings", return_value=settings), \
              patch.object(course_worker, "yandex_settings", return_value={}), \

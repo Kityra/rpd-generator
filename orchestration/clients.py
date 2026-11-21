@@ -81,6 +81,10 @@ def grounded_schema(output, context):
             props["task_ids"]["items"]["enum"] = context["task_ids"]
         if "activity_task_ids" in props and context.get("activity"):
             props["activity_task_ids"]["items"]["enum"] = [task.id for task in context["activity"].tasks]
+        if "excerpt_ids" in props and context.get("subject_excerpts"):
+            choices = context["subject_excerpts"]
+            props["subject_id"]["enum"] = list(choices)
+            props["excerpt_ids"]["items"]["enum"] = sorted(set().union(*choices.values()))
     return schema
 
 
@@ -159,6 +163,7 @@ class YandexEvidenceClient:
             "business": ("Priklad", "HH"), "books": ("Books",),
             "university": ("RPD", "Books"), "interview": ("Interview",),
             "factcheck": ("Priklad", "HH", "Books"), "science": (),
+            "subject_rationale": ("Books", "RPD"),
         }
         if role not in indexes:
             raise ValueError(f"Неизвестная роль поиска {role}.")
@@ -171,16 +176,19 @@ class YandexEvidenceClient:
         with open_yandex(self.settings) as client:
             for index in indexes[role]:
                 store = self.settings.get(f"YANDEX_VECTOR_STORE_ID_{index.upper()}")
+                required = index == "RPD" and role == "university"
                 if not store:
-                    if index == "RPD":
+                    if required:
                         raise ValueError("Обязательный индекс РПД не настроен.")
                     note(f"Индекс {index} не настроен.")
                     continue
                 try:
-                    fragments, taken_at = search_fragments(client, self.settings, index, store, query, 4,
-                                                          scope=("portal", owner_scope, role))
+                    fragments, taken_at = search_fragments(
+                        client, self.settings, index, store, query, 2 if role == "subject_rationale" else 4,
+                        scope=("portal", owner_scope, role), budget=12 if role == "subject_rationale" else 30,
+                    )
                 except (APIStatusError, APIResponseValidationError, ExternalUnavailable, InvalidIndexResponse) as error:
-                    if index == "RPD":
+                    if required:
                         reason = str(error) if isinstance(error, ExternalUnavailable) else type(error).__name__
                         logger.warning("Поиск в обязательном индексе РПД остановлен: %s", reason)
                         raise

@@ -19,6 +19,7 @@ from rpd_specialists import SourceFragment
 
 if TYPE_CHECKING:
     from orchestration.clients import EvidenceClient
+    from orchestration.vacancy_search import PublicVacancySearch
 
 
 LOG = logging.getLogger(__name__)
@@ -175,15 +176,24 @@ class RabotaBusiness:
 class BusinessEvidenceClient:
     """Keep the original evidence client and augment its Business results."""
 
-    def __init__(self, base: "EvidenceClient", rabota: RabotaBusiness,
-                 make_record: Callable[[str, str, str, str], SourceRecord]) -> None:
+    def __init__(self, base: "EvidenceClient", rabota: RabotaBusiness | None,
+                 make_record: Callable[[str, str, str, str], SourceRecord], *,
+                 public_search: "PublicVacancySearch | None" = None) -> None:
         self.base = base
         self.rabota = rabota
         self.make_record = make_record
+        self.public_search = public_search
 
     async def search(self, role: str, query: str, *, owner_scope: str = "") -> list[SourceRecord]:
-        primary = await self.base.search(role, query, owner_scope=owner_scope)
+        primary = self.base.search(role, query, owner_scope=owner_scope)
         if role != "business":
-            return primary
-        return EvidenceResults([*primary, *await self.rabota.records(query, self.make_record)],
-                               getattr(primary, "notices", ()))
+            return await primary
+        requests = [primary]
+        if self.rabota:
+            requests.append(self.rabota.records(query, self.make_record))
+        if self.public_search:
+            topic = _bounded_text(_course_topic(query), 240)
+            requests.append(self.public_search.records(topic))
+        results = await asyncio.gather(*requests)
+        return EvidenceResults((item for result in results for item in result),
+                               (note for result in results for note in getattr(result, "notices", ())))

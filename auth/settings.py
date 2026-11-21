@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     business_coverage_threshold: float = Field(default=0.6, ge=0, le=1)
     science_coverage_threshold: float = Field(default=0.6, ge=0, le=1)
     interview_skill_directory: str = "skills/interview_methods"
+    literature_parser_enabled: bool = True
+    literature_use_llm: bool = False
+    public_vacancies_enabled: bool = True
+    employer_careers_enabled: bool = True
 
     @model_validator(mode="after")
     def validate_auth(self) -> "Settings":

@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Any, Protocol, TypedDict
 from uuid import NAMESPACE_URL, uuid5
 
@@ -18,11 +20,14 @@ from orchestration.draft import make_outline
 from orchestration.interview_methods import load_interview_methods
 from orchestration.rabota_business import SOURCE, SOURCE_GUIDANCE
 from orchestration.resilience import ExternalUnavailable
+from orchestration.subject_rationale import explain_subjects
+from orchestration.vacancy_search import VACANCY_SOURCE_TYPES
 from run_rpd import YandexModeratedResponse
 
 
 AUTO_DRAFT_SUBJECT_LIMIT = 12
 DRAFT_SUBJECT_BATCH_SIZE = 4
+BUSINESS_SOURCE_TYPES = frozenset({"Priklad", "HH", SOURCE}) | VACANCY_SOURCE_TYPES
 
 
 def merge_records(previous: list[dict], additions: list[dict]) -> list[dict]:
@@ -54,6 +59,7 @@ class GraphState(TypedDict, total=False):
     interview_source_notices: list[str]
     factcheck_source_notices: list[str]
     draft_source_notices: list[str]
+    literature_source_notices: list[str]
     applied_activity: dict
     gap_report: dict
     interview_session_id: str
@@ -85,7 +91,8 @@ def run_source_notices(state: GraphState) -> list[str]:
     notices = [note for role in ("business", "science", "books", "university")
                for note in state.get(f"{role}_report", {}).get("source_notices", [])]
     return list(dict.fromkeys([*notices, *state.get("interview_source_notices", []),
-                               *state.get("factcheck_source_notices", []), *state.get("draft_source_notices", [])]))
+                               *state.get("factcheck_source_notices", []), *state.get("draft_source_notices", []),
+                               *state.get("literature_source_notices", [])]))
 
 
 class WorkflowStore(Protocol):
@@ -99,7 +106,8 @@ class WorkflowStore(Protocol):
         """Идемпотентно создать интервью."""
 
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
-                         scheduled: bool, activity: dict, *, evidence_gaps: dict, source_notices: list[str]) -> None:
+                         scheduled: bool, activity: dict, *, evidence_gaps: dict, source_notices: list[str],
+                         vacancy_source_ids: list[str]) -> None:
         """Сохранить версию и уведомление."""
 
     async def finish_review(self, course_id: str, version_id: str, action: str, actor: str, workloads=None) -> None:
@@ -168,7 +176,8 @@ def payload(state: GraphState) -> dict:
 
 
 def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceClient,
-                       store: WorkflowStore, checkpointer: Any):
+                       store: WorkflowStore, checkpointer: Any, *,
+                       university_literature_enricher: Callable[[dict, dict[str, SourceRecord]], Awaitable[tuple]] | None = None):
     async def start(state: GraphState) -> dict:
         if not state.get("run_id"):
             raise ValueError("Для запуска требуется устойчивый run_id.")
@@ -176,6 +185,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         return {"status": "agents_running", "interview_round": 0, "review_iteration": 0,
                 "interview_answers": [], "review_feedback": [], "revision_baseline": None,
                 "interview_source_notices": [], "factcheck_source_notices": [], "draft_source_notices": [],
+                "literature_source_notices": [],
                 "applied_activity": {}, "gap_report": {}, "verification": {}, "auto_subjects": {},
                 "course_program": {}, "consumed_review_id": "", "closed_interview_id": "", "version_id": ""}
 
@@ -198,7 +208,11 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             except ExternalUnavailable:
                 report = AgentReport(findings=[])
                 notices = [*notices, f"{role}: модель не сформировала сводку. Сохранены исходные материалы."]
-            return {f"{role}_report": {**report.model_dump(mode="json"), "source_notices": notices},
+            report_data = {**report.model_dump(mode="json"), "source_notices": notices}
+            if role == "business":
+                report_data["vacancy_source_ids"] = [item.source_id for item in sources
+                                                     if item.source_type in VACANCY_SOURCE_TYPES]
+            return {f"{role}_report": report_data,
                     "sources": [item.model_dump(mode="json") for item in sources]}
         return run
 
@@ -213,7 +227,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def formalize(state: GraphState) -> dict:
         sources = {k: s for k, s in registry(state).items()
-                   if s.source_type in {"Priklad", "HH", "Crossref", "arXiv", "expert", "documentation", SOURCE}}
+                   if s.source_type in BUSINESS_SOURCE_TYPES | {"Crossref", "arXiv", "expert", "documentation"}}
         if not sources:
             return {"applied_activity": {}}
         activity_input = {"course": state["course_meta"], "business": state["business_report"],
@@ -242,10 +256,10 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         activity = AppliedActivityModel.model_validate(state["applied_activity"], context=context(state))
         sources = registry(state)
         count = len(activity.tasks)
-        def coverage(types: set[str]) -> float:
+        def coverage(types: set[str] | frozenset[str]) -> float:
             return sum(any(sources[key].source_type in types for key in task.source_ids)
                        for task in activity.tasks) / max(count, 1)
-        business = coverage({"HH", "Priklad", SOURCE})
+        business = coverage(BUSINESS_SOURCE_TYPES)
         science = coverage({"Crossref", "arXiv"})
         gaps, questions = [], []
         if count < 5 or len(activity.processes) < 3:
@@ -435,6 +449,34 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         checked = CourseProgramModel.model_validate(updated, context=context(state))
         return {"course_program": checked.model_dump(mode="json")}
 
+    async def subject_rationale(state: GraphState) -> dict:
+        program, records = await explain_subjects(state["course_program"], registry(state), evidence, llm,
+                                                  state["owner_user_id"])
+        additions = [record.model_dump(mode="json") for record in records]
+        combined = merge_records(state.get("sources", []), additions)
+        checked = CourseProgramModel.model_validate(program, context=context({**state, "sources": combined}))
+        return {"course_program": checked.model_dump(mode="json"), "sources": additions}
+
+    async def university_literature(state: GraphState) -> dict:
+        if not settings.literature_parser_enabled or university_literature_enricher is None:
+            return {}
+        await store.set_status(state["request_id"], "collecting_literature", state["owner_user_id"])
+        try:
+            current = registry(state)
+            program, records, results = await university_literature_enricher(state["course_program"], current)
+            additions = [record.model_dump(mode="json") for record in records]
+            combined = merge_records(state.get("sources", []), additions)
+            checked = CourseProgramModel.model_validate(program, context=context({**state, "sources": combined}))
+        except Exception as error:
+            logging.getLogger(__name__).warning("University: подбор литературы недоступен (%s)", type(error).__name__)
+            return {"literature_source_notices": ["Подбор учебной литературы временно недоступен."]}
+        notices = []
+        missing = sum(not item.sources for item in results)
+        if missing:
+            notices.append(f"Для {missing} из {len(results)} тем поиск не добавил проверенный учебник или статью.")
+        return {"course_program": checked.model_dump(mode="json"), "sources": additions,
+                "literature_source_notices": notices}
+
     async def persist_review(state: GraphState) -> dict:
         identifier = str(uuid5(NAMESPACE_URL, f"{state['request_id']}/{state['run_id']}/version/{state.get('review_iteration', 0)}"))
         await store.save_sources(state["request_id"], list(registry(state).values()))
@@ -443,7 +485,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         gaps = state["gap_report"]
         evidence_gaps = {key: gaps[key] for key in ("gap_types", "business_coverage", "science_coverage") if key in gaps}
         await store.save_draft(state["request_id"], identifier, program, scheduled, state["applied_activity"],
-                               evidence_gaps=evidence_gaps, source_notices=run_source_notices(state))
+                               evidence_gaps=evidence_gaps, source_notices=run_source_notices(state),
+                               vacancy_source_ids=state["business_report"].get("vacancy_source_ids", []))
         return {"version_id": identifier, "status": "pending_update_review" if scheduled else "waiting_for_review"}
 
     async def review(state: GraphState) -> dict:
@@ -475,7 +518,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     nodes = {"relevance": relevance, "formalize": formalize, "university_audit": university_audit,
              "gap_analysis": gap_analysis, "prepare_interview": prepare_interview, "interview": interview,
              "factcheck": factcheck, "design": design, "business_audit": business_audit,
-             "persist_review": persist_review, "review": review}
+             "subject_rationale": subject_rationale, "persist_review": persist_review, "review": review}
     def guarded(node):
         async def execute(state: GraphState) -> dict:
             try:
@@ -489,6 +532,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     for name, node in nodes.items():
         graph.add_node(name, guarded(node))
+    # Сохраняем ключ узла для возобновления сохранённых запусков.
+    graph.add_node("literature", guarded(university_literature), metadata={"agent": "University"})
     graph.add_edge(START, "start")
     graph.add_edge(list(roles), "relevance")
     graph.add_conditional_edges("relevance", lambda state: "formalize" if state["needs_update"] else END)
@@ -501,7 +546,9 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                                 if state.get("closed_interview_id") == state["interrupt_id"] else "factcheck")
     graph.add_edge("factcheck", "formalize")
     graph.add_edge("design", "business_audit")
-    graph.add_edge("business_audit", "persist_review")
+    graph.add_edge("business_audit", "subject_rationale")
+    graph.add_edge("subject_rationale", "literature")
+    graph.add_edge("literature", "persist_review")
     graph.add_edge("persist_review", "review")
     graph.add_conditional_edges("review", lambda state: END if state["status"] == "approved" else "design")
     return graph.compile(checkpointer=checkpointer)

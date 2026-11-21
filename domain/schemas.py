@@ -9,7 +9,9 @@ class Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-SourceType = Literal["HH", "Priklad", "Crossref", "arXiv", "Books", "RPD", "Interview", "expert", "teacher", "documentation", "RabotaRu"]
+SourceType = Literal["HH", "Priklad", "Crossref", "arXiv", "Books", "RPD", "Interview", "expert", "teacher",
+                     "documentation", "RabotaRu", "Literature", "Rostrud", "EmployerCareer"]
+SUBJECT_RATIONALE_SOURCE_TYPES = frozenset({"Books", "RPD", "Priklad", "HH"})
 INDEPENDENT_EXPERT_SOURCE_TYPES = frozenset({"HH", "Priklad", "Books", "Crossref", "arXiv", "documentation", "RabotaRu"})
 ChangeStatus = Literal["unchanged", "added", "modified", "fundamental_protected"]
 GapType = Literal["missing_tasks", "missing_stack", "missing_quality_criteria", "missing_artifacts", "conflicting_evidence"]
@@ -68,16 +70,16 @@ class LearningReference(Grounded):
         source = info.context["sources"].get(self.source_id)
         if source is None or self.source_ids != [self.source_id]:
             raise ValueError("Некорректная ссылка на учебный материал.")
-        if source.source_type not in {"Books", "Crossref", "arXiv", "documentation"}:
+        if source.source_type not in {"Books", "Crossref", "arXiv", "documentation", "Literature"}:
             raise ValueError("Нужна книга, статья или документация.")
         if " ".join(self.locator.split()).casefold() not in " ".join(source.content.split()).casefold():
             raise ValueError("Указанный фрагмент отсутствует в источнике.")
-        if source.source_type == "Books":
+        if source.source_type in {"Books", "Literature"}:
             bibliography = self.bibliographic_excerpt
             if not bibliography or len(bibliography.strip()) < 10:
-                raise ValueError("Для книги требуется точная библиографическая выдержка.")
+                raise ValueError("Требуется точное библиографическое описание.")
             if " ".join(bibliography.split()).casefold() not in " ".join(source.content.split()).casefold():
-                raise ValueError("Библиографическая выдержка отсутствует в источнике Books.")
+                raise ValueError("Библиографическое описание отсутствует в источнике.")
         return self
 
 
@@ -201,11 +203,40 @@ class Topic(ChangedBlock):
         return self
 
 
+class RationaleEvidence(Model):
+    source_id: str
+    excerpt: str = Field(min_length=15, max_length=400)
+
+
+class SubjectRationale(Grounded):
+    explanation: str = Field(min_length=20, max_length=900)
+    evidence: list[RationaleEvidence] = Field(min_length=1, max_length=3)
+
+    @model_validator(mode="after")
+    def check_database_evidence(self, info: ValidationInfo) -> "SubjectRationale":
+        keys = {item.source_id for item in self.evidence}
+        excerpts = {(item.source_id, item.excerpt) for item in self.evidence}
+        if keys != set(self.source_ids) or len(keys) != len(self.source_ids) or len(excerpts) != len(self.evidence):
+            raise ValueError("Привяжите цитаты к каждому источнику и не повторяйте их.")
+        registry = (info.context or {}).get("sources", {})
+        if not self.explanation.strip():
+            raise ValueError("Объясните роль дисциплины в курсе.")
+        for item in self.evidence:
+            source = registry.get(item.source_id)
+            if source is None or source.source_type not in SUBJECT_RATIONALE_SOURCE_TYPES:
+                raise ValueError("Для обоснования нужны записи из индексов Books, RPD, Priklad или HH.")
+            excerpt = " ".join(item.excerpt.split())
+            if len(excerpt) < 15 or excerpt not in " ".join(source.content.split()):
+                raise ValueError("Цитата отсутствует в источнике или слишком коротка.")
+        return self
+
+
 class CourseSubject(ChangedBlock):
     origin: Literal["manual", "auto"]
     status: Literal["locked", "suggested", "accepted", "rejected"]
     conflict_with: str | None
     topics: list[Topic] = Field(min_length=1)
+    inclusion_rationale: SubjectRationale | None = None
 
 
 class MarketMetric(Grounded):

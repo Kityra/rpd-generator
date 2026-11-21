@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import timedelta
 from io import BytesIO
+from functools import partial
 from pathlib import Path
 from unittest.mock import AsyncMock
 from zipfile import ZipFile
@@ -15,15 +16,17 @@ from auth.password_verifier import ExistingPasswordVerifier
 from auth.settings import Settings
 from auth.user_repository import CurrentUser
 from auth.yandex_users import accounts_from_text
-from domain.export import block_html, export_course, source_html
+from domain.export import block_html, export_course, rationale_report_html, source_html
 from domain.schemas import EvidenceResults
+from literature_parser import LiteratureSource, TopicLiterature, enrich_course_program
 from orchestration.checkpointer import open_checkpointer
+from orchestration.evidence_cache import source_record
 from orchestration.graph import build_course_graph
 from storage.database import make_engine
 from storage.models import Base, Course, CourseVersion, ExpertInvitation, Interview, Notification, SourceRow, WorkflowCommand, now
 from storage.portal import acknowledge, assigned_interviews, create_course, decide, finish_without_answer, schedule_due
 from storage.workflow import SqlWorkflowStore
-from test_course_architecture import program, records
+from test_course_architecture import program, rationale_batch, records
 from workers.course_worker import process_next
 
 
@@ -83,6 +86,10 @@ class Model:
                                  "clarification_question": None, "source_ids": ["HH"]}]}
         elif name == "CourseProgramModel":
             value = program()
+        elif name == "SubjectRationaleBatch":
+            assert all(source["index"] in {"Books", "RPD", "Priklad", "HH"}
+                       for subject in payload["disciplines"] for source in subject["fragments"])
+            value = rationale_batch(payload)
         elif name == "RelevanceDecision":
             value = {"requires_update": self.relevance, "explanation": "Изменение практики", "source_ids": ["HH"]}
         else:
@@ -103,6 +110,7 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         self.store = SqlWorkflowStore(self.factory)
         self.settings = Settings(_env_file=None, session_signing_key="s" * 40)
         self.model = Model(gap=False)
+        self.university_literature_enricher = None
         self.evidence = AsyncMock()
         self.evidence.search.return_value = list(records().values())
         self.teacher = user("teacher")
@@ -115,14 +123,18 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
     async def process(self):
         # Новый saver и новый граф имитируют смену процесса между всеми действиями.
         async with open_checkpointer(self.checkpoint) as saver:
-            graph = build_course_graph(self.settings, self.model, self.evidence, self.store, saver)
+            graph = build_course_graph(self.settings, self.model, self.evidence, self.store, saver,
+                                       university_literature_enricher=self.university_literature_enricher)
             self.assertTrue(await process_next(self.engine, self.factory, graph))
         async with self.factory() as db:
             return await db.get(Course, "course")
 
     async def test_direct_course_review_export_and_audit(self):
         notes = ["Books: использован сохранённый снимок."]
-        self.evidence.search.return_value = EvidenceResults(records().values(), notes)
+        vacancy = source_record("Rostrud", "https://trudvsem.ru/vacancy/card/1/2", "Аналитик данных",
+                                "Работодатель: Компания\nОпубликована: 2026-11-20\nОбязанности: Сбор данных")
+        self.evidence.search.side_effect = lambda role, *_args, **_kwargs: EvidenceResults(
+            [*records().values(), *([vacancy] if role == "business" else [])], notes)
         course = await self.process()
         self.assertEqual(course.status, "waiting_for_review")
         args = (self.factory, self.teacher, course.id, course.draft_version_id)
@@ -138,6 +150,10 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             version = await db.get(CourseVersion, active)
             sources = {k: v.model_dump(mode="json") for k, v in records().items()}
             sources["Books"]["url"] = "https://ai.api.cloud.yandex.net/v1/files/test-book"
+            self.assertEqual(version.content["vacancy_source_ids"], [vacancy.source_id])
+            stored = await db.scalar(select(SourceRow).where(SourceRow.course_id == course.id,
+                                                             SourceRow.source_id == vacancy.source_id))
+            sources[vacancy.source_id] = stored.record
             archive = export_course(course.course_meta, version, sources)
         with ZipFile(BytesIO(archive)) as package:
             rpd = json.loads(package.read("rpd/01/rpd.json"))
@@ -146,6 +162,14 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(rpd["assessmentMaterials"])
             self.assertEqual(rpd["sourceNotes"], notes)
             self.assertEqual(json.loads(package.read("course.json"))["source_notices"], notes)
+            self.assertEqual(json.loads(package.read("sources.json"))[vacancy.source_id]["url"], vacancy.url)
+            report = package.read("course-report.html").decode()
+            self.assertIn("Базы данных", report)
+            self.assertIn("Дисциплина даёт основу для составления запросов SQL", report)
+            self.assertIn("Реляционные модели данных и запросы SQL", report)
+            self.assertIn("Оценка курса индустрией", report)
+            self.assertIn(vacancy.url, report)
+            self.assertNotIn("ai.api.cloud.yandex.net", report)
             html = package.read("rpd/01/rpd.html").decode()
             self.assertIn("color:", html)
             self.assertIn("<details><summary", html)
@@ -164,6 +188,36 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         course = await self.process()
         self.assertEqual(course.active_version_id, active)
         self.assertIsNone(course.draft_version_id)
+
+    async def test_university_adds_literature_and_preserves_business_evidence(self):
+        study = LiteratureSource("Исследование обработки запросов SQL", ["А. Иванов"], "article", 2024,
+                                 "Труды конференции", "DOI", None, "https://doi.org/10.1234/sql", 0.95,
+                                 doi="10.1234/sql")
+        parser = AsyncMock()
+        parser.find_many.return_value = [TopicLiterature("Базы данных", "SQL", ["SQL"], [study])]
+        self.university_literature_enricher = partial(enrich_course_program, parser=parser)
+        course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        parser.find_many.assert_awaited_once_with([("SQL", "Базы данных")])
+        async with self.factory() as db:
+            version = await db.get(CourseVersion, course.draft_version_id)
+            records = (await db.scalars(select(SourceRow))).all()
+        corpus = {row.source_id: row.record for row in records}
+        topic = version.content["program"]["subjects"][0]["topics"][0]
+        citation = topic["learning_references"][0]
+        self.assertEqual(corpus[citation["source_id"]]["url"], study.source_url)
+        self.assertIn("А. Иванов", citation["bibliographic_excerpt"])
+        self.assertEqual(corpus["HH"]["source_type"], "HH")
+        self.assertEqual(version.content["program"]["business_audit"]["source_ids"], ["HH"])
+        await decide(self.factory, self.teacher, course.id, version.id, "approve")
+        await self.process()
+        async with self.factory() as db:
+            approved = await db.get(CourseVersion, version.id)
+        archive = export_course(course.course_meta, approved, corpus)
+        with ZipFile(BytesIO(archive)) as package:
+            subject = json.loads(package.read("rpd/01/rpd.json"))
+            self.assertIn(study.source_url, {item.get("url") for item in subject["readingList"]})
+            self.assertIn(study.source_url, package.read("rpd/01/rpd.html").decode())
 
     async def test_expert_then_teacher_revision(self):
         self.model.gap = True
@@ -265,6 +319,9 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sum(subject["origin"] == "auto" for subject in subjects), 12)
             self.assertEqual([s["title"] for s in subjects if s["origin"] == "manual"], ["Ручной предмет"])
             self.assertTrue(version.content["source_notices"])
+            self.assertTrue(all(subject["inclusion_rationale"] is None for subject in subjects))
+            self.assertEqual(rationale_report_html(version.content["program"], {}).count(
+                "В базе не подтверждено обоснование"), len(subjects))
 
 
 class DirectoryTests(unittest.TestCase):

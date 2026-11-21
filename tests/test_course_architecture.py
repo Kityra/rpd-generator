@@ -18,7 +18,7 @@ from auth.password_verifier import ExistingPasswordVerifier
 from auth.session import AuthService
 from auth.settings import Settings
 from auth.user_repository import SqlUserRepository
-from domain.schemas import CourseProgramModel, ExpertClaimVerification, InterviewTurn, SourceRecord
+from domain.schemas import CourseProgramModel, ExpertClaimVerification, InterviewTurn, SourceRecord, SubjectRationale
 from orchestration.checkpointer import open_checkpointer
 from orchestration.clients import YandexEvidenceClient
 from orchestration.graph import build_course_graph
@@ -51,7 +51,29 @@ def program() -> dict:
     return {"title": "Курс", "source_ids": ["Books"], "subjects": [subject], "business_audit": None}
 
 
+def rationale_batch(request: dict) -> dict:
+    items = []
+    for subject in request["disciplines"]:
+        choices = [item["excerpt_id"] for item in subject["fragments"] if item["index"] == "Books"]
+        supported = choices and subject["title"] == "Базы данных"
+        items.append({"subject_id": subject["subject_id"],
+                      "explanation": ("Дисциплина даёт основу для составления запросов SQL к реляционным моделям данных."
+                                      if supported else None),
+                      "excerpt_ids": choices[:1] if supported else []})
+    return {"items": items}
+
+
 class SchemaTests(unittest.TestCase):
+    def test_discipline_rationale_rejects_external_source_and_invented_quote(self):
+        ctx = {"sources": records()}
+        for source_id, excerpt in (("Crossref", "Реляционные модели данных и запросы SQL"),
+                                   ("Books", "Дословная цитата, которой нет в книге")):
+            with self.subTest(source=source_id), self.assertRaises(ValidationError):
+                SubjectRationale.model_validate({
+                    "explanation": "Изучаем реляционные модели данных для составления запросов.",
+                    "source_ids": [source_id], "evidence": [{"source_id": source_id, "excerpt": excerpt}],
+                }, context=ctx)
+
     def test_unconfirmed_claim_without_citation_requires_clarification(self):
         claim = {"claim": "Рабочий процесс", "explanation": "Нет подтверждения", "source_ids": [],
                  "verification_status": "needs_clarification", "clarification_question": "Как проверили результат?"}
@@ -226,6 +248,8 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                          "clarification_question": None, "source_ids": ["HH"]}]}
             elif output.__name__ == "CourseProgramModel":
                 value = program()
+            elif output.__name__ == "SubjectRationaleBatch":
+                value = rationale_batch(payload)
             else:
                 audit_calls += 1
                 value = {"source_ids": ["HH"], "market_fit_score": 0.7, "metrics": [], "unavailable_metrics": ["active_vacancies"],

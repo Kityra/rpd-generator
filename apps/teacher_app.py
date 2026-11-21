@@ -5,7 +5,7 @@ import streamlit as st
 from sqlalchemy import select
 
 from apps.common import composer, portal
-from domain.export import HOURS, block_html, export_course
+from domain.export import HOURS, block_html, export_course, rationale_report_html, source_html
 from storage.models import Course, CourseVersion, Interview, Notification, SourceRow
 from storage.portal import acknowledge, create_course, decide, finish_without_answer, retry_command
 from storage.workflow import SqlWorkflowStore
@@ -13,6 +13,7 @@ from storage.workflow import SqlWorkflowStore
 
 STATUS = {"queued": "В очереди", "queued_audit": "В очереди на аудит", "agents_running": "Идёт анализ источников",
           "gap_analysis": "Проверяем полноту данных", "designing": "Формируется программа",
+          "collecting_literature": "University подбирает литературу по темам",
           "waiting_for_expert": "Ждёт интервью эксперта", "answer_queued": "Ответ эксперта принят",
           "waiting_for_review": "Черновик на проверке", "review_queued": "Решение принято в обработку",
           "approved": "Актуален", "pending_update_review": "Требует проверки после автообновления",
@@ -130,18 +131,28 @@ async def course_detail(actor, settings, factory, users, course, notices):
             st.warning(f"Требуют проверки преподавателя — {gaps}.")
         for notice in version.content.get("source_notices", []):
             st.caption(notice)
+        audit = program.get("business_audit")
+        vacancy_ids = version.content.get("vacancy_source_ids", [])
+        with st.expander("Отчёт по курсу"):
+            st.html(rationale_report_html(program, registry))
+            if audit or vacancy_ids:
+                st.markdown("## Оценка курса индустрией")
+                if audit:
+                    st.metric("Покрытие рабочих задач курсом (оценка модели)", f"{audit['market_fit_score']:.0%}")
+                    st.write(audit["evidence_summary"])
+                    for metric in audit["metrics"]:
+                        st.write(metric["name"], metric["value"], metric["unit"], metric["region"])
+                    if audit["unavailable_metrics"]:
+                        st.caption("Нет подтверждённых измерений — " + ", ".join(audit["unavailable_metrics"]))
+                if vacancy_ids:
+                    st.write("Вакансии из выборки")
+                    for key in vacancy_ids:
+                        if record := registry.get(key):
+                            st.html(source_html(record))
+                            st.caption("\n".join(record["content"].splitlines()[:2]))
         for index, subject in enumerate(program["subjects"]):
             with st.expander(subject["title"], expanded=index == 0):
                 st.html(block_html(subject, registry))
-        audit = program.get("business_audit")
-        if audit:
-            with st.expander("Оценка курса индустрией"):
-                st.metric("Соответствие требованиям рынка", f"{audit['market_fit_score']:.0%}")
-                st.write(audit["evidence_summary"])
-                for metric in audit["metrics"]:
-                    st.write(metric["name"], metric["value"], metric["unit"], metric["region"])
-                if audit["unavailable_metrics"]:
-                    st.caption("Нет подтверждённых измерений — " + ", ".join(audit["unavailable_metrics"]))
     interview_results(interviews, registry)
     if draft and course.status in {"waiting_for_review", "pending_update_review"}:
         update = bool(active)
