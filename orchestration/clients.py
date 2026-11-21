@@ -13,7 +13,7 @@ from domain.schemas import (ActivityAspect, ActivityProcess, ActivityTask, Appli
                             EvidenceResults, LearningReference, Model, SourceRecord, SubjectPlan, TopicAssignments)
 from orchestration.call_log import CALL_STATS, GENERATION_NOTES
 from orchestration.evidence_cache import source_record
-from orchestration.profession_verifier import ProfessionEvidenceVerdicts
+from orchestration.llm_judge import JudgeVerdicts
 from orchestration.relevance_filter import DEFAULT_MIN_SCORE, dropped_notice, filter_fragments
 from orchestration.resilience import ExternalUnavailable, snapshot_notice
 from orchestration.yandex_calls import InvalidIndexResponse, model_response, search_fragments
@@ -320,7 +320,8 @@ class YandexModelClient:
         schema = grounded_schema(output, context)
         # Входной лимит модели минус запас на ответ не нужен: Yandex ограничивает именно вход.
         limit = int(int(_env(self.settings, "YANDEX_INPUT_TOKEN_LIMIT", "32768")) * 0.9)
-        schema_attempts = 1 if output is ProfessionEvidenceVerdicts else 2
+        is_judge = issubclass(output, JudgeVerdicts)
+        schema_attempts = 1 if is_judge else 2
         with open_yandex(self.settings) as client:
             for attempt in range(schema_attempts):
                 if stats is not None:
@@ -338,7 +339,7 @@ class YandexModelClient:
                     request_key=hashlib.sha256(f"{output.__name__}\0{body}".encode()).hexdigest()[:24],
                 )
                 try:
-                    response = model_response(client, self.settings, stream=stream, **arguments)
+                    response = model_response(client, self.settings, stream=stream, judge=is_judge, **arguments)
                 except APIStatusError as error:
                     if not stream or error.status_code not in {400, 404, 405, 422, 501}:
                         raise
@@ -445,5 +446,6 @@ class YandexEvidenceClient:
                     records.append(source_record("arXiv" if article.status == "arxiv_candidate" else "Crossref",
                                                  article.url, article.title, article.as_science_source(
                                                      include_abstract=True, include_snapshot_notice=False)["text"],
-                                                 retrieved_at=article.retrieved_at))
+                                                 retrieved_at=article.retrieved_at, publication_year=article.year,
+                                                 parent_document_id=f"doi:{article.doi.lower()}" if article.doi else None))
         return records

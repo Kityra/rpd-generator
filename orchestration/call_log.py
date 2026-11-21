@@ -8,6 +8,7 @@ from time import monotonic
 from typing import Any, Awaitable, Callable
 
 import httpx
+from openai import APIConnectionError, APITimeoutError
 from pydantic import ValidationError
 
 from orchestration.resilience import ExternalUnavailable
@@ -19,6 +20,7 @@ OUTCOME_LABELS = {
     "circuit_open": "запросы к модели временно приостановлены", "moderated": "ответ ограничен модерацией",
     "truncated": "ответ модели обрезан по длине", "unavailable": "сервис модели недоступен", "error": "ошибка вызова",
     "input_too_large": "запрос больше контекста модели",
+    "network_error": "сетевая ошибка",
 }
 
 
@@ -28,6 +30,7 @@ class CallScope:
     run_id: str | None = None
     stage: str = ""
     subject: str | None = None
+    subject_id: str | None = None
 
 
 @dataclass
@@ -85,11 +88,15 @@ def classify_outcome(error: BaseException | None) -> str:
         if "приостановлены" in str(error):
             return "circuit_open"
         cause = error.__cause__
-        if isinstance(cause, (TimeoutError, httpx.TimeoutException)):
+        if isinstance(cause, (TimeoutError, httpx.TimeoutException, APITimeoutError)):
             return "timeout"
+        if isinstance(cause, (httpx.NetworkError, APIConnectionError)):
+            return "network_error"
         return "unavailable"
-    if isinstance(error, (TimeoutError, httpx.TimeoutException)):
+    if isinstance(error, (TimeoutError, httpx.TimeoutException, APITimeoutError)):
         return "timeout"
+    if isinstance(error, (httpx.NetworkError, APIConnectionError)):
+        return "network_error"
     if isinstance(error, RuntimeError) and "max_output_tokens" in str(error):
         return "truncated"
     return "error"
@@ -137,14 +144,18 @@ class RecordingModelClient:
         if self.record is None:
             return
         scope = CALL_SCOPE.get()
+        outcome = classify_outcome(error)
         entry = {
             "course_id": scope.course_id, "run_id": scope.run_id, "stage": scope.stage or "unknown",
-            "subject": scope.subject, "output": getattr(output, "__name__", str(output)),
+            "subject": scope.subject, "subject_id": scope.subject_id,
+            "output": getattr(output, "__name__", str(output)),
             "model": stats.model or ("flash" if flash else "default"),
             "duration_ms": int(max(0.0, self.clock() - started) * 1000),
             "input_tokens": stats.input_tokens, "output_tokens": stats.output_tokens,
-            "attempts": stats.attempts or 1, "outcome": classify_outcome(error),
-            "error": sanitize_error(error), "parameters": stats.parameters or None,
+            "attempts": stats.attempts or 1, "outcome": outcome,
+            "error": (f"{type(error).__name__}: {OUTCOME_LABELS[outcome]}"
+                      if scope.stage == "llm_judge" and error else sanitize_error(error)),
+            "parameters": stats.parameters or None,
         }
         try:
             await self.record(entry)

@@ -92,8 +92,19 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
         judge = AsyncMock()
         with self.assertLogs("orchestration.profession_verifier", "WARNING") as logs:
             result = await verify_profession_profile(value, {"chunk": text}, {}, {}, judge)
-        self.assertEqual(len(logs.records), 4)
-        self.assertTrue(all(not item.evidence and item.verification_status == "needs_review" for item in result.claims))
+        self.assertEqual(len(logs.records), 3)
+        self.assertTrue(all(item.verification_status == "needs_review" for item in result.claims))
+        self.assertEqual([item.claim_id for item in result.claims if not item.evidence], ["fake", "wrong-quote", "forgery"])
+        judge.generate.assert_not_awaited()
+
+    async def test_judge_prefilter_zero_overlap_skips_llm(self):
+        sql = "Оптимизирует запросы PostgreSQL"
+        service = "Трудоёмкость работы с PostgreSQL (час) 302, контактная работа (час) 22"
+        value = profile(claim("unrelated", "Верстает интерфейс", excerpt=sql),
+                        claim("service", sql, "service", excerpt=service))
+        judge = AsyncMock()
+        result = await verify_profession_profile(value, {"chunk": sql, "service": service}, {}, {}, judge)
+        self.assertEqual([item.evidence[0].judge_verdict for item in result.claims], ["unrelated", "unrelated"])
         judge.generate.assert_not_awaited()
 
     async def test_expert_can_confirm_edit_and_reject(self):
@@ -113,22 +124,31 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([task["id"] for task in design["tasks"]], ["A", "B"])
         judge.generate.assert_not_awaited()
 
-    async def test_one_batch_with_all_verdicts_and_real_sql_log(self):
+    async def test_judge_single_batched_call(self):
         judge = AsyncMock()
 
         async def decide(output, prompt, request, context, **options):
             self.assertIs(output, ProfessionEvidenceVerdicts)
             self.assertEqual(options["temperature"], 0.0)
-            self.assertEqual(len(request["pairs"]), 4)
+            self.assertEqual(len(request["pairs"]), 5)
+            self.assertEqual(set(request), {"pairs"})
+            self.assertEqual(context, {})
+            self.assertTrue(all(set(pair) == {"pair_id", "claim", "source_type", "evidence"}
+                                for pair in request["pairs"]))
             return output(items=[{"pair_id": row["pair_id"], "verdict": verdict}
-                                 for row, verdict in zip(request["pairs"], ["supports", "weak", "unrelated", "supports"])])
+                                 for row, verdict in zip(request["pairs"],
+                                                         ["supports", "weak", "unrelated", "weak", "supports"], strict=True)])
 
         judge.generate.side_effect = decide
         quote = "Оптимизирует SQL-запросы в PostgreSQL."
-        value = profile(claim("a", quote), claim("b", "Проверяет запросы SQL", excerpt=quote),
-                        claim("c", "Удаляет PostgreSQL", excerpt=quote),
-                        claim("market", "SQL указан в вакансиях", "sql", kind="market_cluster", excerpt="42/60 (70%)"),
-                        claim("invented", "SQL указан в вакансиях", "sql", kind="market_cluster", excerpt="41/60 (99%)"))
+        title = "SQL указан в вакансиях"
+        a = claim("a", quote)
+        b = claim("b", "Проверяет запросы SQL", excerpt=quote)
+        c = claim("market", title, "sql", kind="market_cluster", excerpt="42/60 (70%)")
+        for item in (a, b):
+            item.evidence.append(EvidenceRef(source_type="rag_chunk", source_id="second", quote_or_metric=quote))
+        c.evidence.append(EvidenceRef(source_type="market_cluster", source_id="sql", quote_or_metric="41/60 (99%)"))
+        value = profile(a, b, c)
         with tempfile.TemporaryDirectory() as tmp:
             engine = make_engine("sqlite+aiosqlite:///" + (Path(tmp) / "log.sqlite").as_posix())
             try:
@@ -139,7 +159,7 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
                 store = SqlWorkflowStore(factory)
                 scope = CALL_SCOPE.set(CallScope(course_id="course", run_id="run", stage="profession_verification"))
                 try:
-                    result = await verify_profession_profile(value, {"chunk": quote},
+                    result = await verify_profession_profile(value, {"chunk": quote, "second": quote},
                         {"sql": {"skill": "SQL", "metric": "42/60 (70%)"}}, {},
                         RecordingModelClient(judge, store.record_model_call))
                 finally:
@@ -147,22 +167,28 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
                 async with factory() as db:
                     logged = (await db.scalars(select(ModelCall))).one()
                     self.assertEqual(logged.output, "ProfessionEvidenceVerdicts")
+                    self.assertEqual((logged.course_id, logged.stage, logged.subject_id), ("course", "llm_judge", None))
                     self.assertEqual(logged.outcome, "ok")
             finally:
                 await engine.dispose()
         self.assertEqual([item.verification_status for item in result.claims],
-                         ["verified", "needs_review", "needs_review", "verified", "needs_review"])
-        self.assertEqual(result.claims[-1].evidence, [])
+                         ["verified", "needs_review", "verified"])
+        self.assertEqual(len(result.claims[-1].evidence), 1)
         judge.generate.assert_awaited_once()
 
-    async def test_invalid_judge_reply_fails_closed(self):
+    async def test_judge_missing_pair_id_handled_safely(self):
         judge = AsyncMock()
-        judge.generate.return_value = ProfessionEvidenceVerdicts(items=[{"pair_id": "fake", "verdict": "supports"}])
+        judge.generate.return_value = ProfessionEvidenceVerdicts(items=[
+            {"pair_id": "2", "verdict": "supports"}, {"pair_id": "fake", "verdict": "supports"}])
         text = "Проектирует схемы PostgreSQL"
-        with self.assertLogs("orchestration.profession_verifier", "WARNING"):
-            result = await verify_profession_profile(profile(claim("work_task:x", text)), {"chunk": text}, {}, {}, judge)
+        with self.assertLogs("orchestration.llm_judge", "WARNING"):
+            result = await verify_profession_profile(profile(claim("work_task:x", text), claim("work_task:y", text)),
+                                                      {"chunk": text}, {}, {}, judge)
         self.assertEqual(result.claims[0].verification_status, "needs_review")
-        self.assertIn("недоступна", result.claims[0].verification_reason)
+        self.assertEqual(result.claims[0].evidence[0].judge_verdict, "weak")
+        self.assertEqual(result.claims[1].verification_status, "verified")
+        self.assertFalse(result.judge_unavailable)
+        judge.generate.assert_awaited_once()
 
     async def test_zip_and_portal_share_badges_and_remove_rejected_text(self):
         example = "Оптимизирует SQL-запросы"

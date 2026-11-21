@@ -83,7 +83,7 @@ class Resilience:
 
     def call(self, service: Service, request: Callable[[httpx.Timeout], T], *, budget: float, read: float,
              request_key: str | None = None, count_timeouts: bool = True, cooldown: float | None = None,
-             wait_if_open: bool = False) -> T:
+             wait_if_open: bool = False, attempts: int = 3) -> T:
         """Вызов с повторами и выключателем.
 
         request_key — сбои одного и того же запроса считаются один раз: выключатель открывается,
@@ -111,7 +111,8 @@ class Resilience:
 
         server_delay = 0.0
         try:
-            for attempt in range(1 if probe else 3):
+            limit = 1 if probe else attempts
+            for attempt in range(limit):
                 remaining = deadline - self.clock()
                 if remaining <= 0:
                     raise TimeoutError("Исчерпан бюджет внешнего запроса.")
@@ -126,7 +127,7 @@ class Resilience:
                         raise
                     server_delay = retry_after(error)
                     delay = max(server_delay, self.jitter(0.25, 0.5) * 2 ** attempt)
-                    if isinstance(error, TimeoutError) or probe or attempt == 2 or delay >= deadline - self.clock():
+                    if isinstance(error, TimeoutError) or attempt + 1 == limit or delay >= deadline - self.clock():
                         raise
                     self.wait(delay)
         except Exception as error:

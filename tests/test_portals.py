@@ -6,7 +6,7 @@ from datetime import timedelta
 from io import BytesIO
 from functools import partial
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from zipfile import ZipFile
 
 from sqlalchemy import select
@@ -25,7 +25,7 @@ from orchestration.graph import build_course_graph
 from orchestration.subject_rationale import explain_subjects
 from run_rpd import YandexModeratedResponse
 from storage.database import make_engine
-from storage.models import Base, Course, CourseVersion, Interview, Notification, SourceRow, WorkflowCommand, now
+from storage.models import Base, Course, CourseVersion, Interview, ModelCall, Notification, SourceRow, WorkflowCommand, now
 from storage.portal import (acknowledge, assigned_interviews, create_course, decide, finish_without_answer, rebuild_course,
                             schedule_due)
 from storage.workflow import SqlWorkflowStore
@@ -113,8 +113,7 @@ class Model:
         elif name == "RelevanceDecision":
             value = {"requires_update": self.relevance, "explanation": "Изменение практики", "source_ids": ["HH"]}
         elif name == "RationaleVerdicts":
-            value = {"items": [{"subject_id": row["subject_id"], "verdict": "supports", "reason": "Фрагмент о предмете"}
-                               for row in payload["disciplines"]]}
+            value = {"items": [{"pair_id": row["pair_id"], "verdict": "supports"} for row in payload["pairs"]]}
         else:
             value = {"source_ids": ["HH"], "market_fit_score": .8, "metrics": [], "unavailable_metrics": [],
                      "evidence_summary": "SQL", "suggested_changes": []}
@@ -167,6 +166,50 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             draft = await db.get(CourseVersion, course.draft_version_id)
         self.assertEqual(draft.revision, 2)
         self.assertTrue(all(subject["generated_by"] == "model" for subject in draft.content["program"]["subjects"]))
+
+    async def test_judge_timeout_falls_back_to_needs_review_not_outline(self):
+        original = self.model.generate
+        names = ("Базы данных", "SQL-запросы")
+
+        async def generate(output, prompt, payload, context, **options):
+            if output.__name__ in {"ProfessionEvidenceVerdicts", "RationaleVerdicts"}:
+                raise TimeoutError("token=SECRET; private input")
+            if output.__name__ == "SubjectPlan":
+                return output.model_validate({"subjects": [
+                    {"name": name, "is_fundamental": False, "conflict_with": None, "source_ids": ["Books"]}
+                    for name in names]}, context=context)
+            if output.__name__ == "CourseProgramModel":
+                value = program()
+                subject = value["subjects"][0]
+                subject.update(title=payload["batch_subjects"][0], origin="auto", status="suggested",
+                               is_fundamental=False, locked=False)
+                subject["topics"][0]["activity_task_ids"] = []
+                return output.model_validate(value, context=context)
+            return await original(output, prompt, payload, context, **options)
+
+        self.model.generate = generate
+        with patch("orchestration.graph.make_outline", side_effect=AssertionError("Не строить каркас")) as outline:
+            course = await self.process()
+        outline.assert_not_called()
+        self.assertEqual(course.status, "waiting_for_review")
+        async with self.factory() as db:
+            draft = await db.get(CourseVersion, course.draft_version_id)
+            calls = (await db.scalars(select(ModelCall).where(ModelCall.stage == "llm_judge"))).all()
+        claims = draft.content["profession_profile"]["claims"]
+        self.assertTrue(claims and all(claim["verification_status"] == "needs_review" for claim in claims))
+        self.assertEqual([subject["title"] for subject in draft.content["program"]["subjects"]], list(names))
+        self.assertTrue(all(subject["generated_by"] == "model" for subject in draft.content["program"]["subjects"]))
+        profile_calls = [call for call in calls if call.output == "ProfessionEvidenceVerdicts"]
+        self.assertEqual(len(profile_calls), 1)
+        self.assertEqual(profile_calls[0].outcome, "timeout")
+        self.assertNotIn("SECRET", profile_calls[0].error)
+        rationale_calls = [call for call in calls if call.output == "RationaleVerdicts"]
+        subjects_with_rationale = [subject for subject in draft.content["program"]["subjects"]
+                                   if subject.get("inclusion_rationale")]
+        self.assertTrue(subjects_with_rationale)
+        self.assertEqual({call.subject_id for call in rationale_calls}, {subject["id"] for subject in subjects_with_rationale})
+        self.assertTrue(all(subject["rationale_check"]["verification_status"] == "needs_review"
+                            for subject in subjects_with_rationale))
 
     async def test_filtered_books_summary_and_market_audit_do_not_stop_the_course(self):
         filtered = source_record("Books", "https://example.org/filtered", "Подборка книг", "Текст для теста")
@@ -513,7 +556,7 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         async def generate(output, prompt, payload, context, **options):
             if output.__name__ == "ProfessionEvidenceVerdicts":
                 return output.model_validate({"items": [
-                    {"pair_id": pair["pair_id"], "verdict": "weak" if pair["statement"].endswith(("этапе 0", "этапе 1"))
+                    {"pair_id": pair["pair_id"], "verdict": "weak" if pair["claim"].endswith(("этапе 0", "этапе 1"))
                      else "supports"} for pair in payload["pairs"]]}, context=context)
             if output.__name__ == "CourseProgramModel":
                 tasks = {task.id: task.title for task in context["activity"].tasks}

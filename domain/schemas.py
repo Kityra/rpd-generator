@@ -28,6 +28,8 @@ class SourceRecord(Model):
     content: str = Field(min_length=1)
     # Оценка близости фрагмента к запросу из векторного поиска (None — источник не из индекса или старая запись).
     relevance_score: float | None = None
+    parent_document_id: str | None = None
+    publication_year: int | None = Field(default=None, ge=1, le=9999)
 
     @field_validator("url")
     @classmethod
@@ -418,6 +420,8 @@ class GapReport(Model):
     questions: list[str]
     business_coverage: float = Field(ge=0, le=1)
     science_coverage: float = Field(ge=0, le=1)
+    formula_breakdown: list[dict] = Field(default_factory=list)
+    coverage_parameters: dict | None = None
 
 
 class RelevanceDecision(Grounded):

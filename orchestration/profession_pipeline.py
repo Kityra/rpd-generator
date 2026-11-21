@@ -5,9 +5,10 @@ from urllib.parse import urlsplit
 from domain.schemas import SourceRecord
 from orchestration.evidence_cache import source_record
 from orchestration.interview_skills import MIN_MARKET_SAMPLE, MIN_RAG_CHUNKS
+from orchestration.llm_judge import terms
 from orchestration.market_analysis import course_market
 from orchestration.profession_profile import EvidenceRef, ExpertDecision, ProfessionProfile, pending_claim
-from orchestration.profession_verifier import normalized, terms
+from orchestration.profession_verifier import normalized
 
 
 ACTIVITY_SOURCE_TYPES = {"Priklad", "HH", "Crossref", "arXiv", "documentation", "Rostrud",
@@ -37,14 +38,19 @@ def market_evidence(meta: dict, sources: dict[str, SourceRecord], vacancy_ids: l
     records = {key: sources[key].model_dump(mode="json") for key in ids if key in sources}
     market = course_market(meta, {}, records, ids, None)
     size = market.sample_size or 0
-    provider = "выборка методиста" if (meta.get("market") or {}).get("dataset") else (
+    uploaded_dataset = (meta.get("market") or {}).get("dataset")
+    provider = "выборка методиста" if uploaded_dataset else (
         "HH" if records and all(record["source_type"] == "HH" for record in records.values()) else "выборка вакансий")
+    dates = [str((uploaded_dataset or {}).get("collected_at") or ""), market.period or ""]
+    years = re.findall(r"\b(?:19|20)\d{2}\b", dates[0] or dates[1])
+    year = max(map(int, years), default=None)
     measurements = {}
     for row in market.skills:
         if size and row.vacancies is not None and 0 < row.vacancies <= size:
             share = format((Decimal(row.vacancies) * 100 / size).quantize(Decimal("0.1")), "f").removesuffix(".0")
             measurements[f"skill:{row.skill}"] = {"skill": row.skill, "provider": provider,
-                "metric": f"{row.vacancies}/{size} ({share}%)"}
+                "metric": f"{row.vacancies}/{size} ({share}%)", "publication_year": year,
+                "current_sample": not uploaded_dataset and year is None}
     return size, measurements
 
 

@@ -22,6 +22,7 @@ from orchestration.call_log import (CALL_SCOPE, GENERATION_NOTES, CallScope, Rec
 from orchestration.clients import EvidenceClient, ModelClient, NoActivityEvidence, source_record
 from orchestration import prompts
 from orchestration.draft import make_outline
+from orchestration.gap_coverage import GapParameters, profile_coverage
 from orchestration.interview_methods import load_interview_methods
 from orchestration.interview_skills import FALLBACK, load_interview_skills, select_interview_method
 from orchestration.interviewer_turn import (CATEGORY_SLOT, SLOT_CATEGORY, SUBMISSION_PLACEHOLDERS, InterviewerRequest,
@@ -47,7 +48,7 @@ PROFESSION_MODEL = "profession_model"
 DRAFT_SUBJECT_BATCH_SIZE = 1
 # С этого числа дисциплин бизнес-аудит получает сжатую программу (названия и темы).
 AUDIT_COMPACT_SUBJECTS = 4
-RETRYABLE_OUTCOMES = frozenset({"timeout", "circuit_open", "unavailable"})
+RETRYABLE_OUTCOMES = frozenset({"timeout", "circuit_open", "network_error", "unavailable"})
 GAP_QUERY_LABELS = {"missing_tasks": "рабочие задачи и процессы", "missing_stack": "инструменты",
                     "missing_artifacts": "результаты работы", "missing_quality_criteria": "критерии качества",
                     "conflicting_evidence": "проверка утверждений по источникам"}
@@ -64,6 +65,7 @@ WORKLOAD_REQUEST = re.compile(
 
 
 VOLATILE_SOURCE_FIELDS = frozenset({"retrieved_at", "relevance_score"})
+SOURCE_METADATA_FIELDS = ("parent_document_id", "publication_year")
 
 
 def merge_records(previous: list[dict], additions: list[dict]) -> list[dict]:
@@ -71,10 +73,14 @@ def merge_records(previous: list[dict], additions: list[dict]) -> list[dict]:
     for item in additions:
         if item["source_id"] in merged:
             # Один фрагмент может прийти по разным запросам с разной оценкой близости.
-            old = {key: value for key, value in merged[item["source_id"]].items() if key not in VOLATILE_SOURCE_FIELDS}
-            new = {key: value for key, value in item.items() if key not in VOLATILE_SOURCE_FIELDS}
+            original = merged[item["source_id"]]
+            excluded = VOLATILE_SOURCE_FIELDS.union(SOURCE_METADATA_FIELDS)
+            old = {key: value for key, value in original.items() if key not in excluded}
+            new = {key: value for key, value in item.items() if key not in excluded}
             if old != new:
                 raise ValueError("Конфликт источников с одинаковым ID.")
+            merged[item["source_id"]] = {**original, **{key: item[key] for key in SOURCE_METADATA_FIELDS
+                                                         if original.get(key) is None and item.get(key) is not None}}
         else:
             merged[item["source_id"]] = item
     return list(merged.values())
@@ -320,7 +326,8 @@ def subject_request(state: GraphState, names: list[str], suggestions: list[dict]
     ranked = sorted(tasks, key=lambda task: -len(terms & concepts(" ".join([task["title"], *task.get("stack", [])]))))
     chosen = [task for task in ranked if terms & concepts(" ".join([task["title"], *task.get("stack", [])]))]
     chosen = (chosen or ranked[:3])[:SUBJECT_TASK_LIMIT]
-    hint = outline_hint(state["course_meta"]["title"], names[0], suggestions, ctx) if len(names) == 1 else None
+    judge_unavailable = state.get("profession_profile", {}).get("judge_unavailable", False)
+    hint = outline_hint(state["course_meta"]["title"], names[0], suggestions, ctx) if len(names) == 1 and not judge_unavailable else None
     cited = [key for item in plan for key in item.get("source_ids", [])]
     cited += [key for task in chosen for key in task.get("source_ids", [])]
     cited += hint["source_ids"] if hint else []
@@ -477,12 +484,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                 "acknowledged_profession_claims": acknowledged,
                 "sources": [record.model_dump(mode="json") for record in records]}
 
-    async def verify_profile(profile, rag, market, turns):
-        token = CALL_SCOPE.set(replace(CALL_SCOPE.get(), stage="profession_verification"))
-        try:
-            return await verify_profession_profile(profile, rag, market, turns, llm)
-        finally:
-            CALL_SCOPE.reset(token)
+    async def verify_profile(profile, rag, market, turns, *, reuse=False):
+        return await verify_profession_profile(profile, rag, market, turns, llm, reuse_recorded_verdicts=reuse)
 
     async def university_audit(state: GraphState) -> dict:
         if not state["applied_activity"] and not synthesis_sources(state):
@@ -500,24 +503,32 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def gap_analysis(state: GraphState) -> dict:
         await store.set_status(state["request_id"], "gap_analysis", state["owner_user_id"])
+        snapshot = state.get("profession_profile")
+        sources = registry(state)
+        expert_origins = {f"turn:{idx}": answer["expert_user_id"]
+                          for idx, answer in enumerate(state.get("interview_answers", []), 1)
+                          if answer.get("expert_user_id")}
+        coverage = (profile_coverage(ProfessionProfile.model_validate(snapshot), sources,
+                                     state.get("profession_market", {}), GapParameters.from_settings(settings),
+                                     BUSINESS_SOURCE_TYPES, expert_origins=expert_origins) if snapshot else None)
         if not state["applied_activity"]:
-            report = GapReport(gap_types=["missing_tasks"], business_coverage=0, science_coverage=0,
+            report = GapReport(gap_types=["missing_tasks"], **(coverage or {"business_coverage": 0, "science_coverage": 0}),
                                questions=["Какую рабочую задачу вы решали недавно, что сделали и как проверили результат?"])
             return {"gap_report": report.model_dump(mode="json"), "status": "gap_analysis"}
         activity = AppliedActivityModel.model_validate(state["applied_activity"], context=context(state))
-        sources = registry(state)
         if state.get("activity_origin") == PROFESSION_MODEL and not any(
             claim["verification_status"] == "needs_review" and claim["category"] == "work_task"
             for claim in state.get("profession_profile", {}).get("claims", [])
         ):
             # Задачи уже прошли экспертную валидацию модели профессии: интервью по курсу не нужно.
-            report = GapReport(gap_types=[], questions=[], business_coverage=1.0,
-                               science_coverage=weighted_coverage(activity.tasks, sources, {"Crossref", "arXiv"}))
+            report = GapReport(gap_types=[], questions=[], **(coverage or {
+                "business_coverage": 1.0, "science_coverage": weighted_coverage(activity.tasks, sources, {"Crossref", "arXiv"})
+            }))
             return {"gap_report": report.model_dump(mode="json"), "status": "gap_analysis"}
         count = len(activity.tasks)
-        # Покрытие с учётом качества: тип источника, свежесть и число независимых источников на задачу.
-        business = weighted_coverage(activity.tasks, sources, BUSINESS_SOURCE_TYPES)
-        science = weighted_coverage(activity.tasks, sources, {"Crossref", "arXiv"})
+        if coverage is None:
+            coverage = {"business_coverage": weighted_coverage(activity.tasks, sources, BUSINESS_SOURCE_TYPES),
+                        "science_coverage": weighted_coverage(activity.tasks, sources, {"Crossref", "arXiv"})}
         gaps, questions = [], []
         if count < 5 or len(activity.processes) < 3:
             gaps.append("missing_tasks")
@@ -531,7 +542,11 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             if any(len(getattr(task, field)) < minimum for task in activity.tasks):
                 gaps.append(kind)
                 questions.append(question)
-        if business < settings.business_coverage_threshold or science < settings.science_coverage_threshold:
+        evidence_missing = (any(row["category"] == "work_task" and row["status"] == "critical_gap"
+                                for row in coverage["formula_breakdown"]) if snapshot else
+                            coverage["business_coverage"] < settings.business_coverage_threshold
+                            or coverage["science_coverage"] < settings.science_coverage_threshold)
+        if evidence_missing:
             gaps.append("conflicting_evidence")
             questions.append("Какие источники подтверждают применение задач на практике и их научную основу?")
         if state.get("verification") and not state.get("profession_profile"):
@@ -544,7 +559,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             gaps.append("conflicting_evidence")
             questions.append("Какие предложенные рабочие сведения подтверждаются вашей практикой?")
         report = GapReport(gap_types=list(dict.fromkeys(gaps)), questions=questions,
-                           business_coverage=business, science_coverage=science)
+                           **coverage)
         return {"gap_report": report.model_dump(mode="json"), "status": "gap_analysis"}
 
     async def prepare_interview(state: GraphState) -> dict:
@@ -759,7 +774,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             profile, turn = apply_expert_turn(profile, decisions, turn_id, verbatim_confirmations=verbatim)
             profile = profile.model_copy(update={"unresolved_slots": result.unresolved_slots})
             turns = {**state.get("profession_turns", {}), turn_id: turn}
-            profile = await verify_profile(profile, state["profession_rag"], state["profession_market"], turns)
+            profile = await verify_profile(profile, state["profession_rag"], state["profession_market"], turns, reuse=True)
             update = project_profile(state, profile, state["raw_activity"], state["acknowledged_profession_claims"],
                                      registry(state))
             report["interviewer_result"] = result.model_dump(mode="json")
@@ -954,7 +969,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         program = CourseProgramModel.model_validate(state["course_program"], context=context(state))
         scheduled = state.get("mode") == "relevance"
         gaps = state["gap_report"]
-        evidence_gaps = {key: gaps[key] for key in ("gap_types", "business_coverage", "science_coverage") if key in gaps}
+        evidence_gaps = {key: gaps[key] for key in ("gap_types", "business_coverage", "science_coverage",
+                                                   "formula_breakdown", "coverage_parameters") if key in gaps}
         previous = state.get("workload_proposal")
         proposal = propose_workload(state["course_program"]["subjects"], previous,
                                     WorkloadParams.from_meta(state["course_meta"]))
@@ -1059,6 +1075,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     graph.add_edge("university_audit", "gap_analysis")
     graph.add_conditional_edges("gap_analysis", lambda state: "prepare_interview"
                                 if state["gap_report"]["gap_types"] and not state.get("closed_interview_id") and
+                                not (state.get("profession_profile", {}).get("judge_unavailable") and
+                                     (synthesis_sources(state) or state.get("manual_subjects"))) and
                                 (not state.get("interview_round") or (state.get("interview_continue") and
                                  state["interview_round"] - len(state.get("profession_profile", {}).get("rejected_noise_turns", []))
                                  < state.get("interview_max_turns", 0))) else "design")

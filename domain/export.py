@@ -15,7 +15,7 @@ REASONS = {"market_demand": "Спрос работодателей", "scientific
            "teacher_review": "Правка преподавателя", "scheduled_relevance_update": "Плановая проверка актуальности"}
 
 
-OUTLINE_LABEL = "Собрано шаблоном, нужна проверка"
+OUTLINE_LABEL = "Собрано шаблоном, нужна проверка методиста"
 PROFESSION_REVIEW_LABEL = "[Требует проверки методиста — нет прямого подтверждения в источниках]"
 # Так помечал обоснование шаблон make_outline до появления поля generated_by.
 LEGACY_OUTLINE_SUMMARY = "Тема предложена для проверки преподавателем по приложенным материалам."
@@ -124,14 +124,15 @@ def rationale_report_html(program: dict, sources: dict) -> str:
         parts.append(f"<h2>{escape(subject['title'])}</h2>")
         rationale = subject.get("inclusion_rationale")
         check = subject.get("rationale_check") or {}
+        problem = CHECK_LABELS.get(check.get("status"))
+        if check.get("status") == "supports" and check.get("judge") is False:
+            problem = "для обоснования нет вердикта модели-судьи"
+        if problem:
+            parts.append(f"<p><strong>{PROFESSION_REVIEW_LABEL}</strong> — {escape(problem)}. "
+                         f"{escape(check.get('reason') or '')}</p>")
         if not rationale:
             parts.append("<p>В базе не подтверждено обоснование включения дисциплины в курс.</p>")
-            if check.get("status") in CHECK_LABELS:
-                parts.append(f"<p><strong>Требует проверки</strong> — {escape(CHECK_LABELS[check['status']])}. "
-                             f"{escape(check.get('reason') or '')}</p>")
             continue
-        if check.get("status") == "supports" and check.get("judge") is False and "судья" in check.get("reason", ""):
-            parts.append("<p>Обоснование проверено кодом; проверка смысла моделью-судьёй была недоступна.</p>")
         parts.append(f"<p>{escape(rationale['explanation'])}</p>")
         for item in rationale["evidence"]:
             source = sources[item["source_id"]]
@@ -197,6 +198,7 @@ def course_report_html(content: dict, sources: dict, notices_html: str, market: 
              f"<title>{title}</title><h1>{title}</h1>",
              generation_summary_html(program),
              profession_profile_html(content.get("profession_profile"), content.get("profession_market", {}), sources),
+             gap_coverage_html(content.get("evidence_gaps")),
              composition_html(content.get("composition_check")),
              rationale_report_html(program, sources)]
     audit = program.get("business_audit")
@@ -219,6 +221,31 @@ def course_report_html(content: dict, sources: dict, notices_html: str, market: 
         for key in vacancy_ids:
             parts.append(source_html(sources[key]))
     return "\n".join([*parts, notices_html, "</html>"])
+
+
+def gap_coverage_html(gaps: dict | None) -> str:
+    params = (gaps or {}).get("coverage_parameters")
+    if not params:
+        return ""
+    labels = {"covered": "Достаточно подтверждений", "partial_gap": "Частичный пробел",
+              "critical_gap": "Критический пробел"}
+    parts = ["<h2>Покрытие профиля источниками</h2>",
+             "<p>Итог — лучшее произведение качества на свежесть × коэффициент независимости источников.</p>",
+             f"<p>Коэффициент независимости — min(1, ln(1 + число источников) / "
+             f"ln(1 + {params['target_independent_sources']})). Порог покрытия — {params['covered_threshold']:.2f}. "
+             f"Год расчёта — {params['as_of_year']}. Слабая связь имеет вес {params['weak_weight']:.2f}. "
+             f"За {params['freshness_half_life_years']:g} лет свежесть снижается с 1 до 0,5. "
+             "Если год публикации неизвестен, свежесть равна 0,75.</p>"]
+    rows = gaps.get("formula_breakdown", [])
+    if not rows:
+        return "\n".join([*parts, "<p>Нет утверждений с данными для расчёта.</p>"])
+    parts.append("<details><summary>Расчёт по утверждениям</summary><ul>")
+    for row in rows:
+        parts.append(f"<li>{escape(row['statement'])} — "
+                     f"{row['best_quality_freshness']:.3f} × {row['independence_factor']:.3f} = "
+                     f"{row['final_score']:.3f}, независимых источников {row['independent_sources_count']}. "
+                     f"{labels[row['status']]}.</li>")
+    return "\n".join([*parts, "</ul></details>"])
 
 
 def profession_counts(profile: dict) -> dict:
@@ -328,7 +355,10 @@ def render_block(block, numbers, level):
     if block.get("previous_value"):
         parts.append("<p>Прежняя формулировка — " + escape(block["previous_value"]) + "</p>")
     why = block["justification"]
-    parts.append("<p>" + REASONS[why["reason_type"]] + " — " + escape(why["evidence_summary"]) + "</p>")
+    evidence_summary = why["evidence_summary"]
+    if evidence_summary == LEGACY_OUTLINE_SUMMARY:
+        evidence_summary = "Тема предложена для проверки методистом по приложенным материалам."
+    parts.append("<p>" + REASONS[why["reason_type"]] + " — " + escape(evidence_summary) + "</p>")
     annotations = {}
     for ref in block["learning_references"]:
         annotation = ref["locator"]

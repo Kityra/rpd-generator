@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from zipfile import ZipFile
 
+import httpx
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -18,7 +19,8 @@ from orchestration.call_log import (CALL_SCOPE, CallScope, RecordingModelClient,
 from orchestration.checkpointer import open_checkpointer
 from orchestration.clients import YandexModelClient, grounded_schema
 from orchestration.graph import build_course_graph
-from orchestration.resilience import ExternalUnavailable
+from orchestration.llm_judge import JudgeVerdicts, judge_batch
+from orchestration.resilience import ExternalUnavailable, Resilience
 from run_rpd import YandexModeratedResponse
 from storage.database import ensure_schema, make_engine
 from storage.models import Base, Course, CourseVersion, Interview, ModelCall, SourceRow
@@ -93,6 +95,41 @@ class OutcomeTests(unittest.TestCase):
 
 
 class RecordingClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_actual_judge_transport_attempts_once_and_logs_failures(self):
+        settings = {"YANDEX_MODEL_URI": "gpt://folder/yandexgpt", "YANDEX_FOLDER_ID": "folder"}
+        request = [{"pair_id": "1", "claim": "Проверяет SQL", "source_type": "Books", "evidence": "Проверка SQL"}]
+        cases = ((httpx.ReadTimeout("URL с приватными данными"), "timeout"),
+                 (httpx.ConnectError("URL с приватными данными"), "network_error"),
+                 (YandexModeratedResponse("Приватный фрагмент"), "moderated"),
+                 (ExternalUnavailable("Запросы временно приостановлены."), "circuit_open"),
+                 (None, "validation_error"))
+        for error, outcome in cases:
+            with self.subTest(outcome=outcome):
+                sdk, policy = MagicMock(), Resilience(invoke=lambda call, _: call(), wait=MagicMock())
+                sdk.responses.create.side_effect = error
+                sdk.responses.create.return_value = SimpleNamespace(status="completed", output=[], output_text="{broken",
+                                                                     incomplete_details=None, usage=None)
+                entries = []
+
+                async def record(entry):
+                    entries.append(entry)
+
+                token = CALL_SCOPE.set(CallScope(course_id="c", run_id="run", stage="subject_rationale"))
+                try:
+                    with patch("orchestration.clients.open_yandex") as open_client, patch("orchestration.yandex_calls.EXTERNAL", policy):
+                        open_client.return_value.__enter__.return_value = sdk
+                        result = await judge_batch(RecordingModelClient(YandexModelClient(settings), record),
+                                                   JudgeVerdicts, request, subject_id="s")
+                finally:
+                    CALL_SCOPE.reset(token)
+                self.assertIsNone(result)
+                sdk.responses.create.assert_called_once()
+                policy.wait.assert_not_called()
+                self.assertEqual(len(entries), 1)
+                entry = entries[0]
+                self.assertEqual((entry["stage"], entry["subject_id"], entry["outcome"]), ("llm_judge", "s", outcome))
+                self.assertNotIn("приватными", entry["error"])
+
     @patch("orchestration.clients.open_yandex")
     @patch("orchestration.clients.model_response")
     async def test_yandex_client_reports_model_and_tokens(self, response, open_client):
@@ -236,7 +273,7 @@ class MigrationTests(unittest.TestCase):
             finally:
                 connection.close()
             self.assertTrue({"model_calls", "courses", "evidence_snapshots"} <= tables)
-            self.assertEqual(version, "0004_activity_model")
+            self.assertEqual(version, "0005_judge_subject_id")
 
     def test_existing_database_gets_call_log_table(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -257,7 +294,7 @@ class MigrationTests(unittest.TestCase):
             finally:
                 connection.close()
             self.assertIn("model_calls", tables)
-            self.assertEqual(version, "0004_activity_model")
+            self.assertEqual(version, "0005_judge_subject_id")
 
 
 if __name__ == "__main__":

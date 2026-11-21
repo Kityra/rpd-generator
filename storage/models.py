@@ -3,7 +3,7 @@ from uuid import uuid4
 
 from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, synonym
 
 
 def now() -> datetime:
@@ -141,7 +141,9 @@ class ModelCall(Base):
     course_id: Mapped[str | None] = mapped_column(String(36), index=True)
     run_id: Mapped[str | None] = mapped_column(String(100))
     stage: Mapped[str] = mapped_column(String(60))
+    stage_name = synonym("stage")
     subject: Mapped[str | None] = mapped_column(String(300))
+    subject_id: Mapped[str | None] = mapped_column(Text)
     output: Mapped[str] = mapped_column(String(80))
     model: Mapped[str] = mapped_column(String(300))
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)

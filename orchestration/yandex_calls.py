@@ -35,7 +35,7 @@ def collect_stream(events):
 
 
 def model_response(client, settings, *, model: str, budget: float = 120, stream: bool = False,
-                   request_key: str | None = None, **kwargs):
+                   request_key: str | None = None, judge: bool = False, **kwargs):
     """Вызов модели. При stream=True ответ читается потоком: лимит чтения действует на каждый фрагмент,
     поэтому длинный ответ не обрывается, пока модель продолжает писать, а общий срок задаёт budget."""
     if stream:
@@ -46,9 +46,13 @@ def model_response(client, settings, *, model: str, budget: float = 120, stream:
         def request(timeout):
             return client.responses.create(model=model, timeout=timeout, **kwargs)
         read = budget
-    return EXTERNAL.call(("Yandex", "responses", _scope(settings), model), request, budget=budget, read=read,
+    service = ("Yandex", "responses", _scope(settings), model)
+    if judge:
+        service = (*service, "llm_judge")
+    return EXTERNAL.call(service, request, budget=budget, read=read, attempts=1 if judge else 3,
                          request_key=request_key, count_timeouts=request_key is None,
-                         cooldown=MODEL_CIRCUIT_COOLDOWN if request_key else None, wait_if_open=request_key is not None)
+                         cooldown=MODEL_CIRCUIT_COOLDOWN if request_key else None,
+                         wait_if_open=not judge and request_key is not None)
 
 
 def search_fragments(client, settings, index: SourceType, store_id: str, query: str, count: int, *,
@@ -71,7 +75,8 @@ def search_fragments(client, settings, index: SourceType, store_id: str, query: 
                 score = getattr(hit, "score", None)
                 score = float(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else None
                 fragments.append(SnapshotEvidence(source=source_record(index, url, hit.filename, text[:6000],
-                                                                       relevance_score=score)))
+                                                                       relevance_score=score,
+                                                                       parent_document_id=f"yandex:{hit.file_id}")))
         return tuple(fragments)
 
     if index == "Interview":

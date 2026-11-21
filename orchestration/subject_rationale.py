@@ -8,7 +8,6 @@
 import asyncio
 import logging
 from textwrap import wrap
-from typing import Literal
 
 from openai import APIResponseValidationError, APIStatusError
 from pydantic import Field, ValidationError, ValidationInfo, model_validator
@@ -16,7 +15,8 @@ from pydantic import Field, ValidationError, ValidationInfo, model_validator
 from domain.schemas import Model, SUBJECT_RATIONALE_SOURCE_TYPES, SourceRecord, SubjectRationale
 from orchestration import prompts
 from orchestration.clients import EvidenceClient, ModelClient
-from orchestration.semantic_check import concepts, excerpt_supports_title, rationale_problem, title_coverage
+from orchestration.llm_judge import JudgePair, JudgeVerdicts, can_judge, judge_batch
+from orchestration.semantic_check import concepts, excerpt_supports_title, title_coverage
 
 
 LOG = logging.getLogger(__name__)
@@ -52,21 +52,8 @@ class SubjectRationaleBatch(Model):
         return self
 
 
-class RationaleVerdict(Model):
-    subject_id: str
-    verdict: Literal["supports", "weak", "unrelated"]
-    reason: str = Field(max_length=400)
-
-
-class RationaleVerdicts(Model):
-    items: list[RationaleVerdict]
-
-    @model_validator(mode="after")
-    def check_subjects(self, info: ValidationInfo) -> "RationaleVerdicts":
-        expected = set((info.context or {}).get("judged_subjects", ()))
-        if {item.subject_id for item in self.items} - expected:
-            raise ValueError("Скопируйте subject_id из запроса.")
-        return self
+class RationaleVerdicts(JudgeVerdicts):
+    pass
 
 
 def _excerpts(record: SourceRecord, title: str, terms: set[str]) -> list[str]:
@@ -77,7 +64,8 @@ def _excerpts(record: SourceRecord, title: str, terms: set[str]) -> list[str]:
 
 
 def checked(status: str, reason: str, *, judge: bool) -> dict:
-    return {"status": status, "reason": reason, "judge": judge}
+    return {"status": status, "reason": reason, "judge": judge,
+            "verification_status": "verified" if status == "supports" else "needs_review"}
 
 
 async def explain_subjects(program: dict, registry: dict[str, SourceRecord], evidence: EvidenceClient,
@@ -91,8 +79,11 @@ async def explain_subjects(program: dict, registry: dict[str, SourceRecord], evi
     def existing(subject):
         """Сохранённое обоснование остаётся, если его цитаты по-прежнему проходят проверку кодом."""
         rationale = subject.get("inclusion_rationale")
-        if rationale and rationale_problem(subject["title"], rationale["explanation"],
-                                           [item["excerpt"] for item in rationale["evidence"]]):
+        if rationale is None:
+            return None
+        try:
+            SubjectRationale.model_validate(rationale, context={"sources": database, "rationale_subject": subject["title"]})
+        except ValidationError:
             return None
         return rationale
 
@@ -116,18 +107,25 @@ async def explain_subjects(program: dict, registry: dict[str, SourceRecord], evi
         ordered = sorted(candidates.items(), key=lambda item: title_coverage(title, item[1].content), reverse=True)
         return dict(ordered[:7])
 
-    async def judge(rows: list[dict]) -> dict[str, RationaleVerdict] | None:
-        if not rows:
-            return {}
-        try:
-            async with model_limit:
-                verdicts = await llm.generate(RationaleVerdicts, prompts.RATIONALE_JUDGE,
-                                              {"course": program["title"], "disciplines": rows},
-                                              {"judged_subjects": [row["subject_id"] for row in rows]}, flash=True)
-        except UNAVAILABLE as error:
-            LOG.warning("Проверка обоснований судьёй недоступна: %s", type(error).__name__)
-            return None
-        return {item.subject_id: item for item in verdicts.items}
+    async def judge(subject_id, rationale, sources):
+        claim = rationale["explanation"]
+        pairs: list[JudgePair] = [
+            {"pair_id": str(index), "claim": claim, "source_type": sources[item["source_id"]].source_type,
+             "evidence": item["excerpt"]}
+            for index, item in enumerate(rationale["evidence"], 1) if can_judge(claim, item["excerpt"])
+        ]
+        if not pairs:
+            return subject_id, checked("unrelated", "В цитатах нет прямого совпадения с обоснованием.", judge=False)
+        async with model_limit:
+            verdicts = await judge_batch(llm, RationaleVerdicts, pairs, subject_id=subject_id)
+        if verdicts is None:
+            return subject_id, checked("weak", "Проверка обоснования моделью-судьёй недоступна.", judge=False)
+        values = set(verdicts.values())
+        if "supports" in values:
+            return subject_id, checked("supports", "Модель-судья подтвердила связь с цитатой.", judge=True)
+        if "weak" in values:
+            return subject_id, checked("weak", "Модель-судья не установила прямого подтверждения.", judge=True)
+        return subject_id, checked("unrelated", "Модель-судья не обнаружила связи с цитатами.", judge=True)
 
     async def explain_batch(batch, *, retry=False):
         found = await asyncio.gather(*(gather_sources(subject, retry=retry) for subject in batch))
@@ -159,7 +157,7 @@ async def explain_subjects(program: dict, registry: dict[str, SourceRecord], evi
             LOG.warning("Обоснование состава курса не сформировано для группы дисциплин: %s", type(error).__name__)
             return {}, {}, {}
         titles = {row["subject_id"]: row["title"] for row in disciplines}
-        candidates, checks = {}, {}
+        rationales, checks = {}, {}
         for item in report.items:
             if not item.excerpt_ids:
                 continue
@@ -172,28 +170,7 @@ async def explain_subjects(program: dict, registry: dict[str, SourceRecord], evi
             except ValidationError as error:
                 checks[subject_ids[item.subject_id]] = checked("unrelated", error.errors()[0]["msg"], judge=False)
                 continue
-            candidates[item.subject_id] = rationale.model_dump(mode="json")
-        by_text = {(item["source_id"], item["excerpt"]): excerpt_id for excerpt_id, item in excerpts.items()}
-        rows = [{"subject_id": key, "title": titles[key], "explanation": value["explanation"],
-                 "fragments": [{"excerpt_id": by_text.get((e["source_id"], e["excerpt"])),
-                                "title": sources[e["source_id"]].title, "text": e["excerpt"]} for e in value["evidence"]]}
-                for key, value in candidates.items()]
-        verdicts = await judge(rows)
-        rationales = {}
-        for key, rationale in candidates.items():
-            subject_id = subject_ids[key]
-            if verdicts is None:
-                rationales[subject_id] = rationale
-                checks[subject_id] = checked("supports", "Проверено кодом; судья недоступен.", judge=False)
-                continue
-            verdict = verdicts.get(key)
-            if verdict is None:
-                checks[subject_id] = checked("weak", "Судья не оценил обоснование.", judge=True)
-            elif verdict.verdict == "supports":
-                rationales[subject_id] = rationale
-                checks[subject_id] = checked("supports", verdict.reason, judge=True)
-            else:
-                checks[subject_id] = checked(verdict.verdict, verdict.reason, judge=True)
+            rationales[subject_ids[item.subject_id]] = rationale.model_dump(mode="json")
         used = {key: sources[key] for rationale in rationales.values() for key in rationale["source_ids"]}
         return rationales, used, checks
 
@@ -213,12 +190,16 @@ async def explain_subjects(program: dict, registry: dict[str, SourceRecord], evi
         for key, value in items.items():
             if key not in checks or value["status"] == "supports":
                 checks[key] = value
-    additions = {key: value for _, used, _ in batches for key, value in used.items() if key not in registry}
+    judged_sources = {**registry, **{key: value for _, used, _ in batches for key, value in used.items()}}
+    checks.update(await asyncio.gather(*(judge(key, rationale, judged_sources) for key, rationale in rationales.items())))
+    additions = {key: value for key, value in judged_sources.items() if key not in registry}
 
     def updated(subject):
         rationale = rationales.get(subject["id"], existing(subject))
         if rationale is not None and subject["id"] not in rationales:
-            check = subject.get("rationale_check") or checked("supports", "Сохранённое обоснование.", judge=False)
+            check = subject.get("rationale_check")
+            if not check or (check["status"] == "supports" and not check.get("judge")):
+                check = checked("weak", "Для сохранённого обоснования нет вердикта модели-судьи.", judge=False)
         elif rationale is not None:
             check = checks[subject["id"]]
         else:

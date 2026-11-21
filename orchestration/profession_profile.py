@@ -53,6 +53,7 @@ class ProfessionProfile(Contract):
     interview_method_used: str | None = None
     rejected_noise_turns: list[int] = Field(default_factory=list)
     unresolved_slots: list[str] = Field(default_factory=list)
+    judge_unavailable: bool = False
 
     @model_validator(mode="after")
     def unique_claim_ids(self):

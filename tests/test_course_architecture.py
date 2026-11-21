@@ -283,8 +283,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             elif output.__name__ == "SubjectRationaleBatch":
                 value = rationale_batch(payload)
             elif output.__name__ == "RationaleVerdicts":
-                value = {"items": [{"subject_id": row["subject_id"], "verdict": "supports", "reason": "SQL"}
-                                   for row in payload["disciplines"]]}
+                value = {"items": [{"pair_id": row["pair_id"], "verdict": "supports"} for row in payload["pairs"]]}
             else:
                 audit_calls += 1
                 value = {"source_ids": ["HH"], "market_fit_score": 0.7, "metrics": [], "unavailable_metrics": ["active_vacancies"],

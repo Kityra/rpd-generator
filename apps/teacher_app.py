@@ -8,7 +8,7 @@ from activity.rpd_bridge import origin_note
 from apps.common import composer, portal
 from apps.teacher_programs import knowledge_screen, my_disciplines
 from apps.presentation import course_progress, status_badge
-from domain.export import (OUTLINE_LABEL, block_html, composition_html, export_course, generation_summary,
+from domain.export import (OUTLINE_LABEL, block_html, composition_html, export_course, gap_coverage_html, generation_summary,
                            profession_counts, profession_profile_html, rationale_report_html, source_html, subject_origin)
 from pydantic import ValidationError
 
@@ -163,13 +163,14 @@ def generation_panel(program, failures):
         text += f" Для {summary['unknown']} происхождение не записано (старая версия)."
     (st.warning if summary["outline"] else st.caption)(text)
     if summary["reasons"] or failures:
-        with st.expander("Почему дисциплины собраны шаблоном"):
+        with st.expander("Почему дисциплины собраны шаблоном" if summary["outline"] else "Подробности проверок"):
             for reason, count in summary["reasons"]:
                 st.write(f"{reason} — {count}")
             if failures:
                 st.caption("Сбои вызовов модели по журналу")
                 for stage, outcome, count in failures:
-                    st.write(f"{stage}: {OUTCOME_LABELS.get(outcome, outcome)} — {count}")
+                    name = "Модель-судья" if stage == "llm_judge" else stage
+                    st.write(f"{name}: {OUTCOME_LABELS.get(outcome, outcome)} — {count}")
 
 
 def market_report(analysis):
@@ -263,6 +264,8 @@ def report_panel(version, registry, interviews, analysis=None):
                 for claim in rejected:
                     st.text(claim["statement"])
                     st.caption(claim["verification_reason"])
+    if coverage := gap_coverage_html(version.content.get("evidence_gaps")):
+        st.html(coverage)
     if analysis is not None:
         market_report(analysis)
     if composition := composition_html(version.content.get("composition_check")):

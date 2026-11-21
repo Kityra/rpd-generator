@@ -66,16 +66,17 @@ class JudgeTests(unittest.IsolatedAsyncioTestCase):
         evidence.search.return_value = sources
         subjects = [subject("s1", "Регрессия"), subject("s2", "Регрессия временных рядов"), subject("s3", "Логистическая регрессия")]
 
-        async def generate(output, prompt, payload, context, flash=False):
+        async def generate(output, prompt, payload, context, flash=False, **options):
             if output.__name__ == "SubjectRationaleBatch":
                 return output.model_validate({"items": [
                     {"subject_id": row["subject_id"], "excerpt_ids": [row["fragments"][0]["excerpt_id"]],
                      "explanation": "Регрессия оценивает зависимость отклика от признаков модели."}
                     for row in payload["disciplines"]]}, context=context)
-            verdicts = {"Регрессия": "supports", "Регрессия временных рядов": "weak", "Логистическая регрессия": "unrelated"}
+            status = {"с лагами": "weak", "логистическая": "unrelated"}
             return output.model_validate({"items": [
-                {"subject_id": row["subject_id"], "verdict": verdicts[row["title"]], "reason": "оценка судьи"}
-                for row in payload["disciplines"]]}, context=context)
+                {"pair_id": row["pair_id"], "verdict": next(
+                    (verdict for marker, verdict in status.items() if marker in row["evidence"]), "supports")}
+                for row in payload["pairs"]]}, context=context)
 
         llm = AsyncMock()
         llm.generate.side_effect = generate
@@ -84,12 +85,18 @@ class JudgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(by_title["Регрессия"]["inclusion_rationale"])
         self.assertEqual(by_title["Регрессия"]["rationale_check"]["status"], "supports")
         for title, status in (("Регрессия временных рядов", "weak"), ("Логистическая регрессия", "unrelated")):
-            self.assertIsNone(by_title[title]["inclusion_rationale"])
+            self.assertIsNotNone(by_title[title]["inclusion_rationale"])
             self.assertEqual(by_title[title]["rationale_check"]["status"], status)
+            self.assertEqual(by_title[title]["rationale_check"]["verification_status"], "needs_review")
         html = rationale_report_html(result, {source.source_id: source.model_dump(mode="json") for source in sources})
         self.assertEqual(html.count("Требует проверки"), 2)
         judged = [call for call in llm.generate.call_args_list if call.args[0].__name__ == "RationaleVerdicts"]
-        self.assertTrue(judged and all(call.kwargs.get("flash") for call in judged))
+        self.assertEqual(len(judged), 3)
+        for call in judged:
+            self.assertEqual(set(call.args[2]), {"pairs"})
+            self.assertTrue(all(set(pair) == {"pair_id", "claim", "source_type", "evidence"}
+                                for pair in call.args[2]["pairs"]))
+            self.assertEqual(call.kwargs["temperature"], 0.0)
 
 
 class CompositionTests(unittest.TestCase):

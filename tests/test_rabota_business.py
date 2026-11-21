@@ -150,8 +150,11 @@ class CourseBusinessTests(unittest.IsolatedAsyncioTestCase):
                 config={"configurable": {"thread_id": "course"}}, interrupt_before=["prepare_interview"],
             )
             self.assertEqual(state["status"], "gap_analysis")
-            # Одна карточка Работы.ру подтверждает задачу с весом 0.8 (config/analysis.yaml), а не полностью.
-            self.assertEqual(state["gap_report"]["business_coverage"], 0.8)
+            coverage = state["gap_report"]
+            task = next(item for item in coverage["formula_breakdown"] if item["category"] == "work_task")
+            self.assertEqual(task["independent_sources_count"], 1)
+            self.assertEqual(task["independence_factor"], 0.5)
+            self.assertEqual(coverage["business_coverage"], task["final_score"])
             self.assertEqual(state["gap_report"]["science_coverage"], 0.0)
 
         settings = SimpleNamespace(app_database_url="unused", checkpoint_url="unused", public_origin="http://localhost:8501",
