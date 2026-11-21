@@ -114,7 +114,7 @@ class SqlWorkflowStore:
 
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
                          scheduled: bool, activity: dict, *, evidence_gaps: dict, source_notices: list[str],
-                         vacancy_source_ids: list[str] | None = None) -> None:
+                         vacancy_source_ids: list[str] | None = None, workload_proposal: dict | None = None) -> None:
         async with write_transaction(self.factory) as db:
             course = await db.scalar(select(Course).where(Course.id == course_id).with_for_update())
             if course.draft_version_id and course.draft_version_id != version_id:
@@ -128,6 +128,8 @@ class SqlWorkflowStore:
                     content["source_notices"] = source_notices
                 if vacancy_source_ids:
                     content["vacancy_source_ids"] = vacancy_source_ids
+                if workload_proposal:
+                    content["workload_proposal"] = workload_proposal
                 db.add(CourseVersion(id=version_id, course_id=course_id, revision=revision, content=content))
                 await db.flush()
             course.draft_version_id = version_id

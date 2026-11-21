@@ -6,9 +6,8 @@ from urllib.parse import urlsplit
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from jsonschema import Draft202012Validator
-from sympy import Integer, Rational
+from domain.workload import HOURS, workload
 
-HOURS = {"lectures": "Лекции", "practice": "Практика", "labs": "Лабораторные", "independent": "Самостоятельная работа"}
 REASONS = {"market_demand": "Спрос работодателей", "scientific_trend": "Научные результаты",
            "expert_practice": "Практика эксперта", "fundamental_core": "Фундаментальная подготовка",
            "teacher_review": "Правка преподавателя", "scheduled_relevance_update": "Плановая проверка актуальности"}
@@ -22,18 +21,6 @@ def used_sources(value):
         yield from value.get("source_ids", ())
         for child in value.values():
             yield from used_sources(child)
-
-
-def workload(values):
-    if any(type(values.get(key)) is not int or not 0 <= values[key] <= 10000 for key in HOURS):
-        raise ValueError("Введите целые часы от 0 до 10 000.")
-    rate = values.get("hours_per_credit")
-    if type(rate) is not int or not 1 <= rate <= 1000:
-        raise ValueError("Укажите число часов в зачётной единице.")
-    total = sum(Integer(values[key]) for key in HOURS)
-    if not total:
-        raise ValueError("Суммарная нагрузка должна быть больше нуля.")
-    return {"totalHours": int(total), "totalCredits": float(Rational(total, rate))}
 
 
 def is_yandex_file(source: dict) -> bool:
@@ -134,25 +121,37 @@ def child_blocks(block):
     return [*block.get("topics", []), *block.get("assignments", [])]
 
 
-def cited_sources(block):
-    yield from block["justification"]["source_ids"]
-    yield from (ref["source_id"] for ref in block["learning_references"])
+def cited_sources(block, *, for_learning: bool):
+    if for_learning:
+        yield from (ref["source_id"] for ref in block["learning_references"])
+    else:
+        yield from block["justification"]["source_ids"]
     for child in child_blocks(block):
-        yield from cited_sources(child)
+        yield from cited_sources(child, for_learning=for_learning)
 
 
 def block_html(block, sources):
     materials = {}
-    for source_id in dict.fromkeys(cited_sources(block)):
+    supporting = {}
+    for source_id in dict.fromkeys(cited_sources(block, for_learning=True)):
         key = material_key(sources[source_id], source_id)
         materials.setdefault(key, []).append(source_id)
-    numbers = {source_id: number for number, ids in enumerate(materials.values(), 1) for source_id in ids}
+    for source_id in dict.fromkeys(cited_sources(block, for_learning=False)):
+        key = material_key(sources[source_id], source_id)
+        items = materials[key] if key in materials else supporting.setdefault(key, [])
+        if source_id not in items:
+            items.append(source_id)
+    entries = [*materials.values(), *supporting.values()]
+    numbers = {source_id: number for number, ids in enumerate(entries, 1) for source_id in ids}
     article = render_block(block, numbers, 2)
-    if not materials:
-        return article
     catalog = [source_html(sources[ids[0]], number=number, fragments=[sources[key]["content"] for key in ids])
-               for number, ids in enumerate(materials.values(), 1)]
-    return "\n".join([article, "<h3>Материалы дисциплины</h3>", *catalog])
+               for number, ids in enumerate(entries, 1)]
+    parts = [article]
+    if materials:
+        parts.extend(["<h3>Материалы дисциплины</h3>", *catalog[:len(materials)]])
+    if supporting:
+        parts.extend(["<h3>Источники для обоснований</h3>", *catalog[len(materials):]])
+    return "\n".join(parts)
 
 
 def render_block(block, numbers, level):
@@ -238,6 +237,8 @@ def export_course(meta, version, sources):
                 document["workload"] = workload(load)
                 document["workloadInputs"] = load
                 load_text = f"<p>Нагрузка — {document['workload']['totalHours']} ч., {document['workload']['totalCredits']:g} ЗЕ</p>"
+                load_text += "<ul>" + "".join(f"<li>{label} — {load.get(field, 0)} акад. ч.</li>"
+                                               for field, label in HOURS.items()) + "</ul>"
             validator.validate(document)
             directory = f"rpd/{index:02}"
             write_json(f"{directory}/rpd.json", document)

@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 from textwrap import wrap
 
 from openai import APIResponseValidationError, APIStatusError
@@ -16,6 +17,15 @@ from orchestration.draft import keywords
 LOG = logging.getLogger(__name__)
 UNAVAILABLE = (APIResponseValidationError, APIStatusError, RuntimeError, ValidationError)
 BATCH_SIZE = 4
+AI_SCOPE_TITLE = re.compile(
+    r"\b(?:слаб\w*\s+и\s+сильн\w*|сильн\w*\s+и\s+слаб\w*)\s+(?:ии|искусственн\w*\s+интеллект\w*)\b", re.I)
+AI_SCOPE_EVIDENCE = re.compile(
+    r"\b(?:слаб\w*|сильн\w*|узк\w*|общ\w*)\s+(?:ии|искусственн\w*\s+интеллект\w*)\b"
+    r"|\b(?:weak|strong|narrow|general)\s+(?:ai|artificial intelligence)\b"
+    r"|\bweak\s+(?:\(narrow\)\s+)?and\s+strong\s+ai\b", re.I)
+AI_SCOPE_QUERY = (
+    "слабый и сильный искусственный интеллект: различия, узкий ИИ, искусственный общий интеллект, AGI"
+)
 
 
 class DisciplineRationale(Model):
@@ -50,9 +60,11 @@ def _terms(text: str) -> set[str]:
     return {word[:5] for word in keywords(text)}
 
 
-def _excerpts(record: SourceRecord, terms: set[str]) -> list[str]:
+def _excerpts(record: SourceRecord, terms: set[str], required: re.Pattern | None = None) -> list[str]:
     chunks = wrap(" ".join(record.content.split()), width=340, break_long_words=False, break_on_hyphens=False)
     useful = [chunk for chunk in chunks if 15 <= len(chunk) <= 400]
+    if required:
+        useful = [chunk for chunk in useful if required.search(chunk)]
     return sorted(useful, key=lambda chunk: len(_terms(chunk) & terms), reverse=True)[:2]
 
 
@@ -63,13 +75,27 @@ async def explain_subjects(program: dict, registry: dict[str, SourceRecord], evi
     database = {key: source for key, source in registry.items()
                 if source.source_type in SUBJECT_RATIONALE_SOURCE_TYPES}
     subjects = program["subjects"]
+    focused = {subject["id"] for subject in subjects if AI_SCOPE_TITLE.search(subject["title"])}
 
-    async def gather_sources(subject):
+    def existing(subject):
+        rationale = subject.get("inclusion_rationale")
+        if rationale and subject["id"] in focused and not any(
+            AI_SCOPE_EVIDENCE.search(item["excerpt"]) for item in rationale["evidence"]
+        ):
+            return None
+        return rationale
+
+    async def gather_sources(subject, *, retry):
         topics = ", ".join(topic["title"] for topic in subject["topics"])
-        query = f"Дисциплина «{subject['title']}». Темы: {topics}."[:900]
+        title = subject["title"]
+        query = title if retry else f"Дисциплина «{title}». Темы: {topics}."[:900]
+        role = "subject_rationale_extended" if retry else "subject_rationale"
+        if subject["id"] in focused:
+            role = "subject_rationale_extended"
+            query = AI_SCOPE_QUERY if not retry else f"{title}. Системы сильного искусственного интеллекта и слабый ИИ."
         async with source_limit:
             try:
-                found = await evidence.search("subject_rationale", query, owner_scope=owner)
+                found = await evidence.search(role, query, owner_scope=owner)
             except UNAVAILABLE as error:
                 LOG.warning("Поиск материалов для обоснования дисциплины: %s", type(error).__name__)
                 found = []
@@ -78,19 +104,23 @@ async def explain_subjects(program: dict, registry: dict[str, SourceRecord], evi
                     if key in database)
         candidates = {record.source_id: record for record in [*found, *previous]
                       if record.source_type in SUBJECT_RATIONALE_SOURCE_TYPES}
+        if subject["id"] in focused:
+            candidates = {key: source for key, source in candidates.items() if AI_SCOPE_EVIDENCE.search(
+                " ".join(source.content.split()))}
         return dict(list(candidates.items())[:7])
 
-    async def explain_batch(batch):
-        found = await asyncio.gather(*(gather_sources(subject) for subject in batch))
+    async def explain_batch(batch, *, retry=False):
+        found = await asyncio.gather(*(gather_sources(subject, retry=retry) for subject in batch))
         sources = {key: source for records in found for key, source in records.items()}
         disciplines, choices, excerpts, subject_ids = [], {}, {}, {}
         for number, (subject, records) in enumerate(zip(batch, found, strict=True), 1):
             key = f"D{number}"
             topics = [topic["title"] for topic in subject["topics"]]
             terms = _terms(" ".join([subject["title"], *topics]))
+            required = AI_SCOPE_EVIDENCE if subject["id"] in focused else None
             fragments = []
             for record in records.values():
-                for text in _excerpts(record, terms):
+                for text in _excerpts(record, terms, required):
                     excerpt_key = f"E{len(excerpts) + 1}"
                     excerpts[excerpt_key] = {"source_id": record.source_id, "excerpt": text}
                     fragments.append({"excerpt_id": excerpt_key, "index": record.source_type,
@@ -105,7 +135,7 @@ async def explain_subjects(program: dict, registry: dict[str, SourceRecord], evi
             async with model_limit:
                 report = await llm.generate(SubjectRationaleBatch, prompts.SUBJECT_RATIONALE,
                                             {"course": program["title"], "disciplines": disciplines},
-                                            {"subject_excerpts": choices}, flash=True)
+                                            {"subject_excerpts": choices}, flash=not retry)
         except UNAVAILABLE as error:
             LOG.warning("Обоснование состава курса не сформировано для группы дисциплин: %s", type(error).__name__)
             return {}, {}
@@ -121,9 +151,18 @@ async def explain_subjects(program: dict, registry: dict[str, SourceRecord], evi
         used = {key: sources[key] for rationale in rationales.values() for key in rationale["source_ids"]}
         return rationales, used
 
-    batches = await asyncio.gather(*(explain_batch(subjects[index:index + BATCH_SIZE])
-                                     for index in range(0, len(subjects), BATCH_SIZE)))
+    def requests(batch_subjects, *, retry=False):
+        return asyncio.gather(*(explain_batch(batch_subjects[index:index + BATCH_SIZE], retry=retry)
+                                for index in range(0, len(batch_subjects), BATCH_SIZE)))
+
+    targets = [subject for subject in subjects if not existing(subject)]
+    batches = await requests(targets)
+    found = {key for items, _ in batches for key in items}
+    missing = [subject for subject in targets if subject["id"] not in found]
+    if missing:
+        batches.extend(await requests(missing, retry=True))
     rationales = {key: value for items, _ in batches for key, value in items.items()}
     additions = {key: value for _, used in batches for key, value in used.items() if key not in registry}
-    return {**program, "subjects": [{**subject, "inclusion_rationale": rationales.get(subject["id"])}
+    return {**program, "subjects": [{**subject, "inclusion_rationale": rationales.get(
+        subject["id"], existing(subject))}
                                      for subject in subjects]}, list(additions.values())

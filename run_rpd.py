@@ -91,6 +91,7 @@ def yandex_settings() -> dict[str, str]:
         raise ValueError(f"Укажите в YANDEX_BASE_URL адрес {YANDEX_BASE_URL}")
     for key in ("YANDEX_VECTOR_STORE_ID_BOOKS", "YANDEX_VECTOR_STORE_ID_HH",
                 "YANDEX_VECTOR_STORE_ID_PRIKLAD", "YANDEX_VECTOR_STORE_ID_INTERVIEW",
+                "YANDEX_MODEL_URI_COURSE_DESIGN",
                 *(f"YANDEX_MODEL_URI_{role.upper()}" for role in PROFILES)):
         if key not in indexes:
             settings[key] = os.environ.get(key, "").strip()

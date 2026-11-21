@@ -32,22 +32,27 @@ class AuthService:
         if not email.strip() or len(email) > 320 or not password or len(password) > 1024:
             raise PermissionError("Некорректные учётные данные.")
         email = email.strip().lower()
+        lookup = select(LoginAttempt).where(LoginAttempt.email == email, LoginAttempt.ip == ip)
+        async with self.factory() as db:
+            locked_until = await db.scalar(lookup.with_only_columns(LoginAttempt.locked_until))
+        already_blocked = locked_until is not None and aware(locked_until) > datetime.now(timezone.utc)
+        user = None
+        valid = False
+        # A cloud directory lookup and password hashing must finish before acquiring a database write lock.
+        if not already_blocked:
+            user = await self.users.get_by_email(email)
+            if user:
+                stored = await self.users.password_hash(user.id)
+                valid = await asyncio.to_thread(self.verifier.verify, password, stored)
         at = datetime.now(timezone.utc)
         token = None
         async with write_transaction(self.factory) as db:
             insert = sqlite_insert if db.bind.dialect.name == "sqlite" else pg_insert
             await db.execute(insert(LoginAttempt).values(email=email, ip=ip, attempts=0).on_conflict_do_nothing())
-            attempt = await db.scalar(select(LoginAttempt).where(
-                LoginAttempt.email == email, LoginAttempt.ip == ip).with_for_update())
-            blocked = attempt.locked_until is not None and aware(attempt.locked_until) > at
-            user = None
-            valid = False
-            if not blocked:
-                user = await self.users.get_by_email(email)
-                if user:
-                    stored = await self.users.password_hash(user.id)
-                    valid = await asyncio.to_thread(self.verifier.verify, password, stored)
+            attempt = await db.scalar(lookup.with_for_update())
+            blocked = already_blocked or (attempt.locked_until is not None and aware(attempt.locked_until) > at)
             if blocked:
+                user = None
                 event = "login_blocked"
             elif not valid:
                 if attempt.locked_until is not None:

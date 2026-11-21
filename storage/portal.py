@@ -5,7 +5,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from auth.user_repository import CurrentUser
-from domain.export import workload
+from domain.workload import proposal_from_loads, propose_workload, workload
 from storage.database import write_transaction
 from storage.models import Course, CourseVersion, ExpertInvitation, Interview, Notification, WorkflowCommand
 
@@ -36,21 +36,34 @@ async def create_course(factory: async_sessionmaker[AsyncSession], actor: Curren
 async def decide(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str, version_id: str,
                  action: str, content: str = "", attachments: tuple | list = (), workloads: dict | None = None) -> None:
     require_teacher(actor)
-    if action not in {"approve", "reject", "revise"} or (action == "revise" and not (content.strip() or attachments)):
+    if action not in {"approve", "reject", "revise", "refresh_materials"} or (action == "revise" and not (content.strip() or attachments)):
         raise ValueError("Укажите решение или правку.")
     async with write_transaction(factory) as db:
         course = await db.scalar(select(Course).where(Course.id == course_id, Course.owner_user_id == actor.id).with_for_update())
         if course is None:
             raise PermissionError("Курс недоступен.")
-        if workloads:
+        proposal = None
+        if workloads or action in {"approve", "revise", "refresh_materials"}:
             version = await db.get(CourseVersion, version_id)
-            if not version or version.course_id != course_id or set(workloads) - {s["id"] for s in version.content["program"]["subjects"]}:
+            if not version or version.course_id != course_id:
                 raise ValueError("Нагрузка не соответствует версии курса.")
-            for hours in workloads.values():
+            subjects = version.content["program"]["subjects"]
+            proposal = version.content.get("workload_proposal")
+            if proposal is None and course.active_version_id:
+                active = await db.get(CourseVersion, course.active_version_id)
+                if active:
+                    proposal = proposal_from_loads(active.content.get("workloads", {}))
+            if action == "approve" and workloads is None:
+                workloads = propose_workload(subjects, proposal)["loads"]
+            if set(workloads or {}) - {subject["id"] for subject in subjects}:
+                raise ValueError("Нагрузка не соответствует версии курса.")
+            for hours in (workloads or {}).values():
                 workload(hours)
         payload = {"action": action, "actor_user_id": actor.id, "version_id": version_id,
                    "content": content.strip() or ("См. приложенные материалы." if attachments else ""),
                    "attachments": list(attachments), "workloads": workloads or {}}
+        if proposal and action in {"revise", "refresh_materials"}:
+            payload["workload_proposal"] = proposal
         key = f"review:{version_id}"
         existing = await db.get(WorkflowCommand, key)
         if existing and existing.payload == payload:

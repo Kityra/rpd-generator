@@ -17,11 +17,13 @@ from auth.settings import Settings
 from auth.user_repository import CurrentUser
 from auth.yandex_users import accounts_from_text
 from domain.export import block_html, export_course, rationale_report_html, source_html
-from domain.schemas import EvidenceResults
+from domain.schemas import EvidenceResults, block_value
 from literature_parser import LiteratureSource, TopicLiterature, enrich_course_program
 from orchestration.checkpointer import open_checkpointer
 from orchestration.evidence_cache import source_record
 from orchestration.graph import build_course_graph
+from orchestration.subject_rationale import explain_subjects
+from run_rpd import YandexModeratedResponse
 from storage.database import make_engine
 from storage.models import Base, Course, CourseVersion, ExpertInvitation, Interview, Notification, SourceRow, WorkflowCommand, now
 from storage.portal import acknowledge, assigned_interviews, create_course, decide, finish_without_answer, schedule_due
@@ -56,6 +58,17 @@ class SourceDisplayTests(unittest.TestCase):
         self.assertEqual(1, html.count("Первый текст."))
         self.assertEqual(1, html.count("Другой фрагмент."))
         self.assertIn("Источник 1 —", html)
+
+    def test_job_export_cannot_appear_in_discipline_materials(self):
+        subject = program()["subjects"][0]
+        subject["justification"]["source_ids"].append("HH")
+        sources = {key: record.model_dump(mode="json") for key, record in records().items()}
+        sources["HH"]["title"] = "jobix_hh_only_part_0002.csv"
+        html = block_html(subject, sources)
+        materials, supporting = html.split("<h3>Источники для обоснований</h3>", 1)
+        self.assertIn("Материалы дисциплины", materials)
+        self.assertNotIn("jobix_hh_only_part_0002.csv", materials)
+        self.assertIn("jobix_hh_only_part_0002.csv", supporting)
 
 
 def user(role, suffix=""):
@@ -128,6 +141,159 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await process_next(self.engine, self.factory, graph))
         async with self.factory() as db:
             return await db.get(Course, "course")
+
+    async def test_filtered_books_summary_and_market_audit_do_not_stop_the_course(self):
+        filtered = source_record("Books", "https://example.org/filtered", "Подборка книг", "Текст для теста")
+        self.evidence.search.side_effect = lambda role, *_args, **_kwargs: (
+            [filtered] if role == "books" else list(records().values()))
+        original = self.model.generate
+
+        async def generate(output, prompt, payload, context, flash=False):
+            if output.__name__ == "BusinessCourseAudit" or filtered.source_id in context.get("sources", {}):
+                raise YandexModeratedResponse("Провайдер ограничил ответ.")
+            return await original(output, prompt, payload, context, flash)
+
+        self.model.generate = generate
+        course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        async with self.factory() as db:
+            version = await db.get(CourseVersion, course.draft_version_id)
+            self.assertIn("books: Yandex AI Studio ограничила анализ этой подборки источников.",
+                          version.content["source_notices"])
+            self.assertIsNone(version.content["program"]["business_audit"])
+            self.assertIsNone(await db.get(SourceRow, (course.id, filtered.source_id)))
+            self.assertTrue(version.content["program"]["subjects"][0]["inclusion_rationale"])
+
+    async def test_draft_workload_is_prefilled_and_text_revision_is_exported(self):
+        course = await self.process()
+        async with self.factory() as db:
+            draft = await db.get(CourseVersion, course.draft_version_id)
+            initial = draft.content["workload_proposal"]
+            subject = draft.content["program"]["subjects"][0]
+            self.assertEqual(initial["total_hours"], 2160)
+            self.assertEqual(initial["hours_per_credit"], 36)
+            self.assertGreater(initial["loads"][subject["id"]]["assessment"], 0)
+
+        async def edit(output, prompt, payload, context, flash=False):
+            self.assertEqual(output.__name__, "WorkloadEdit")
+            self.assertEqual(payload["total_hours"], 2160)
+            return output.model_validate({
+                "workload_only": True, "total_hours": None, "total_credits": None,
+                "hours_per_credit": None, "distribute_evenly": False,
+                "subjects": [{"subject_id": subject["id"], "total_hours": 108, "credits": None,
+                              "lectures": None, "practice": None, "labs": 20,
+                              "independent": None, "assessment": 8}],
+            })
+
+        self.model.generate = edit
+        await decide(self.factory, self.teacher, course.id, draft.id, "revise",
+                     "Для баз данных оставь 108 академических часов, из них 20 лабораторных и 8 на аттестацию.")
+        course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        async with self.factory() as db:
+            revised = await db.get(CourseVersion, course.draft_version_id)
+            self.assertEqual(revised.content["program"], draft.content["program"])
+            revised_load = revised.content["workload_proposal"]["loads"][subject["id"]]
+            self.assertEqual(revised.content["workload_proposal"]["total_hours"], 108)
+            self.assertEqual(revised_load["labs"], 20)
+            self.assertEqual(revised_load["assessment"], 8)
+
+        await decide(self.factory, self.teacher, course.id, revised.id, "approve")
+        course = await self.process()
+        async with self.factory() as db:
+            active = await db.get(CourseVersion, course.active_version_id)
+            sources = {row.source_id: row.record for row in (await db.scalars(
+                select(SourceRow).where(SourceRow.course_id == course.id))).all()}
+            archive = export_course(course.course_meta, active, sources)
+        with ZipFile(BytesIO(archive)) as package:
+            rpd = json.loads(package.read("rpd/01/rpd.json"))
+            self.assertEqual(rpd["workload"], {"totalHours": 108, "totalCredits": 3})
+            self.assertEqual(rpd["workloadInputs"]["assessment"], 8)
+
+    async def test_mixed_revision_updates_course_content_and_workload(self):
+        course = await self.process()
+        original = self.model.generate
+
+        async def generate(output, prompt, payload, context, flash=False):
+            if output.__name__ == "WorkloadEdit":
+                return output.model_validate({"workload_only": False, "total_hours": 216, "total_credits": None,
+                    "hours_per_credit": None, "distribute_evenly": False, "subjects": []})
+            if output.__name__ == "CourseProgramModel":
+                revised = program()
+                assignment = revised["subjects"][0]["topics"][0]["assignments"][0]
+                old = context["baseline"].subjects[0].topics[0].assignments[0]
+                assignment.update(instructions="Составьте SQL-запрос и проверьте работу индекса.",
+                                  change_status="modified", previous_value=block_value(old))
+                return output.model_validate(revised, context=context)
+            return await original(output, prompt, payload, context, flash)
+
+        self.model.generate = generate
+        await decide(self.factory, self.teacher, course.id, course.draft_version_id, "revise",
+                     "Установи 216 академических часов на курс и добавь в задание SQL проверку индекса.")
+        course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        async with self.factory() as db:
+            draft = await db.get(CourseVersion, course.draft_version_id)
+            self.assertEqual(draft.content["workload_proposal"]["total_hours"], 216)
+            assignment = draft.content["program"]["subjects"][0]["topics"][0]["assignments"][0]
+            self.assertEqual(assignment["instructions"], "Составьте SQL-запрос и проверьте работу индекса.")
+
+    async def test_refresh_keeps_discipline_ids_and_adds_evidence_to_existing_draft(self):
+        model = self.model.generate
+
+        async def old_model(output, prompt, payload, context, flash=False):
+            if output.__name__ == "SubjectRationaleBatch":
+                return output.model_validate({"items": []}, context=context)
+            return await model(output, prompt, payload, context, flash)
+
+        self.model.generate = old_model
+        course = await self.process()
+        original_id = course.draft_version_id
+        async with self.factory() as db:
+            original = await db.get(CourseVersion, original_id)
+            before = original.content["program"]["subjects"][0]
+            self.assertIsNone(before["inclusion_rationale"])
+
+        source = LiteratureSource("Практическое введение в SQL", ["А. Иванов"], "textbook", 2024,
+                                  "Издательство", "Каталог", None, "https://example.org/sql", 0.95)
+        parser = AsyncMock()
+        parser.find_many.return_value = [TopicLiterature("Базы данных", "SQL", [], [source])]
+        self.university_literature_enricher = partial(enrich_course_program, parser=parser)
+        self.model.generate = AsyncMock(side_effect=model)
+        await decide(self.factory, self.teacher, course.id, original_id, "refresh_materials")
+        course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        async with self.factory() as db:
+            revised = await db.get(CourseVersion, course.draft_version_id)
+            after = revised.content["program"]["subjects"][0]
+            self.assertEqual(after["id"], before["id"])
+            self.assertTrue(after["inclusion_rationale"])
+            self.assertTrue(any(ref["source_id"].startswith("Literature-") for ref in after["topics"][0]["learning_references"]))
+            self.assertEqual((await db.get(CourseVersion, original_id)).status, "archived")
+        self.assertEqual({call.args[0].__name__ for call in self.model.generate.call_args_list}, {"SubjectRationaleBatch"})
+
+    async def test_weak_and_strong_ai_rationale_excludes_weak_learners(self):
+        subject = program()["subjects"][0]
+        subject["title"] = "Теория слабого и сильного ИИ"
+        bad = source_record("Books", "https://example.org/boosting", "Бустинг",
+                            "Слабые классификаторы объединяются в сильную модель с помощью бустинга.")
+        good = source_record("RPD", "https://example.org/ai", "AI methods and models",
+                             "The objectives include acquaintance with the theory of weak (narrow) and strong AI.")
+        self.evidence.search.return_value = [bad, good]
+
+        async def generate(output, _prompt, payload, context, flash=False):
+            row = payload["disciplines"][0]
+            self.assertEqual([item["title"] for item in row["fragments"]], [good.title])
+            return output.model_validate({"items": [{"subject_id": row["subject_id"],
+                "explanation": "Дисциплина знакомит с теорией слабого и сильного искусственного интеллекта.",
+                "excerpt_ids": [row["fragments"][0]["excerpt_id"]]}]}, context=context)
+
+        llm = AsyncMock()
+        llm.generate.side_effect = generate
+        result, added = await explain_subjects({"title": "ML-инженер", "subjects": [subject]}, {},
+                                               self.evidence, llm, "teacher")
+        self.assertEqual(result["subjects"][0]["inclusion_rationale"]["source_ids"], [good.source_id])
+        self.assertEqual(added, [good])
 
     async def test_direct_course_review_export_and_audit(self):
         notes = ["Books: использован сохранённый снимок."]

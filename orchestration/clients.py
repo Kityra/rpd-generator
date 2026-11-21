@@ -7,8 +7,8 @@ from typing import Any, Protocol, TypeVar
 from openai import APIResponseValidationError, APIStatusError
 from pydantic import BaseModel, ValidationError, ValidationInfo, model_validator
 
-from domain.schemas import (ActivityAspect, ActivityProcess, ActivityTask, AppliedActivityModel, EvidenceResults,
-                            Model, SourceRecord)
+from domain.schemas import (ActivityAspect, ActivityProcess, ActivityTask, AppliedActivityModel, CourseProgramModel,
+                            EvidenceResults, Model, SourceRecord, SubjectPlan)
 from orchestration.evidence_cache import source_record
 from orchestration.resilience import ExternalUnavailable, snapshot_notice
 from orchestration.yandex_calls import InvalidIndexResponse, model_response, search_fragments
@@ -125,8 +125,12 @@ class YandexModelClient:
 
     def _generate(self, output: type[Output], prompt: str, payload: dict[str, Any],
                   context: dict[str, Any], flash: bool) -> Output:
-        model = (f"gpt://{self.settings['YANDEX_FOLDER_ID']}/aliceai-llm-flash" if flash
-                 else self.settings["YANDEX_MODEL_URI"])
+        if flash:
+            model = f"gpt://{self.settings['YANDEX_FOLDER_ID']}/aliceai-llm-flash"
+        elif output in (CourseProgramModel, SubjectPlan):
+            model = self.settings.get("YANDEX_MODEL_URI_COURSE_DESIGN") or self.settings["YANDEX_MODEL_URI"]
+        else:
+            model = self.settings["YANDEX_MODEL_URI"]
         request = payload
         draft_batch = "batch_subjects" in payload
         with open_yandex(self.settings) as client:
@@ -164,6 +168,7 @@ class YandexEvidenceClient:
             "university": ("RPD", "Books"), "interview": ("Interview",),
             "factcheck": ("Priklad", "HH", "Books"), "science": (),
             "subject_rationale": ("Books", "RPD"),
+            "subject_rationale_extended": ("Books", "RPD", "Priklad"),
         }
         if role not in indexes:
             raise ValueError(f"Неизвестная роль поиска {role}.")
@@ -174,6 +179,7 @@ class YandexEvidenceClient:
             logger.warning("%s", message)
 
         with open_yandex(self.settings) as client:
+            rationale_search = role in {"subject_rationale", "subject_rationale_extended"}
             for index in indexes[role]:
                 store = self.settings.get(f"YANDEX_VECTOR_STORE_ID_{index.upper()}")
                 required = index == "RPD" and role == "university"
@@ -184,8 +190,9 @@ class YandexEvidenceClient:
                     continue
                 try:
                     fragments, taken_at = search_fragments(
-                        client, self.settings, index, store, query, 2 if role == "subject_rationale" else 4,
-                        scope=("portal", owner_scope, role), budget=12 if role == "subject_rationale" else 30,
+                        client, self.settings, index, store, query,
+                        {"subject_rationale": 2, "subject_rationale_extended": 10}.get(role, 4),
+                        scope=("portal", owner_scope, role), budget=12 if rationale_search else 30,
                     )
                 except (APIStatusError, APIResponseValidationError, ExternalUnavailable, InvalidIndexResponse) as error:
                     if required:

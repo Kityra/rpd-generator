@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from typing import Annotated, Any, Protocol, TypedDict
 from uuid import NAMESPACE_URL, uuid5
@@ -8,12 +9,14 @@ from uuid import NAMESPACE_URL, uuid5
 from langgraph.graph import END, START, StateGraph
 from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
+from openai import APIResponseValidationError, APIStatusError
 from pydantic import ValidationError
 
 from auth.settings import Settings
 from domain.schemas import (AppliedActivityModel, BusinessCourseAudit, CourseProgramModel, GapReport,
                             Grounded, INDEPENDENT_EXPERT_SOURCE_TYPES, InterviewTurn, Model, RelevanceDecision, SourceRecord, SubjectPlan,
                             VerificationReport, all_blocks, block_value)
+from domain.workload import WorkloadEdit, apply_workload_edit, proposal_from_loads, propose_workload
 from orchestration.clients import EvidenceClient, ModelClient, NoActivityEvidence, source_record
 from orchestration import prompts
 from orchestration.draft import make_outline
@@ -28,6 +31,8 @@ from run_rpd import YandexModeratedResponse
 AUTO_DRAFT_SUBJECT_LIMIT = 12
 DRAFT_SUBJECT_BATCH_SIZE = 4
 BUSINESS_SOURCE_TYPES = frozenset({"Priklad", "HH", SOURCE}) | VACANCY_SOURCE_TYPES
+WORKLOAD_REQUEST = re.compile(
+    r"\b(?:час(?:ы|ов|а|ам|ами)?|з\s*\.\s*е\.?|зе|зач[её]тн\w*\s+единиц\w*|учебн\w*\s+нагрузк\w*)\b", re.I)
 
 
 def merge_records(previous: list[dict], additions: list[dict]) -> list[dict]:
@@ -73,6 +78,10 @@ class GraphState(TypedDict, total=False):
     revision_baseline: dict | None
     review_feedback: list[dict]
     review_iteration: int
+    refresh_only: bool
+    workload_only: bool
+    workload_proposal: dict | None
+    workload_notice: str
     status: str
     version_id: str
     consumed_review_id: str
@@ -107,7 +116,7 @@ class WorkflowStore(Protocol):
 
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
                          scheduled: bool, activity: dict, *, evidence_gaps: dict, source_notices: list[str],
-                         vacancy_source_ids: list[str]) -> None:
+                         vacancy_source_ids: list[str], workload_proposal: dict) -> None:
         """Сохранить версию и уведомление."""
 
     async def finish_review(self, course_id: str, version_id: str, action: str, actor: str, workloads=None) -> None:
@@ -158,6 +167,7 @@ def context(state: GraphState) -> dict:
 def payload(state: GraphState) -> dict:
     excluded = {"interview_answers", "verification", "owner_user_id", "request_id", "run_id",
                 "interview_session_id", "interrupt_id", "version_id", "consumed_review_id", "closed_interview_id"}
+    excluded.update({"workload_proposal", "workload_only", "workload_notice"})
     result = {key: value for key, value in state.items() if key not in excluded}
     if "review_feedback" in result:
         result["review_feedback"] = [{"content": item.get("content", ""), "attachments": item.get("attachments", [])}
@@ -184,6 +194,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         await store.set_status(state["request_id"], "agents_running", state["owner_user_id"])
         return {"status": "agents_running", "interview_round": 0, "review_iteration": 0,
                 "interview_answers": [], "review_feedback": [], "revision_baseline": None,
+                "refresh_only": False, "workload_only": False, "workload_notice": "",
                 "interview_source_notices": [], "factcheck_source_notices": [], "draft_source_notices": [],
                 "literature_source_notices": [],
                 "applied_activity": {}, "gap_report": {}, "verification": {}, "auto_subjects": {},
@@ -205,7 +216,12 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                                             {"course": state["course_meta"],
                                              "sources": [item.model_dump(mode="json") for item in sources],
                                              "source_notices": notices}, {"sources": source_map}, flash=True)
-            except ExternalUnavailable:
+            except YandexModeratedResponse:
+                logging.getLogger(__name__).warning("Yandex ограничила анализ источников агента %s.", role)
+                report = AgentReport(findings=[])
+                sources = []
+                notices = [*notices, f"{role}: Yandex AI Studio ограничила анализ этой подборки источников."]
+            except (ExternalUnavailable, ValidationError):
                 report = AgentReport(findings=[])
                 notices = [*notices, f"{role}: модель не сформировала сводку. Сохранены исходные материалы."]
             report_data = {**report.model_dump(mode="json"), "source_notices": notices}
@@ -237,7 +253,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             if any(source.source_type == SOURCE for source in sources.values()):
                 instructions += "\n" + SOURCE_GUIDANCE
             model = await llm.generate(AppliedActivityModel, instructions, activity_input, {"sources": sources})
-        except NoActivityEvidence:
+        except (NoActivityEvidence, YandexModeratedResponse):
             return {"applied_activity": {}}
         return {"applied_activity": model.model_dump(mode="json")}
 
@@ -434,18 +450,21 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         try:
             audit = await llm.generate(BusinessCourseAudit, prompts.BUSINESS_AUDIT, audit_input, context(state), flash=True)
         except (ValidationError, RuntimeError):
-            if not batched:
-                raise
             notices = [*state.get("draft_source_notices", []), "Рыночная оценка пока недоступна."]
             return {"draft_source_notices": list(dict.fromkeys(notices))}
         updated = {**state["course_program"], "business_audit": audit.model_dump(mode="json")}
         if audit.suggested_changes and not batched:
-            program = await llm.generate(CourseProgramModel, prompts.DESIGN,
-                                        {**payload(state), "business_enrichment": audit.model_dump(mode="json")}, context(state))
-            audit = await llm.generate(BusinessCourseAudit, prompts.BUSINESS_AUDIT,
-                                       {**payload(state), "course_program": program.model_dump(mode="json")},
-                                       context(state), flash=True)
-            updated = {**program.model_dump(mode="json"), "business_audit": audit.model_dump(mode="json")}
+            try:
+                program = await llm.generate(CourseProgramModel, prompts.DESIGN,
+                                             {**payload(state), "business_enrichment": audit.model_dump(mode="json")},
+                                             context(state))
+                audit = await llm.generate(BusinessCourseAudit, prompts.BUSINESS_AUDIT,
+                                           {**payload(state), "course_program": program.model_dump(mode="json")},
+                                           context(state), flash=True)
+                updated = {**program.model_dump(mode="json"), "business_audit": audit.model_dump(mode="json")}
+            except (ValidationError, RuntimeError):
+                notices = [*state.get("draft_source_notices", []), "Рыночные предложения сохранены в отчёте для проверки."]
+                return {"course_program": updated, "draft_source_notices": list(dict.fromkeys(notices))}
         checked = CourseProgramModel.model_validate(updated, context=context(state))
         return {"course_program": checked.model_dump(mode="json")}
 
@@ -484,10 +503,17 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         scheduled = state.get("mode") == "relevance"
         gaps = state["gap_report"]
         evidence_gaps = {key: gaps[key] for key in ("gap_types", "business_coverage", "science_coverage") if key in gaps}
+        previous = state.get("workload_proposal")
+        proposal = propose_workload(state["course_program"]["subjects"], previous)
+        notices = run_source_notices(state)
+        if notice := state.get("workload_notice"):
+            notices.append(notice)
         await store.save_draft(state["request_id"], identifier, program, scheduled, state["applied_activity"],
-                               evidence_gaps=evidence_gaps, source_notices=run_source_notices(state),
-                               vacancy_source_ids=state["business_report"].get("vacancy_source_ids", []))
-        return {"version_id": identifier, "status": "pending_update_review" if scheduled else "waiting_for_review"}
+                               evidence_gaps=evidence_gaps, source_notices=notices,
+                               vacancy_source_ids=state["business_report"].get("vacancy_source_ids", []),
+                               workload_proposal=proposal)
+        return {"version_id": identifier, "workload_proposal": proposal,
+                "status": "pending_update_review" if scheduled else "waiting_for_review"}
 
     async def review(state: GraphState) -> dict:
         decision = interrupt({"interrupt_id": state["version_id"], "prompt": "Утвердите курс или укажите правки.", "kind": "teacher"})
@@ -499,41 +525,76 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         if action in {"approve", "reject"}:
             await store.finish_review(state["request_id"], state["version_id"], action, decision["actor_user_id"], decision.get("workloads"))
             return {"status": "approved", "consumed_review_id": state["version_id"]}
+        if action == "refresh_materials":
+            await store.set_status(state["request_id"], "collecting_literature", state["owner_user_id"])
+            return {"consumed_review_id": state["version_id"], "refresh_only": True, "workload_only": False,
+                    "review_iteration": state.get("review_iteration", 0) + 1,
+                    "revision_baseline": state["course_program"], "status": "collecting_literature",
+                    "workload_proposal": decision.get("workload_proposal") or state.get("workload_proposal")}
         if action != "revise" or not decision.get("content"):
             raise ValueError("Укажите правку или решение ревью.")
+        subjects = state["course_program"]["subjects"]
+        proposal = propose_workload(subjects, proposal_from_loads(decision.get("workloads") or {})
+                                    or decision.get("workload_proposal") or state.get("workload_proposal"))
+        workload_only = False
+        notice = ""
+        if WORKLOAD_REQUEST.search(decision["content"]):
+            edit = None
+            try:
+                edit = await llm.generate(WorkloadEdit, prompts.WORKLOAD_EDIT, {
+                    "feedback": decision["content"], "total_hours": proposal["total_hours"],
+                    "hours_per_credit": proposal["hours_per_credit"],
+                    "subjects": [{"subject_id": subject["id"], "title": subject["title"],
+                                  "hours": proposal["loads"][subject["id"]]} for subject in subjects],
+                    "attachments": [{"name": f["name"], "text": f["text"][:6000]} for f in decision.get("attachments", [])],
+                }, {}, flash=True)
+                workload_only = edit.workload_only
+                if workload_only or any((edit.subjects, edit.distribute_evenly, edit.total_hours,
+                                         edit.total_credits, edit.hours_per_credit)):
+                    proposal = apply_workload_edit(subjects, proposal, edit)
+            except ValueError as error:
+                notice = str(error) if not isinstance(error, ValidationError) else "Уточните числовые параметры нагрузки."
+                workload_only = edit is None or edit.workload_only
+            except (RuntimeError, APIStatusError, APIResponseValidationError):
+                notice = "Не удалось обработать уточнение нагрузки. Сохранена предыдущая разбивка часов."
+                workload_only = True
+        update = {"consumed_review_id": state["version_id"], "review_iteration": state.get("review_iteration", 0) + 1,
+                  "revision_baseline": state["course_program"], "status": "designing", "refresh_only": False,
+                  "workload_only": workload_only, "workload_proposal": proposal, "workload_notice": notice}
+        if workload_only:
+            return update
         url = f"{settings.public_origin}/teacher?course={state['request_id']}&version={state['version_id']}"
         records = [source_record("teacher", url, "Правка преподавателя", decision["content"])]
         records.extend(source_record("teacher", url, file["name"], file["text"]) for file in decision.get("attachments", []))
-        return {"consumed_review_id": state["version_id"], "review_feedback": [*state.get("review_feedback", []), decision],
-                "review_iteration": state.get("review_iteration", 0) + 1,
-                "revision_baseline": state["course_program"], "sources": [r.model_dump(mode="json") for r in records],
-                "status": "designing"}
+        return {**update, "review_feedback": [*state.get("review_feedback", []), decision],
+                "sources": [r.model_dump(mode="json") for r in records]}
 
-    graph = StateGraph(GraphState)
-    graph.add_node("start", start)
-    roles = ("business", "science", "books", "university")
-    for role in roles:
-        graph.add_node(role, agent(role))
-        graph.add_edge("start", role)
-    nodes = {"relevance": relevance, "formalize": formalize, "university_audit": university_audit,
-             "gap_analysis": gap_analysis, "prepare_interview": prepare_interview, "interview": interview,
-             "factcheck": factcheck, "design": design, "business_audit": business_audit,
-             "subject_rationale": subject_rationale, "persist_review": persist_review, "review": review}
-    def guarded(node):
+    def guarded(name, node):
         async def execute(state: GraphState) -> dict:
             try:
                 return await node(state)
             except GraphBubbleUp:
                 raise
-            except Exception:
+            except Exception as error:
+                logging.getLogger(__name__).error("Этап %s курса %s: %s", name, state["request_id"], type(error).__name__)
                 await store.set_status(state["request_id"], "failed", state["owner_user_id"])
                 raise
         return execute
 
+    graph = StateGraph(GraphState)
+    graph.add_node("start", start)
+    roles = ("business", "science", "books", "university")
+    for role in roles:
+        graph.add_node(role, guarded(role, agent(role)))
+        graph.add_edge("start", role)
+    nodes = {"relevance": relevance, "formalize": formalize, "university_audit": university_audit,
+             "gap_analysis": gap_analysis, "prepare_interview": prepare_interview, "interview": interview,
+             "factcheck": factcheck, "design": design, "business_audit": business_audit,
+             "subject_rationale": subject_rationale, "persist_review": persist_review, "review": review}
     for name, node in nodes.items():
-        graph.add_node(name, guarded(node))
+        graph.add_node(name, guarded(name, node))
     # Сохраняем ключ узла для возобновления сохранённых запусков.
-    graph.add_node("literature", guarded(university_literature), metadata={"agent": "University"})
+    graph.add_node("literature", guarded("literature", university_literature), metadata={"agent": "University"})
     graph.add_edge(START, "start")
     graph.add_edge(list(roles), "relevance")
     graph.add_conditional_edges("relevance", lambda state: "formalize" if state["needs_update"] else END)
@@ -550,5 +611,12 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     graph.add_edge("subject_rationale", "literature")
     graph.add_edge("literature", "persist_review")
     graph.add_edge("persist_review", "review")
-    graph.add_conditional_edges("review", lambda state: END if state["status"] == "approved" else "design")
+    def after_review(state):
+        if state["status"] == "approved":
+            return END
+        if state.get("workload_only"):
+            return "persist_review"
+        return "subject_rationale" if state.get("refresh_only") else "design"
+
+    graph.add_conditional_edges("review", after_review)
     return graph.compile(checkpointer=checkpointer)

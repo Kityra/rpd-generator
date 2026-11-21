@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import importlib.util
@@ -178,6 +179,29 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 await service.login("teacher@example.org", "wrong", "127.0.0.1", "test")
         with self.assertRaises(PermissionError):
             await service.login("teacher@example.org", "test-password", "127.0.0.1", "test")
+
+    async def test_login_does_not_hold_sqlite_write_lock_during_directory_lookup(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original = self.users.get_by_email
+
+        async def slow_lookup(email):
+            started.set()
+            await release.wait()
+            return await original(email)
+
+        service = AuthService(self.settings, self.users, ExistingPasswordVerifier(), self.factory)
+        with patch.object(self.users, "get_by_email", side_effect=slow_lookup):
+            login = asyncio.create_task(service.login("teacher@example.org", "test-password", "127.0.0.1", "test"))
+            try:
+                await asyncio.wait_for(started.wait(), timeout=2)
+                async with self.engine.connect() as connection:
+                    await asyncio.wait_for(connection.execute(text("BEGIN IMMEDIATE")), timeout=2)
+                    await connection.commit()
+            finally:
+                release.set()
+                token = await login
+        self.assertIsNotNone(await service.authenticate(token))
 
     async def test_migration_keeps_existing_user_schema(self):
         from alembic.migration import MigrationContext

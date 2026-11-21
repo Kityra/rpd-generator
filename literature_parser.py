@@ -45,6 +45,7 @@ from xml.etree import ElementTree
 
 import httpx
 
+from literature_catalog import references_for_discipline
 
 logger = logging.getLogger(__name__)
 
@@ -2422,13 +2423,17 @@ def is_junk_reference(reference: dict, sources: dict[str, Any]) -> bool:
 def clean_references(references: list[dict], sources: dict[str, Any]) -> list[dict]:
     result: list[dict] = []
     titles: list[str] = []
+    urls: set[str] = set()
     for reference in references:
         if is_junk_reference(reference, sources) or any(r["source_id"] == reference["source_id"] for r in result):
             continue
         record = sources.get(reference["source_id"])
         title = _record_field(record, "title") if record is not None else reference.get("locator", "")
-        if any(similar_titles(title, seen) for seen in titles):
+        url = url_key(_record_field(record, "url")) if record else ""
+        if (url and url in urls) or any(similar_titles(title, seen) for seen in titles):
             continue
+        if url:
+            urls.add(url)
         titles.append(title)
         result.append(reference)
     return result
@@ -2447,19 +2452,37 @@ async def enrich_course_program(program: dict, sources: dict[str, Any], *, parse
     Возвращает обновлённую программу, новые SourceRecord и результаты поиска по темам.
     """
     updated = copy.deepcopy(program)
+    subjects = updated.get("subjects", [])
+    reinforcement_learning = any("подкреплением" in subject["title"].casefold() for subject in subjects)
+    shared_topics = Counter(clean(topic["title"]).casefold() for subject in subjects for topic in subject.get("topics", []))
+    curated = {}
+    for subject in subjects:
+        title = clean(subject["title"])
+        references = references_for_discipline(title, reinforcement_learning=reinforcement_learning)
+        if references:
+            curated[title] = [LiteratureSource(ref.title, list(ref.authors), ref.kind, ref.year, ref.publisher,
+                                               "Библиографическая запись автора или издателя", ref.pdf, ref.url, 1.0,
+                                               doi=ref.doi) for ref in references]
 
     def lookup_title(topic: str, discipline: str) -> str:
-        return clean(discipline if topic == f"Основные понятия дисциплины «{discipline}»" else topic)
+        broad = topic == f"Основные понятия дисциплины «{discipline}»" or shared_topics[clean(topic).casefold()] > 1
+        return clean(discipline if broad else topic)
 
     pairs = list(dict.fromkeys((lookup_title(topic["title"], subject["title"]), clean(subject["title"]))
-                               for subject in updated.get("subjects", []) for topic in subject.get("topics", [])))
+                               for subject in subjects for topic in subject.get("topics", [])))
+    # Книжный каталог закрывает общие и повторяющиеся темы. По конкретным новым темам работает поиск.
+    multi_topic = {clean(subject["title"]) for subject in subjects if len(subject.get("topics", [])) > 1}
+    search_pairs = [(topic, discipline) for topic, discipline in pairs
+                    if discipline not in curated or (topic != discipline and discipline in multi_topic)]
     own = parser is None
-    active = parser or LiteratureParser(llm_expander=llm_expander)
-    try:
-        results = await active.find_many(pairs)
-    finally:
-        if own:
-            await active.aclose()
+    results = []
+    if search_pairs:
+        active = parser or LiteratureParser(llm_expander=llm_expander)
+        try:
+            results = await active.find_many(search_pairs)
+        finally:
+            if own:
+                await active.aclose()
     by_pair = {(result.topic, result.discipline): result for result in results}
     records: dict[str, Any] = {}
     registry = dict(sources)
@@ -2473,18 +2496,20 @@ async def enrich_course_program(program: dict, sources: dict[str, Any], *, parse
             refs.append(literature_reference(item, record))
         return refs
 
-    for subject in updated.get("subjects", []):
+    for subject in subjects:
         subject_sources: list[LiteratureSource] = []
+        discipline = clean(subject["title"])
         for topic in subject.get("topics", []):
-            result = by_pair.get((lookup_title(topic["title"], subject["title"]), clean(subject["title"])))
-            found = result.sources if result else []
+            target = lookup_title(topic["title"], subject["title"])
+            result = by_pair.get((target, discipline))
+            found = result.sources if result else curated.get(discipline, []) if target == discipline else []
             subject_sources.extend(found)
             merged = clean_references([*attach(found), *topic.get("learning_references", [])], registry)
             topic["learning_references"] = merged or topic.get("learning_references", [])
             for assignment in topic.get("assignments", []):
                 kept = clean_references(assignment.get("learning_references", []), registry)
                 assignment["learning_references"] = kept or attach(found[:1]) or assignment.get("learning_references", [])
-        kept = clean_references(subject.get("learning_references", []), registry)
+        kept = clean_references([*attach(curated.get(discipline, [])), *subject.get("learning_references", [])], registry)
         if not kept:
             best = max(subject_sources, key=lambda item: (item.type == "textbook", item.relevance_score),
                        default=None)

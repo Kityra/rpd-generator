@@ -5,7 +5,8 @@ import streamlit as st
 from sqlalchemy import select
 
 from apps.common import composer, portal
-from domain.export import HOURS, block_html, export_course, rationale_report_html, source_html
+from domain.export import block_html, export_course, rationale_report_html, source_html
+from domain.workload import HOURS, MAX_HOURS, proposal_from_loads, propose_workload
 from storage.models import Course, CourseVersion, Interview, Notification, SourceRow
 from storage.portal import acknowledge, create_course, decide, finish_without_answer, retry_command
 from storage.workflow import SqlWorkflowStore
@@ -71,20 +72,28 @@ async def new_course(actor, factory):
         st.rerun()
 
 
-def workload_form(subjects, version_id, previous):
+def workload_form(subjects, version_id, proposal):
     loads = {}
     with st.expander("Учебная нагрузка по дисциплинам"):
-        st.caption("Отметьте дисциплины с утверждёнными часами. Сумму часов и ЗЕ приложение рассчитает при экспорте.")
+        if proposal["origin"] == "default":
+            st.caption("Черновой ориентир для всего курса — 60 з.е. по 36 акад. ч. Сверьте объём с учебным планом.")
+        else:
+            st.caption("Черновая нагрузка. Проверьте значения перед утверждением курса.")
+        rate = st.number_input("Академических часов в 1 з.е.", min_value=1, max_value=1000,
+                               value=proposal["hours_per_credit"], key=f"workload-rate-{version_id}")
         for subject in subjects:
             key = f"load-{version_id}-{subject['id']}"
-            saved = previous.get(subject["id"], {})
-            if st.checkbox(subject["title"], key=key, value=bool(saved)):
-                fields = {}
-                for field, label in HOURS.items():
-                    fields[field] = st.number_input(label, min_value=0, max_value=10000, value=saved.get(field, 0), key=f"{key}-{field}")
-                rate = st.number_input("Часов в одной ЗЕ", min_value=1, max_value=1000,
-                                       value=saved.get("hours_per_credit", None), key=key + "-rate")
-                loads[subject["id"]] = {**fields, "hours_per_credit": rate}
+            saved = proposal["loads"][subject["id"]]
+            st.text(subject["title"])
+            columns = st.columns(len(HOURS))
+            fields = {field: column.number_input(label, min_value=0, max_value=MAX_HOURS,
+                                                  value=saved.get(field, 0), key=f"{key}-{field}")
+                      for (field, label), column in zip(HOURS.items(), columns, strict=True)}
+            total = sum(fields.values())
+            st.caption(f"{total} акад. ч. · {total / rate:.2f} з.е.")
+            loads[subject["id"]] = {**fields, "hours_per_credit": rate}
+        total = sum(row[field] for row in loads.values() for field in HOURS)
+        st.caption(f"Итого по курсу — {total} акад. ч. · {total / rate:.2f} з.е.")
     return loads
 
 
@@ -156,7 +165,14 @@ async def course_detail(actor, settings, factory, users, course, notices):
     interview_results(interviews, registry)
     if draft and course.status in {"waiting_for_review", "pending_update_review"}:
         update = bool(active)
-        loads = workload_form(draft.content["program"]["subjects"], draft.id, active.content.get("workloads", {}) if active else {})
+        if st.button("Обновить материалы и обоснования"):
+            await decide(factory, actor, course.id, draft.id, "refresh_materials")
+            st.rerun()
+        previous = draft.content.get("workload_proposal")
+        if not previous and active:
+            previous = proposal_from_loads(active.content.get("workloads", {}))
+        proposal = propose_workload(draft.content["program"]["subjects"], previous)
+        loads = workload_form(draft.content["program"]["subjects"], draft.id, proposal)
         if st.button("Утвердить изменения" if update else "Утвердить курс", type="primary"):
             await decide(factory, actor, course.id, draft.id, "approve", workloads=loads)
             st.rerun()
@@ -166,7 +182,8 @@ async def course_detail(actor, settings, factory, users, course, notices):
         with st.container():
             change = composer("Что изменить или уточнить", f"edit-{draft.id}")
         if change:
-            await decide(factory, actor, course.id, draft.id, "revise", *change)
+            await decide(factory, actor, course.id, draft.id, "revise", *change,
+                         workloads=loads if loads != proposal["loads"] else None)
             st.rerun()
     if active:
         st.download_button(f"Скачать утверждённую версию {active.revision} · ZIP",
