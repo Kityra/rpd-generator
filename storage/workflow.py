@@ -166,5 +166,7 @@ class SqlWorkflowStore:
     async def defer_audit(self, course_id: str) -> None:
         async with write_transaction(self.factory) as db:
             course = await db.get(Course, course_id)
+            if course.status == "approved" and course.next_audit_at and aware(course.next_audit_at) > datetime.now(timezone.utc):
+                return
             course.status = "approved"
             course.next_audit_at = datetime.now(timezone.utc) + timedelta(days=270)

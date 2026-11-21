@@ -3,7 +3,6 @@ from typing import Annotated, Any, Protocol, TypedDict
 from uuid import NAMESPACE_URL, uuid5
 
 from langgraph.graph import END, START, StateGraph
-from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 from pydantic import ValidationError
 
@@ -370,19 +369,9 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
              "gap_analysis": gap_analysis, "prepare_interview": prepare_interview, "interview": interview,
              "factcheck": factcheck, "design": design, "business_audit": business_audit,
              "persist_review": persist_review, "review": review}
-    def guarded(node):
-        async def execute(state: GraphState) -> dict:
-            try:
-                return await node(state)
-            except GraphBubbleUp:
-                raise
-            except Exception:
-                await store.set_status(state["request_id"], "failed", state["owner_user_id"])
-                raise
-        return execute
-
     for name, node in nodes.items():
-        graph.add_node(name, guarded(node))
+        # The worker handles temporary and permanent failures after checkpointing.
+        graph.add_node(name, node)
     graph.add_edge(START, "start")
     graph.add_edge(list(roles), "relevance")
     graph.add_conditional_edges("relevance", lambda state: "formalize" if state["needs_update"] else END)

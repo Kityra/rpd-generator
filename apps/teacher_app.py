@@ -6,7 +6,8 @@ from sqlalchemy import select
 
 from apps.common import composer, portal
 from domain.export import HOURS, block_html, course_export_block, export_course
-from storage.models import Course, CourseVersion, Interview, Notification, SourceRow
+from domain.workflow_queue import ERROR_LABELS, MAX_ATTEMPTS, QUEUED_COURSE_STATUS
+from storage.models import Course, CourseVersion, Interview, Notification, SourceRow, WorkflowCommand
 from storage.portal import acknowledge, create_course, decide, recheck_official_rpd, retry_command
 from storage.workflow import SqlWorkflowStore
 
@@ -66,11 +67,28 @@ async def course_detail(actor, settings, factory, users, course, notices):
     if any(n.course_id == course.id and n.read_at is None for n in notices):
         await acknowledge(factory, actor, course.id)
     async with factory() as db:
+        commands = (await db.scalars(select(WorkflowCommand).where(WorkflowCommand.course_id == course.id,
+            WorkflowCommand.status.in_(("pending", "running", "failed")))
+            .order_by(WorkflowCommand.created_at.desc(), WorkflowCommand.id.desc()))).all()
         registry = {r.source_id: r.record for r in (await db.scalars(select(SourceRow).where(SourceRow.course_id == course.id))).all()}
         interviews = (await db.scalars(select(Interview).where(Interview.course_id == course.id)
                                       .order_by(Interview.created_at.desc()))).all()
         active = await db.get(CourseVersion, course.active_version_id) if course.active_version_id else None
         draft = await db.get(CourseVersion, course.draft_version_id) if course.draft_version_id else None
+    failed = next((item for item in commands if item.status == "failed" and item.kind in QUEUED_COURSE_STATUS), None)
+    for cmd in commands:
+        reason = ERROR_LABELS.get(cmd.last_error_code)
+        if cmd.status == "pending" and cmd.next_attempt_at:
+            label = "Проверка материалов РПД" if cmd.kind == "official_rpd" else "Обработка курса"
+            st.warning(f"{label}. Следующая попытка {cmd.attempt_count + 1} из {MAX_ATTEMPTS} "
+                       f"после {cmd.next_attempt_at:%d.%m.%Y %H:%M:%S} UTC. {reason or ''}")
+        elif cmd.status == "running" and cmd.attempt_count > 1:
+            st.info(f"Идёт повторная попытка {cmd.attempt_count} из {MAX_ATTEMPTS}.")
+    if course.status == "failed":
+        if failed:
+            st.error(ERROR_LABELS.get(failed.last_error_code, "Команда завершилась ошибкой."))
+        else:
+            st.info("Лимит уточнений исчерпан. Создайте заявку с уточнённой темой.")
     if interviews:
         for interview in interviews:
             claims = interview.gap_report.get("verification", {}).get("claims", [])
@@ -115,7 +133,11 @@ async def course_detail(actor, settings, factory, users, course, notices):
             lookups = [audit.get("lookup"), *audit.get("lookups", {}).values()]
             for detail in dict.fromkeys(entry["reason"] for entry in lookups if entry and entry.get("reason")):
                 st.caption(detail)
-            if st.button("Перепроверить материалы РПД", key=f"official-rpd-{item.id}"):
+            audit_command = next((cmd for cmd in commands if cmd.id == f"official-rpd:{item.id}"), None)
+            if audit_command and audit_command.status == "failed":
+                st.error(ERROR_LABELS.get(audit_command.last_error_code, "Проверка РПД завершилась ошибкой."))
+            if st.button("Перепроверить материалы РПД", key=f"official-rpd-{item.id}",
+                         disabled=bool(audit_command and audit_command.status in {"pending", "running"})):
                 await recheck_official_rpd(factory, actor, course.id, item.id)
                 st.info("Проверка поставлена в очередь. Результат появится после обновления статуса.")
             return False
@@ -162,7 +184,7 @@ async def course_detail(actor, settings, factory, users, course, notices):
                                export_course(course.course_meta, active, registry), f"course-v{active.revision}.zip", "application/zip")
         if course.next_audit_at:
             st.caption(f"Следующий аудит — {course.next_audit_at:%d.%m.%Y}")
-    if course.status == "failed" and st.button("Повторить обработку"):
+    if course.status == "failed" and failed and st.button("Повторить обработку"):
         await retry_command(factory, actor, course.id)
         st.rerun()
     st.button("Обновить статус")

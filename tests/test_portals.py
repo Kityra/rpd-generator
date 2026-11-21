@@ -5,7 +5,7 @@ import unittest
 from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from zipfile import ZipFile
 
 from sqlalchemy import select
@@ -20,11 +20,13 @@ from domain.schemas import EvidenceResults
 from orchestration.checkpointer import open_checkpointer
 from orchestration.evidence_cache import source_record
 from orchestration.graph import build_course_graph
+from orchestration.resilience import ExternalUnavailable
 from storage.database import make_engine
-from storage.models import Base, Course, CourseVersion, ExpertInvitation, Interview, Notification, SourceRow, WorkflowCommand, now
+from storage.models import Base, Course, CourseVersion, ExpertInvitation, Interview, InterviewMessage, Notification, SourceRow, WorkflowCommand, now
 from storage.portal import acknowledge, assigned_interviews, create_course, decide, recheck_official_rpd, schedule_due
 from storage.workflow import SqlWorkflowStore
 from test_course_architecture import program, records
+from workers import course_worker
 from workers.course_worker import process_next
 
 
@@ -131,8 +133,18 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             self.model.relevance = needs_update
             self.assertEqual(await schedule_due(self.factory, now() + timedelta(days=271)), 1)
             self.assertEqual(await schedule_due(self.factory, now() + timedelta(days=271)), 0)
+            if needs_update:
+                with patch.object(course_worker, "finish_command", side_effect=RuntimeError("after checkpoint")):
+                    with self.assertRaisesRegex(RuntimeError, "after checkpoint"):
+                        await self.process()
+                async with self.factory() as db:
+                    persisted = await db.get(Course, "course")
+                    self.assertIsNotNone(persisted.draft_version_id)
+                    draft_id = persisted.draft_version_id
             course = await self.process()
             self.assertEqual(course.status, "pending_update_review" if needs_update else "approved")
+            if needs_update:
+                self.assertEqual(course.draft_version_id, draft_id)
         async with self.factory() as db:
             self.assertEqual((await db.scalar(select(Notification))).user_id, self.teacher.id)
         await acknowledge(self.factory, self.teacher, course.id)
@@ -140,6 +152,59 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         course = await self.process()
         self.assertEqual(course.active_version_id, active)
         self.assertIsNone(course.draft_version_id)
+
+    async def test_retries_resume_interview_and_replay_review_after_completion(self):
+        self.model.gap = True
+        generate = self.model.generate
+
+        async def fail_first_at_each_stage(output, *args, **kwargs):
+            if output.__name__ in failures:
+                failures.remove(output.__name__)
+                raise ExternalUnavailable("simulated outage")
+            return await generate(output, *args, **kwargs)
+
+        failures = {"AppliedActivityModel", "VerificationReport"}
+        with patch.object(self.model, "generate", side_effect=fail_first_at_each_stage):
+            self.assertNotEqual((await self.process()).status, "failed")
+            async with self.factory() as db:
+                create = await db.get(WorkflowCommand, "create:course")
+                self.assertEqual((create.status, create.attempt_count), ("pending", 1))
+            with patch.object(course_worker, "now", return_value=now() + timedelta(hours=1)):
+                self.assertEqual((await self.process()).status, "waiting_for_expert")
+            self.assertEqual(sum(call.args[0] == "business" for call in self.evidence.search.call_args_list), 1)
+
+            async with self.factory() as db:
+                interview = await db.scalar(select(Interview))
+            expert = user("expert")
+            users = AsyncMock()
+            users.get_by_id.return_value = expert
+            token = await self.store.invite(interview.id, expert.id, self.teacher, users)
+            await self.store.submit_interview(token, expert, interview.interrupt_id, "submission", "Сверка", [])
+            self.assertNotEqual((await self.process()).status, "failed")
+            async with self.factory() as db:
+                cmd = await db.scalar(select(WorkflowCommand).where(WorkflowCommand.kind == "resume"))
+                self.assertEqual((cmd.status, cmd.attempt_count), ("pending", 1))
+            with patch.object(course_worker, "now", return_value=now() + timedelta(hours=1)):
+                course = await self.process()
+            self.assertEqual(course.status, "waiting_for_review")
+            async with self.factory() as db:
+                self.assertEqual(len((await db.scalars(select(InterviewMessage))).all()), 1)
+                cmd = await db.get(WorkflowCommand, cmd.id)
+                self.assertEqual((cmd.status, cmd.attempt_count), ("done", 2))
+
+        version_id = course.draft_version_id
+        await decide(self.factory, self.teacher, course.id, version_id, "approve")
+        with patch.object(self.store, "finish_review", wraps=self.store.finish_review) as applied:
+            with patch.object(course_worker, "finish_command", side_effect=RuntimeError("after checkpoint")):
+                with self.assertRaisesRegex(RuntimeError, "after checkpoint"):
+                    await self.process()
+            course = await self.process()
+            applied.assert_awaited_once()
+        self.assertEqual((course.status, course.active_version_id), ("approved", version_id))
+        async with self.factory() as db:
+            self.assertEqual(len((await db.scalars(select(CourseVersion))).all()), 1)
+            cmd = await db.get(WorkflowCommand, f"review:{version_id}")
+            self.assertEqual((cmd.status, cmd.attempt_count), ("done", 1))
 
     async def test_expert_then_teacher_revision(self):
         self.model.gap = True

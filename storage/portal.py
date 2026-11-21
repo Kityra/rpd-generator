@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from auth.user_repository import CurrentUser
 from domain.export import workload
+from domain.workflow_queue import QUEUED_COURSE_STATUS
 from storage.database import write_transaction
 from storage.models import Course, CourseVersion, ExpertInvitation, Interview, Notification, WorkflowCommand
 
@@ -82,9 +83,10 @@ async def recheck_official_rpd(factory: async_sessionmaker[AsyncSession], actor:
         if command is None:
             db.add(WorkflowCommand(id=key, course_id=course_id, kind="official_rpd",
                                    payload={"version_id": version_id}))
-        elif command.status != "pending":
+        elif command.status in {"done", "failed"}:
             command.status = "pending"
             command.created_at = datetime.now(timezone.utc)
+            command.attempt_count, command.next_attempt_at, command.last_error_code = 0, None, None
 
 
 async def schedule_due(factory: async_sessionmaker[AsyncSession], at: datetime | None = None) -> int:
@@ -106,10 +108,12 @@ async def retry_command(factory: async_sessionmaker[AsyncSession], actor: Curren
         if course is None or course.status != "failed":
             raise ValueError("Заявка недоступна для повторного запуска.")
         command = await db.scalar(select(WorkflowCommand).where(WorkflowCommand.course_id == course.id,
-                                  WorkflowCommand.status == "failed").order_by(WorkflowCommand.created_at.desc()))
+                                  WorkflowCommand.status == "failed", WorkflowCommand.kind.in_(QUEUED_COURSE_STATUS))
+                                  .order_by(WorkflowCommand.created_at.desc(), WorkflowCommand.id.desc()).limit(1))
         if command is None:
             raise ValueError("Лимит уточнений исчерпан. Создайте заявку с уточнённой темой.")
-        command.status, course.status = "pending", "queued"
+        command.status, course.status = "pending", QUEUED_COURSE_STATUS[command.kind]
+        command.attempt_count, command.next_attempt_at, command.last_error_code = 0, None, None
 
 
 def assigned_interviews(actor: CurrentUser, *, token_hash: str | None = None):

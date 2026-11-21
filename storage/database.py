@@ -79,12 +79,21 @@ def make_engine(url: str) -> AsyncEngine:
 
 async def table_state(url: str) -> tuple[set[str], set[str]]:
     """Возвращает отсутствующие и уже существующие таблицы приложения."""
-    from storage.models import Base
+    from storage.models import Base, WorkflowCommand
+
+    def inspect_schema(sync):
+        inspector = inspect(sync)
+        existing = set(inspector.get_table_names())
+        if "workflow_commands" in existing and set(Base.metadata.tables) <= existing:
+            columns = {column["name"] for column in inspector.get_columns("workflow_commands")}
+            if set(WorkflowCommand.__table__.columns.keys()) - columns:
+                raise DatabaseSetupError("Примените миграции базы приложения: python -m alembic upgrade head.")
+        return existing
 
     engine = make_engine(url)
     try:
         async with engine.connect() as connection:
-            existing = set(await connection.run_sync(lambda sync: inspect(sync).get_table_names()))
+            existing = await connection.run_sync(inspect_schema)
     finally:
         await engine.dispose()
     expected = set(Base.metadata.tables)
