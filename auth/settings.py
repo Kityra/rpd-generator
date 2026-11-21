@@ -2,12 +2,16 @@ from typing import Literal
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+
+from storage.database import DEFAULT_APP_DATABASE_URL, LEGACY_CHECKPOINT_PATH, postgres_dsn
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8-sig", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8-sig", extra="ignore",
+                                      hide_input_in_errors=True)
 
-    app_database_url: str = "sqlite+aiosqlite:///./data/application.sqlite"
+    app_database_url: str = Field(default=DEFAULT_APP_DATABASE_URL, repr=False)
     user_database_url: str = ""
     teachers_index_id: str = ""
     experts_index_id: str = ""
@@ -37,7 +41,7 @@ class Settings(BaseSettings):
     allow_rehash_on_login: bool = False
     session_signing_key: SecretStr
     app_env: Literal["development", "production"] = "development"
-    checkpoint_url: str = "data/checkpoints.sqlite"
+    checkpoint_url: str = Field(default="", repr=False)
     public_origin: str = "http://localhost:8501"
     business_coverage_threshold: float = Field(default=0.6, ge=0, le=1)
     science_coverage_threshold: float = Field(default=0.6, ge=0, le=1)
@@ -62,6 +66,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_auth(self) -> "Settings":
+        backend = make_url(self.app_database_url).get_backend_name()
+        if not self.checkpoint_url:
+            self.checkpoint_url = (postgres_dsn(self.app_database_url) if backend in {"postgres", "postgresql"}
+                                   else LEGACY_CHECKPOINT_PATH)
         if len(self.session_signing_key.get_secret_value()) < 32:
             raise ValueError("SESSION_SIGNING_KEY должен содержать минимум 32 символа.")
         if self.allow_rehash_on_login:

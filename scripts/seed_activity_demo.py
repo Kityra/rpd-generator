@@ -11,7 +11,6 @@
 """
 
 import argparse
-import asyncio
 import hashlib
 import random
 from datetime import date, datetime, timedelta, timezone
@@ -25,7 +24,7 @@ from auth.settings import Settings
 from storage.activity_models import (ActivityClaim, ActivityExpert, ActivityItem, ActivityMergeLog, ActivitySource,
                                      ClaimLink, DisciplineLink, ExpertVote, ItemLink, ItemMetrics, ModelVersionRow,
                                      Profession, Program, ProgramDiscipline, Recommendation)
-from storage.database import ensure_schema, make_engine, write_transaction
+from storage.database import ensure_schema, make_engine, run_async, write_transaction
 
 from activity import store
 from activity.extract import ClaimDraft, verify
@@ -577,7 +576,7 @@ def main() -> None:
     parser.add_argument("--expert-login", default="expert@demo.local", help="логин эксперта для прохождения анкеты")
     arguments = parser.parse_args()
     ensure_schema(Settings().app_database_url)
-    asyncio.run(run(arguments.head_login, arguments.teacher_login, arguments.expert_login, arguments.reset))
+    run_async(run(arguments.head_login, arguments.teacher_login, arguments.expert_login, arguments.reset))
 
 
 if __name__ == "__main__":

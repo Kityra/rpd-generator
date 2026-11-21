@@ -20,6 +20,7 @@ COPY rabota_it/ rabota_it/
 COPY storage/ storage/
 COPY apps/ apps/
 COPY workers/ workers/
+COPY scripts/migrate_sqlite_to_postgres.py scripts/
 COPY alembic.ini ./
 RUN mkdir -p /app/data && chown appuser:appuser /app/data
 

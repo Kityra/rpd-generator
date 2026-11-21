@@ -1,15 +1,15 @@
-import asyncio
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import streamlit as st
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
 from streamlit.components.v1 import declare_component
 
 from auth.settings import Settings
 from orchestration.clients import YandexModelClient
 from run_rpd import yandex_settings
-from storage.database import DatabaseSetupError, ensure_schema, make_engine
+from storage.database import DatabaseSetupError, ensure_schema, make_engine, run_async
 from storage.profession_boundaries import submit_boundary_turn, validate_boundary_invite
 
 
@@ -75,6 +75,6 @@ def main():
     try:
         settings = Settings()
         ensure_schema(settings.app_database_url)
-        asyncio.run(guest_interview(settings, token))
-    except (DatabaseSetupError, ValueError):
+        run_async(guest_interview(settings, token))
+    except (DatabaseSetupError, SQLAlchemyError, OSError, ValueError):
         st.error("Интервью временно недоступно.")

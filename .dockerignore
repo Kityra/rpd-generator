@@ -8,3 +8,5 @@ transfer
 tests
 **/__pycache__
 *.sqlite*
+*.zip
+scenario_results

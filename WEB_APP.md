@@ -4,15 +4,19 @@
 
 ## Запуск
 
-В корне проекта заполните .env по .env.example. SESSION_SIGNING_KEY — постоянный случайный секрет длиной от 32 символов. В production задайте HTTPS-адрес PUBLIC_ORIGIN для ссылок-приглашений.
+В корне проекта заполните `.env` по `.env.example`. `SESSION_SIGNING_KEY` — постоянный случайный секрет длиной от 32 символов. В production задайте HTTPS-адрес `PUBLIC_ORIGIN` для ссылок-приглашений.
 
-Кабинеты и воркеры при запуске сами создают таблицы в пустой БД приложения (по умолчанию `data/application.sqlite`). Существующую базу они не изменяют. Миграцию можно применить и вручную:
+Курсы, версии, интервью, сессии и контрольные точки LangGraph по умолчанию хранятся в PostgreSQL. Укажите `APP_DATABASE_URL` в формате `postgresql://пользователь:пароль@хост:5432/база`. Пустой `CHECKPOINT_URL` направляет LangGraph в ту же базу. Для PostgreSQL в Docker задайте в `.env` случайный `POSTGRES_PASSWORD` из шестнадцатеричных символов и подставьте его в `APP_DATABASE_URL` для запуска с хоста. Секрет можно сгенерировать командой `python -c "from secrets import token_hex; print(token_hex(32))"`.
+
+`docker compose up -d --build` запускает PostgreSQL, применяет миграции и запускает кабинеты, воркер и планировщик. Контейнеры получают внутренний адрес базы автоматически. Том `postgres-data` содержит PostgreSQL. Том `course-data` хранит файлы приложения, в том числе прежние базы SQLite, если они были в этом томе.
+
+Для локального Python запустите PostgreSQL отдельно (`docker compose up -d --wait postgres` или свой сервер с пустой базой). Из корня проекта примените миграции:
 
 ```powershell
 .\.venv\Scripts\python.exe -m alembic upgrade head
 ```
 
-Для локальной работы запустите три команды в отдельных терминалах из корня проекта.
+Затем запустите три команды в отдельных терминалах из корня проекта.
 
 ```powershell
 .\.venv\Scripts\python.exe -m streamlit run app.py
@@ -20,7 +24,25 @@
 .\.venv\Scripts\python.exe -m workers.relevance_scheduler
 ```
 
-Альтернатива для Docker — `docker compose up -d --build`. Сервис migrate применяет миграцию перед запуском кабинетов, обработчика и планировщика. Том course-data хранит SQLite и checkpoints. Для PostgreSQL укажите асинхронный APP_DATABASE_URL для SQLAlchemy и CHECKPOINT_URL в формате postgresql:// для LangGraph; на Windows с PostgreSQL используйте совместимый с psycopg SelectorEventLoop.
+## Перенос существующих данных из SQLite
+
+Остановите кабинеты, воркер и планировщик, чтобы файлы приложения и LangGraph соответствовали одному состоянию. Сохраните резервные копии `data/application.sqlite` и `data/checkpoints.sqlite`. Если рядом есть `-wal` или `-shm`, оставьте их рядом с исходными файлами на время переноса. Укажите пустую базу PostgreSQL в `APP_DATABASE_URL` и оставьте `CHECKPOINT_URL` пустым. Перенос с хоста:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.migrate_sqlite_to_postgres
+```
+
+Для прежних SQLite-файлов в томе `course-data` используйте команды из корня проекта:
+
+```powershell
+docker compose stop app worker scheduler
+docker compose up -d --wait postgres
+docker compose build migrate
+docker compose run --rm --no-deps migrate python -m scripts.migrate_sqlite_to_postgres
+docker compose up -d
+```
+
+Команда снимает копии SQLite, применяет Alembic и переносит строки и историю LangGraph одной транзакцией. Если целевая база уже содержит данные приложения, команда прерывается. После переноса проверьте список курсов, версии и статусы в кабинете. Сохраните `SESSION_SIGNING_KEY`, чтобы существующие приглашения продолжили работать. Для последующих резервных копий PostgreSQL используйте `pg_dump` всей базы `rpd`.
 
 ## Учётные записи
 
@@ -51,3 +73,5 @@ TEACHERS_INDEX_ID и EXPERTS_INDEX_ID указывают на раздельны
 .\.venv\Scripts\python.exe -m pip check
 docker compose config --quiet
 ```
+
+Для интеграционного теста миграции задайте `RPD_TEST_POSTGRES_URL` с доступом к тестовому PostgreSQL. Тест создаёт отдельную схему и проверяет возобновление прерванного интервью после переноса.

@@ -4,11 +4,14 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 import os
 
+from dotenv import dotenv_values
 from sqlalchemy import Column, DateTime, JSON, MetaData, String, Table, create_engine, delete, select
 from sqlalchemy.dialects.postgresql import JSONB, insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import make_url
 from sqlalchemy.pool import NullPool
+
+from storage.database import DEFAULT_APP_DATABASE_URL, postgres_dsn
 
 
 # This cache can be unavailable while core course tables remain usable. Alembic
@@ -36,11 +39,8 @@ class EvidenceSnapshotStore:
             self.engine = create_engine(target.set(drivername="sqlite+pysqlite"), poolclass=NullPool,
                                         connect_args={"timeout": 0.5})
             self.insert = sqlite_insert
-        elif target.get_backend_name() == "postgresql":
-            if target.drivername == "postgresql+asyncpg" and "ssl" in target.query:
-                target = target.difference_update_query(["ssl"]).update_query_dict({
-                    "sslmode": target.query.get("sslmode", target.query["ssl"]),
-                })
+        elif target.get_backend_name() in {"postgres", "postgresql"}:
+            target = make_url(postgres_dsn(url))
             options = target.query.get("options", "")
             self.engine = create_engine(target.set(drivername="postgresql+psycopg"), poolclass=NullPool,
                                         connect_args={"connect_timeout": 2,
@@ -86,4 +86,5 @@ def _snapshot_store(url: str) -> EvidenceSnapshotStore:
 
 
 def snapshot_store() -> EvidenceSnapshotStore:
-    return _snapshot_store(os.environ.get("APP_DATABASE_URL", "sqlite+aiosqlite:///./data/application.sqlite"))
+    url = os.environ.get("APP_DATABASE_URL") or dotenv_values(encoding="utf-8-sig", interpolate=False).get("APP_DATABASE_URL")
+    return _snapshot_store(url or DEFAULT_APP_DATABASE_URL)

@@ -19,7 +19,7 @@ from orchestration.rabota_business import BusinessEvidenceClient, RabotaBusiness
 from orchestration.resume import resume_graph
 from orchestration.vacancy_search import PublicVacancySearch
 from run_rpd import yandex_settings
-from storage.database import DatabaseSetupError, ensure_schema, make_engine, write_transaction
+from storage.database import DatabaseSetupError, ensure_schema, make_engine, run_async, write_transaction
 from storage.models import Course, CourseVersion, WorkflowCommand
 from storage.workflow import SqlWorkflowStore
 
@@ -137,4 +137,4 @@ if __name__ == "__main__":
         ensure_schema(Settings().app_database_url)
     except DatabaseSetupError as error:
         raise SystemExit(str(error))
-    asyncio.run(run(arguments.once))
+    run_async(run(arguments.once))
