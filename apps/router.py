@@ -7,16 +7,16 @@ from apps.presentation import portal_brand
 CABINETS = (
     ("head", "Кабинет руководителя программы",
      "Модели деятельности профессий, экспертная валидация, состав программы и рекомендации."),
-    ("teacher", "Кабинет преподавателя",
+    ("teacher", "Кабинет методиста",
      "Закреплённые дисциплины, проверенные задачи профессии, РПД и карта знаний."),
     ("expert", "Кабинет эксперта", "Анкета по задачам профессии и интервью по курсам."),
 )
 
 
 def main():
-    st.set_page_config(page_title="Проектирование программ", layout="wide")
+    st.set_page_config(page_title="Проектирование программ", layout="wide", initial_sidebar_state=200)
     pages = {"head": st.Page(head_app.main, title="Кабинет руководителя программы", url_path="head"),
-             "teacher": st.Page(teacher_app.main, title="Кабинет преподавателя", url_path="teacher"),
+             "teacher": st.Page(teacher_app.main, title="Кабинет методиста", url_path="teacher"),
              "expert": st.Page(expert_app.main, title="Кабинет эксперта", url_path="expert")}
 
     def landing():
@@ -24,7 +24,7 @@ def main():
         st.title("Выберите кабинет")
         st.caption("Модель деятельности профессии, проверенная экспертами, — основа программы и РПД.")
         for key, title, description in CABINETS:
-            with st.container(border=True):
+            with st.container(border=True, key=f"portal-card-cabinet-{key}"):
                 st.page_link(pages[key], label=title, icon=":material/arrow_forward:")
                 st.caption(description)
 

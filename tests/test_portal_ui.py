@@ -58,6 +58,7 @@ class PortalUITests(unittest.TestCase):
             with patch.dict(os.environ, env):
                 app = AppTest.from_string("from apps.teacher_app import main\nmain()", default_timeout=30).run()
                 self.assertFalse(app.exception)
+                self.assertIn("Кабинет методиста", [title.value for title in app.title])
                 app.text_input[0].set_value("tester@example.org")
                 app.text_input[1].set_value("fixture")
                 app.button[0].click().run()
@@ -65,6 +66,7 @@ class PortalUITests(unittest.TestCase):
                 self.assertIn("Создать курс", [b.label for b in app.button],
                               ([e.value for e in app.error], [b.label for b in app.button]))
                 next(b for b in app.button if b.label == "Создать курс").click().run()
+                self.assertFalse(app.number_input)
                 for field, value in zip(app.text_input, ("Аналитика", "Вуз", "2026/2027", "Аналитик данных"), strict=True):
                     field.set_value(value)
                 next(b for b in app.button if b.label == "Добавить предметы автоматически").click().run()
@@ -132,6 +134,7 @@ class PortalUITests(unittest.TestCase):
                 app.button[0].click().run()
                 next(b for b in app.button if b.label == "Открыть курс").click().run()
                 self.assertFalse(app.exception, app.exception)
+                self.assertEqual([tab.label for tab in app.tabs], ["Программа", "Отчёт по курсу"])
                 html = " ".join(item.proto.body for item in app.get("html"))
                 self.assertIn("Базы данных", html)
                 self.assertTrue(any("Рыночные данные не загружены" in item.value for item in app.info))

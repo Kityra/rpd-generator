@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError, ValidationInfo, model_validator
 
 from domain.schemas import (ActivityAspect, ActivityProcess, ActivityTask, AppliedActivityModel, CourseProgramModel,
                             EvidenceResults, LearningReference, Model, SourceRecord, SubjectPlan, TopicAssignments)
+from domain.skill_mapper import SkillMappingBatch
 from orchestration.call_log import CALL_STATS, GENERATION_NOTES
 from orchestration.evidence_cache import source_record
 from orchestration.llm_judge import JudgeVerdicts
@@ -289,6 +290,8 @@ class YandexModelClient:
         return GenerationOptions.from_settings(self.settings)
 
     def model_for(self, output: type[BaseModel], flash: bool) -> str:
+        if output is SkillMappingBatch and self.settings.get("YANDEX_MODEL_URI_BUSINESS"):
+            return self.settings["YANDEX_MODEL_URI_BUSINESS"]
         if flash:
             return self.settings.get("YANDEX_MODEL_URI_FLASH") or f"gpt://{self.settings['YANDEX_FOLDER_ID']}/aliceai-llm-flash"
         if output in (CourseProgramModel, SubjectPlan):
@@ -321,7 +324,8 @@ class YandexModelClient:
         # Входной лимит модели минус запас на ответ не нужен: Yandex ограничивает именно вход.
         limit = int(int(_env(self.settings, "YANDEX_INPUT_TOKEN_LIMIT", "32768")) * 0.9)
         is_judge = issubclass(output, JudgeVerdicts)
-        schema_attempts = 1 if is_judge else 2
+        is_mapper = output is SkillMappingBatch
+        schema_attempts = 1 if is_judge or is_mapper else 2
         with open_yandex(self.settings) as client:
             for attempt in range(schema_attempts):
                 if stats is not None:
@@ -339,6 +343,8 @@ class YandexModelClient:
                     request_key=hashlib.sha256(f"{output.__name__}\0{body}".encode()).hexdigest()[:24],
                 )
                 try:
+                    if is_mapper:
+                        arguments["single_attempt_stage"] = "skill_mapping"
                     response = model_response(client, self.settings, stream=stream, judge=is_judge, **arguments)
                 except APIStatusError as error:
                     if not stream or error.status_code not in {400, 404, 405, 422, 501}:

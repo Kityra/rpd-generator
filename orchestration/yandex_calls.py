@@ -35,7 +35,7 @@ def collect_stream(events):
 
 
 def model_response(client, settings, *, model: str, budget: float = 120, stream: bool = False,
-                   request_key: str | None = None, judge: bool = False, **kwargs):
+                   request_key: str | None = None, judge: bool = False, single_attempt_stage: str = "", **kwargs):
     """Вызов модели. При stream=True ответ читается потоком: лимит чтения действует на каждый фрагмент,
     поэтому длинный ответ не обрывается, пока модель продолжает писать, а общий срок задаёт budget."""
     if stream:
@@ -47,12 +47,13 @@ def model_response(client, settings, *, model: str, budget: float = 120, stream:
             return client.responses.create(model=model, timeout=timeout, **kwargs)
         read = budget
     service = ("Yandex", "responses", _scope(settings), model)
-    if judge:
-        service = (*service, "llm_judge")
-    return EXTERNAL.call(service, request, budget=budget, read=read, attempts=1 if judge else 3,
+    stage = "llm_judge" if judge else single_attempt_stage
+    if stage:
+        service = (*service, stage)
+    return EXTERNAL.call(service, request, budget=budget, read=read, attempts=1 if stage else 3,
                          request_key=request_key, count_timeouts=request_key is None,
                          cooldown=MODEL_CIRCUIT_COOLDOWN if request_key else None,
-                         wait_if_open=not judge and request_key is not None)
+                         wait_if_open=not stage and request_key is not None)
 
 
 def search_fragments(client, settings, index: SourceType, store_id: str, query: str, count: int, *,

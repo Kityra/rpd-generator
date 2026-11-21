@@ -108,7 +108,8 @@ class WebPreviewTests(unittest.TestCase):
             self.assertIn("Курс утверждён", report)
             plan = archive.read("02 - Алгоритмы.txt").decode()
             self.assertIn("Тематический план".casefold(), plan.casefold())
-            self.assertIn("часы и ЗЕТ", plan)
+            self.assertIn("утверждённые компетенции", plan)
+            self.assertNotIn("часы и ЗЕТ", plan)
         self.assertTrue(all(task.approved for task in batch.tasks))
 
     def test_network_binding_leaves_public_generation_unavailable(self):

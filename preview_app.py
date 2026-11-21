@@ -52,7 +52,7 @@ def new_request(preview: PreviewSession) -> None:
             facts = ""
         else:
             facts = st.text_area("Известные сведения", max_chars=16000,
-                                 placeholder="Учебный план, часы, компетенции, темы, форма аттестации")
+                                 placeholder="Учебный план, компетенции, темы, форма аттестации")
             start = st.form_submit_button("Подготовить РПД", type="primary")
             suggest = False
 
@@ -111,9 +111,6 @@ def download_package(batch: Batch) -> bytes:
                 name = discipline_filename(task, index, "txt")
                 archive.writestr(name, readable_document(task))
                 lines.append(f"РПД — {name}.")
-                load = doc.get("workload", {})
-                if {"totalHours", "totalCredits"} <= load.keys():
-                    lines.append(f"Объём — {load['totalHours']} ч, {load['totalCredits']} ЗЕТ.")
                 for semester in doc.get("curriculum", []):
                     topics = ", ".join(topic["title"] for topic in semester["topics"])
                     lines.append(f"Семестр {semester['semester']} — {topics}.")
@@ -136,13 +133,9 @@ def missing_official_fields(document: dict) -> list[str]:
         missing.append("шифр направления")
     if not document.get("competencies"):
         missing.append("утверждённые компетенции")
-    if not {"totalHours", "totalCredits"} <= document.get("workload", {}).keys():
-        missing.append("часы и ЗЕТ")
     if not document.get("curriculum"):
         missing.append("семестры")
-    if not document.get("assessment", {}).get("interimForms") and not any(
-        semester.get("assessmentForm") for semester in document.get("workload", {}).get("bySemester", [])
-    ):
+    if not document.get("assessment", {}).get("interimForms"):
         missing.append("форма аттестации")
     return missing
 

@@ -263,8 +263,10 @@ class CourseSubject(ChangedBlock):
     # Происхождение заполняет сервер; в схему ответа модели эти поля не передаются.
     generated_by: Literal["model", "outline"] | None = Field(default=None, json_schema_extra=SERVER_ONLY)
     generation_note: str | None = Field(default=None, json_schema_extra=SERVER_ONLY)
-    importance: Literal["core", "major", "standard", "minor"] | None = Field(default=None, json_schema_extra=SERVER_ONLY)
-    importance_reason: str | None = Field(default=None, json_schema_extra=SERVER_ONLY)
+    # Старые версии содержат ранги, которые использовались при расчёте часов.
+    importance: Literal["core", "major", "standard", "minor"] | None = Field(
+        default=None, exclude=True, json_schema_extra=SERVER_ONLY)
+    importance_reason: str | None = Field(default=None, exclude=True, json_schema_extra=SERVER_ONLY)
     # Итог проверки обоснования: status supports / weak / unrelated / missing, reason, judge.
     rationale_check: dict | None = Field(default=None, json_schema_extra=SERVER_ONLY)
     needs_review: bool = Field(default=False, json_schema_extra=SERVER_ONLY)
@@ -298,6 +300,7 @@ class MarketSkill(Model):
 
 
 class MarketVacancy(Model):
+    id: str | None = None
     title: str = Field(min_length=1, max_length=300)
     skills: list[str] = Field(default_factory=list)
     text: str = Field(default="", max_length=20_000)
@@ -331,6 +334,18 @@ class SkillCoverage(Model):
     tasks: list[str]
     priority: float
     manual: bool = False
+    competence_name: str = ""
+    tools: list[str] = Field(default_factory=list)
+    raw_skills: list[str] = Field(default_factory=list)
+    vacancy_ids: list[str] | None = None
+    expert_tools: list[str] = Field(default_factory=list)
+
+
+class ExpertToolLink(Model):
+    competence_name: str
+    tool_name: str
+    quote: str
+    interview_id: str
 
 
 class MarketAnalysis(Model):
@@ -341,6 +356,7 @@ class MarketAnalysis(Model):
     period: str | None = None
     region: str | None = None
     skills: list[SkillCoverage] = Field(default_factory=list)
+    competences: list[SkillCoverage] = Field(default_factory=list)
     uncovered: list[str] = Field(default_factory=list)
     weak_subjects: list[str] = Field(default_factory=list)
     task_priorities: list[dict] = Field(default_factory=list)
@@ -459,9 +475,9 @@ class SubjectSuggestion(Grounded):
     name: str
     is_fundamental: bool
     conflict_with: str | None
-    # Единственный вклад модели в расчёт часов: относительная важность из фиксированного набора.
-    importance: Importance = "standard"
-    importance_reason: str | None = None
+    # Прежние ответы модели могут содержать ранги.
+    importance: Importance = Field(default="standard", exclude=True, json_schema_extra=SERVER_ONLY)
+    importance_reason: str | None = Field(default=None, exclude=True, json_schema_extra=SERVER_ONLY)
 
 
 class SubjectPlan(Model):

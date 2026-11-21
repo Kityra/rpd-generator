@@ -292,9 +292,17 @@ class RecommendationTests(unittest.TestCase):
                         "Веб-сервисы SOAP" in {rec["target"] for rec in self.by_rule["R3"]})
 
     def test_no_recommendation_relies_on_hypotheses(self):
-        for rule in ("R1", "R2", "R4", "R5", "R6"):
+        for rule in ("R1", "R2", "R4", "R5"):
             for rec in self.by_rule.get(rule, []):
                 self.assertNotIn("hypothesis", {task["status"] for task in rec["tasks"]}, rec["action_text"])
+
+    def test_recommendations_use_topics_independently_of_hours(self):
+        from dataclasses import replace
+        program = fixture_program()
+        program.disciplines = [replace(discipline, hours=0) for discipline in program.disciplines]
+        self.assertEqual(analyse(program), self.result)
+        self.assertNotIn("R6", self.by_rule)
+        self.assertNotIn("hours", self.result)
 
     def test_analysis_is_deterministic(self):
         self.assertEqual(json.dumps(analyse(fixture_program()), sort_keys=True, ensure_ascii=False),

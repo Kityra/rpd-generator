@@ -13,7 +13,9 @@ from auth.user_repository import CurrentUser
 
 
 ROLES = ("teacher", "expert", "program_head", "admin")
-ROLE_NAMES = {"teacher": "teacher", "преподаватель": "teacher", "expert": "expert", "эксперт": "expert",
+# Старые имена ролей сохраняют прежние права и идентификаторы пользователей.
+ROLE_NAMES = {"teacher": "teacher", "преподаватель": "teacher", "methodologist": "teacher", "методист курса": "teacher",
+              "expert": "expert", "эксперт": "expert",
               "program_head": "program_head", "руководитель": "program_head", "руководитель программы": "program_head",
               "методист": "program_head", "admin": "admin", "администратор": "admin"}
 
@@ -121,7 +123,7 @@ class YandexUserRepository(AccountDirectory):
         if not teachers_id or not experts_id or teachers_id == experts_id:
             raise DirectoryError("Укажите разные TEACHERS_INDEX_ID и EXPERTS_INDEX_ID.")
         if heads_id and heads_id in (teachers_id, experts_id):
-            raise DirectoryError("PROGRAM_HEADS_INDEX_ID должен отличаться от справочников преподавателей и экспертов.")
+            raise DirectoryError("PROGRAM_HEADS_INDEX_ID должен отличаться от справочников методистов и экспертов.")
         self.client_factory = client_factory
         self.indexes = {"teacher": teachers_id, "expert": experts_id}
         if heads_id:

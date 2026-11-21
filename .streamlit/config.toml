@@ -10,7 +10,12 @@ showErrorDetails = "none"
 
 [theme]
 primaryColor = "#3159A0"
-backgroundColor = "#F5F6FA"
+backgroundColor = "#F7F8FA"
 secondaryBackgroundColor = "#EDF1F7"
 textColor = "#1B263B"
 font = "sans serif"
+
+[theme.sidebar]
+backgroundColor = "#A32949"
+secondaryBackgroundColor = "#81203C"
+textColor = "#FFFFFF"

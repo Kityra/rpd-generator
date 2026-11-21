@@ -98,7 +98,7 @@ class AuthService:
             db.add(AuthEvent(user_id=row.user_id, event="logout", ip=ip, user_agent=user_agent[:1000]))
 
 
-async def require_role(service: AuthService, roles: set[str]) -> CurrentUser:
+async def require_role(service: AuthService, roles: set[str], *, account=None) -> CurrentUser:
     import streamlit as st
 
     ip = st.context.ip_address
@@ -120,7 +120,11 @@ async def require_role(service: AuthService, roles: set[str]) -> CurrentUser:
             except PermissionError as error:
                 st.error(str(error))
         st.stop()
-    if st.sidebar.button("Выйти", type="tertiary", icon=":material/logout:", width="stretch"):
+    with account if account is not None else st.sidebar:
+        if account is not None:
+            st.text(user.email)
+        sign_out = st.button("Выйти", key="portal-logout", icon=":material/logout:")
+    if sign_out:
         await service.logout(token, ip, agent)
         st.session_state.clear()
         st.rerun()

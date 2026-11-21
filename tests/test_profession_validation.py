@@ -4,21 +4,24 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from zipfile import ZipFile
 
 from langgraph.checkpoint.memory import InMemorySaver
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from apps.teacher_app import report_panel
 from auth.settings import Settings
-from domain.export import PROFESSION_REVIEW_LABEL, export_course, profession_profile_html
+from domain.export import export_course
+from domain.schemas import MarketDataset, MarketVacancy
 from orchestration.call_log import CALL_SCOPE, CallScope, RecordingModelClient
 from orchestration.evidence_cache import source_record
 from orchestration.graph import build_course_graph
 from orchestration.interview_skills import SKILL_FILES, load_interview_skills, select_interview_method
 from orchestration.interviewer_turn import (InterviewerRequest, classify_user_turn, extract_interview_claims,
                                             interview_result)
+from orchestration.market_analysis import analyse_market, with_competences
 from orchestration.profession_pipeline import activity_for_design, apply_expert_turn, initial_profile, market_evidence
 from orchestration.profession_profile import EvidenceRef, pending_claim
 from orchestration.profession_verifier import ProfessionEvidenceVerdicts, verify_profession_profile
@@ -190,10 +193,10 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.judge_unavailable)
         judge.generate.assert_awaited_once()
 
-    async def test_zip_and_portal_share_badges_and_remove_rejected_text(self):
+    async def test_zip_and_portal_show_market_table_without_profile_claim_list(self):
         example = "Оптимизирует SQL-запросы"
         value, turn = apply_expert_turn(profile(claim("rag", example),
-            claim("market", "SQL указан в вакансиях", "sql", kind="market_cluster", excerpt="42/60 (70%)"),
+            claim("market", "В выборке вакансий указан навык SQL.", "sql", kind="market_cluster", excerpt="42/60 (70%)"),
             claim("manual", "Проектирует API", "fake"), claim("a", "Обучает модель"),
             claim("b", "СКРЫТЫЙ ОТКЛОНЁННЫЙ ТЕКСТ")), [
                 {"claim_id": "a", "action": "confirm"}, {"claim_id": "b", "action": "reject"}], "turn:1")
@@ -205,22 +208,31 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
         sources["chunk"] = sources["HH"] | {"content": example}
         result = await verify_profession_profile(value, {"chunk": example}, market, {"turn:1": turn}, judge)
         data = result.model_dump(mode="json")
+        data["unresolved_slots"] = ["work_tasks"]
         version = SimpleNamespace(status="approved", revision=1, content={"program": program(),
                                   "profession_profile": data, "profession_market": market})
-        ui = profession_profile_html(data, market, sources)
-        with ZipFile(BytesIO(export_course({"institution": "Вуз", "year": "2026"}, version, sources))) as archive:
+        dataset = MarketDataset(source="HH", vacancies=[MarketVacancy(title="Аналитик", skills=["SQL"])])
+        analysis = with_competences(analyse_market(version.content["program"], dataset), {})
+        with patch("apps.teacher_app.st") as ui:
+            report_panel(version, sources, [], analysis)
+            ui.dataframe.assert_called_once()
+            self.assertEqual(ui.dataframe.call_args.args[0][0]["Компетенция"], "Проектирование и работа с базами данных")
+            self.assertEqual(ui.dataframe.call_args.args[0][0]["Инструменты"], "SQL")
+            self.assertEqual(ui.dataframe.call_args.args[0][0]["Вакансий"], 1)
+        package = export_course({"institution": "Вуз", "year": "2026"}, version, sources,
+                                analysis.model_dump(mode="json"))
+        with ZipFile(BytesIO(package)) as archive:
             report = archive.read("course-report.html").decode()
             saved = json.loads(archive.read("course.json"))
             manifest = json.loads(archive.read("sources.json"))
-        for badge in (PROFESSION_REVIEW_LABEL, "[Подтверждено экспертом, реплика #1]",
-                      "[Рынок HH: 42/60 вакансий (70%), подтверждено]", "[Подтверждено источником RAG]"):
-            self.assertIn(badge, report)
-            self.assertIn(badge, ui)
-        self.assertIn("Требует проверки методиста — нет прямого подтверждения в источниках", ui)
-        self.assertIn("Требует проверки методиста — нет прямого подтверждения в источниках", report)
-        self.assertNotIn("Требует проверки преподавателя", ui + report)
+        self.assertIn("<td>SQL</td><td>100%</td><td>1</td>", report)
+        for removed in ("Поля интервью для проверки методистом", "В выборке вакансий указан навык",
+                        "<summary>Основание</summary>"):
+            self.assertNotIn(removed, report)
+            self.assertNotIn(removed, str(ui.html.call_args_list))
         self.assertIn("chunk", manifest)
         self.assertEqual(saved["profession_profile"]["counts"], {"verified": 3, "needs_review": 1, "rejected": 1})
+        self.assertTrue(any(item["claim_id"] == "market" for item in saved["profession_profile"]["claims"]))
         self.assertNotIn("СКРЫТЫЙ ОТКЛОНЁННЫЙ ТЕКСТ", report)
         self.assertNotIn("СКРЫТЫЙ ОТКЛОНЁННЫЙ ТЕКСТ", json.dumps(saved, ensure_ascii=False))
 

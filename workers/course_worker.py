@@ -11,7 +11,6 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from auth.settings import Settings
-from domain.workload import proposal_from_loads
 from literature_parser import enrich_course_program, yandex_llm_expander
 from orchestration.checkpointer import open_checkpointer
 from orchestration.clients import YandexEvidenceClient, YandexModelClient, source_record
@@ -69,10 +68,10 @@ async def execute(graph, factory, cmd):
                  "mode": cmd.kind, "course_meta": course.course_meta,
                  "manual_subjects": course.course_meta.get("manual_subjects", []),
                  "baseline": version.content["program"] if version else None,
+                 "skill_mappings": version.content.get("skill_mappings", {}) if version else {},
                  # Повторная проверка ищет источники и по рабочим задачам утверждённой версии.
                  "known_tasks": [task["title"] for task in (version.content.get("activity") or {}).get("tasks", [])]
-                 if version else [],
-                 "workload_proposal": proposal_from_loads(version.content.get("workloads", {})) if version else None}
+                 if version else []}
     return await graph.ainvoke(state, config)
 
 

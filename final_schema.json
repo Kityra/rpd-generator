@@ -36,6 +36,26 @@
         "$ref": "#/$defs/competency"
       }
     },
+    "competenceLearningOutcomes": {
+      "type": "array",
+      "description": "Рыночные компетенции и связанные инструменты дисциплины.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["competence_name", "learningOutcomes"],
+        "properties": {
+          "competence_name": {"type": "string", "minLength": 1},
+          "learningOutcomes": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["skillsAndTools"],
+            "properties": {
+              "skillsAndTools": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        }
+      }
+    },
     "workload": {
       "$ref": "#/$defs/workload"
     },

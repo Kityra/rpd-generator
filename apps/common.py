@@ -53,7 +53,7 @@ def composer(label, key):
     return msg.text.strip(), files
 
 
-async def authenticated(roles, render):
+async def authenticated(roles, render, account):
     settings = Settings()
     engine = make_engine(settings.app_database_url)
     user_engine = None
@@ -78,7 +78,7 @@ async def authenticated(roles, render):
         users = repositories[0] if len(repositories) == 1 else CombinedUserRepository(repositories)
         factory = async_sessionmaker(engine, expire_on_commit=False)
         auth = AuthService(settings, users, ExistingPasswordVerifier(settings.hash_scheme), factory)
-        actor = await require_role(auth, roles)
+        actor = await require_role(auth, roles, account=account)
         await render(actor, settings, factory, users)
     finally:
         if user_engine is not None:
@@ -87,11 +87,15 @@ async def authenticated(roles, render):
 
 
 def portal(title, roles, render):
-    portal_brand()
+    with st.container(key="portal-header", horizontal=True, horizontal_alignment="distribute",
+                      vertical_alignment="center", gap="small"):
+        portal_brand()
+        account = st.container(key="portal-account", horizontal=True, horizontal_alignment="right",
+                               vertical_alignment="center", width="content", gap="small")
     st.title(title)
     try:
         ensure_schema(Settings().app_database_url)
-        asyncio.run(authenticated(roles, render))
+        asyncio.run(authenticated(roles, render, account))
     except (DirectoryError, DatabaseSetupError) as error:
         st.error(str(error))
     except ValidationError:

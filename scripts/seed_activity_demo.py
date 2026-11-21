@@ -527,7 +527,7 @@ async def seed_program(factory, actor, profession_id: str, teacher: str, today: 
         factory, actor, "Программная инженерия: бэкенд-разработка (ДЕМО)", level="bachelor", total_zet=240,
         institution="ДЕМО-университет", academic_year="2026/2027",
         targets=[{"profession_id": profession_id, "weight": 1.0}], is_demo=True)
-    rows = [{"name": name, "zet": zet, "hours": zet * 36, "semester": semester, "part": part}
+    rows = [{"name": name, "zet": zet, "semester": semester, "part": part}
             for name, zet, semester, part, _, _ in PROGRAM]
     await store.save_disciplines(factory, actor, program_id, rows)
     async with factory() as db:
@@ -536,8 +536,8 @@ async def seed_program(factory, actor, profession_id: str, teacher: str, today: 
     for name, _, _, _, topics, outcomes in PROGRAM:
         await store.save_content(factory, actor, disciplines[name], topics, outcomes, [])
     await store.assign_teacher(factory, actor, disciplines["Дискретная математика и теория графов"], teacher,
-                               "Преподаватель теории графов (демо)")
-    await store.assign_teacher(factory, actor, disciplines["Базы данных"], teacher, "Преподаватель теории графов (демо)")
+                               "Методист по теории графов (демо)")
+    await store.assign_teacher(factory, actor, disciplines["Базы данных"], teacher, "Методист по теории графов (демо)")
     await store.recompute(factory, actor, program_id)
     return program_id
 
@@ -564,7 +564,7 @@ async def run(head_login: str, teacher_login: str, expert_login: str, do_reset: 
             version = await store.latest_version(db, backend)
         statuses = version.counts["statuses"]
         print(f"{DEMO}. Модель «Backend-разработчик» v{version.number}: {statuses}.")
-        print(f"Программа {program_id}: руководитель {head_login}, преподаватель {teacher_login}, эксперт {expert_login}.")
+        print(f"Программа {program_id}: руководитель {head_login}, методист {teacher_login}, эксперт {expert_login}.")
     finally:
         await engine.dispose()
 
@@ -573,7 +573,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--reset", action="store_true", help="пересоздать демоданные (удаляются только записи is_demo)")
     parser.add_argument("--head-login", default="head@demo.local", help="логин руководителя программы")
-    parser.add_argument("--teacher-login", default="teacher@demo.local", help="логин преподавателя")
+    parser.add_argument("--teacher-login", default="teacher@demo.local", help="логин методиста")
     parser.add_argument("--expert-login", default="expert@demo.local", help="логин эксперта для прохождения анкеты")
     arguments = parser.parse_args()
     ensure_schema(Settings().app_database_url)

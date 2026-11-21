@@ -60,7 +60,7 @@ async def interviews(actor, factory, *, database_url=None):
                         st.write(message.content)
                         if message.attachments:
                             st.caption(", ".join(f["name"] for f in message.attachments))
-    with st.container():
+    with st.container(key="expert-composer"):
         if inv.status == "active" and interview.status == "invited":
             pending_key = f"draft-answer-{interview.id}"
             reply = composer("Ваш ответ и материалы к вопросу", f"answer-{interview.id}")

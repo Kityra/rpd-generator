@@ -51,12 +51,12 @@ def choose_profession(rows) -> Profession | None:
 
 async def screen_professions(actor, factory):
     st.header("Профессии")
-    st.caption("Одна проверенная модель деятельности на профессию — её видят руководитель программы, методист и преподаватели.")
+    st.caption("Одна проверенная модель деятельности на профессию — её видят руководитель программы и методисты.")
     rows, versions, experts = await professions_list(factory)
     for offset in range(0, len(rows), 2):
         for column, row in zip(st.columns(2, gap="medium"), rows[offset:offset + 2]):
             version = versions[row.id]
-            with column.container(border=True):
+            with column.container(border=True, key=f"portal-card-profession-{row.id}"):
                 st.subheader(row.name)
                 details = [row.region or "регион не указан", f"горизонт {row.horizon_years} г.",
                            ", ".join(row.standard_codes or []) or "ПС не указан"]
@@ -496,19 +496,18 @@ async def screen_program(actor, factory, users):
         teacher_names = {user.id: user.display_name for user in teachers}
         for d in disciplines:
             if d.teacher_user_id and d.teacher_user_id not in teacher_names:
-                teacher_names[d.teacher_user_id] = d.teacher_name or "преподаватель вне справочника"
+                teacher_names[d.teacher_user_id] = d.teacher_name or "методист вне справочника"
         by_name = {name: key for key, name in teacher_names.items()}
-        st.caption("Часть «обязательная по ФГОС» система не предлагает сокращать. Преподаватель увидит закреплённую "
+        st.caption("Часть «обязательная по ФГОС» система не предлагает сокращать. Методист увидит закреплённую "
                    "дисциплину в своём кабинете и запустит генерацию РПД по модели деятельности.")
         edited = st.data_editor(
-            [{"id": d.id, "name": d.name, "zet": d.zet, "hours": d.hours, "semester": d.semester, "part": d.part,
+            [{"id": d.id, "name": d.name, "zet": d.zet, "semester": d.semester, "part": d.part,
               "teacher": teacher_names.get(d.teacher_user_id, "")} for d in disciplines],
             column_config={"id": None, "name": st.column_config.TextColumn("Дисциплина", required=True, width="large"),
                            "zet": st.column_config.NumberColumn("ЗЕТ", min_value=0, max_value=60, step=0.5),
-                           "hours": st.column_config.NumberColumn("Часов", min_value=0, max_value=2000),
                            "semester": st.column_config.NumberColumn("Семестр", min_value=1, max_value=12),
                            "part": st.column_config.SelectboxColumn("Часть", options=list(PART_LABELS), required=True),
-                           "teacher": st.column_config.SelectboxColumn("Преподаватель", options=["", *by_name])},
+                           "teacher": st.column_config.SelectboxColumn("Методист", options=["", *by_name])},
             num_rows="dynamic", hide_index=True, width="stretch", key=f"editor-{program.id}")
         st.caption("Часть: " + "; ".join(f"{key} — {label}" for key, label in PART_LABELS.items()))
         if st.button("Сохранить дисциплины", type="primary"):
@@ -555,7 +554,7 @@ async def screen_program(actor, factory, users):
               (f"−{balance['frees']:g}", "ЗЕТ освобождается"), (f"+{balance['needs']:g}", "ЗЕТ нужно новым"),
               (f"{balance['after']:g}", "ЗЕТ после всех рекомендаций"),
               (sum(1 for row in saved.values() if row.current and row.decision), "решений принято")])
-        st.caption("Рекомендации считает код по правилам R1–R7 и порогам config/activity_model.yaml. Учитываются задачи "
+        st.caption("Рекомендации считает код по правилам R1–R5 и R7 и порогам config/activity_model.yaml. Учитываются задачи "
                    "со статусами «Подтверждено» и «Предварительно». Обязательные по ФГОС дисциплины не трогаются. "
                    "Окончательно решает руководитель.")
         recommendations = analysis["recommendations"]
@@ -586,7 +585,7 @@ async def screen_program(actor, factory, users):
         for d in disciplines:
             links = analysis["links"].get(d.id, {})
             with st.expander(f"{d.name} · {len(links)} {plural(len(links), 'задача', 'задачи', 'задач')} · "
-                             f"без связи {analysis['unallocated_hours'].get(d.id, 0):.0f} ч"):
+                             f"доля тем без связи — {percent(analysis['unlinked_topic_share'].get(d.id, 0))}"):
                 for key, link in links.items():
                     profession_id, task_id = key.split(":", 1)
                     task = models[profession_id]["tasks"][task_id]
@@ -673,7 +672,7 @@ async def screen_map(factory):
 
 
 def knowledge_map(models: dict[str, dict]) -> None:
-    """Матрица «профессии × области знаний» и сценарий преподавателя: где нужна моя область и какие задачи — идеи проектов."""
+    """Матрица «профессии × области знаний» и сценарий методиста: где нужна моя область и какие задачи — идеи проектов."""
     if not models:
         st.info("Моделей деятельности пока нет.")
         return
