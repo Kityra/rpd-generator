@@ -169,10 +169,12 @@ class ChangedBlock(Grounded):
     is_fundamental: bool
     locked: bool
     justification: ChangeJustification
-    learning_references: list[LearningReference] = Field(min_length=1)
+    learning_references: list[LearningReference]
 
     @model_validator(mode="after")
-    def check_change(self) -> "ChangedBlock":
+    def check_change(self, info: ValidationInfo) -> "ChangedBlock":
+        if not self.learning_references and not (info.context or {}).get("allow_incomplete_activity"):
+            raise ValueError("Требуется ссылка на учебный материал.")
         if self.is_fundamental and not self.locked:
             raise ValueError("Фундаментальное ядро должно быть защищено.")
         if self.change_status == "modified" and not self.previous_value:
@@ -282,6 +284,11 @@ class CourseProgramModel(Grounded):
             matching = [subject for subject in self.subjects if subject.title.casefold() == name.casefold()]
             if len(matching) != 1 or not matching[0].is_fundamental or not matching[0].locked:
                 raise ValueError(f"Не сохранён фундаментальный предмет {name}.")
+        required_names = context.get("required_subject_names")
+        if required_names is not None:
+            actual = [" ".join(subject.title.casefold().split()) for subject in self.subjects]
+            if len(actual) != len(required_names) or set(actual) != required_names:
+                raise ValueError("Состав дисциплин должен точно совпасть с batch_subjects.")
         activity = context.get("activity")
         allow_incomplete = context.get("allow_incomplete_activity")
         if activity or (allow_incomplete and "activity" not in context):

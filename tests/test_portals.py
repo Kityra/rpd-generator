@@ -15,7 +15,7 @@ from auth.password_verifier import ExistingPasswordVerifier
 from auth.settings import Settings
 from auth.user_repository import CurrentUser
 from auth.yandex_users import accounts_from_text
-from domain.export import export_course
+from domain.export import block_html, export_course, source_html
 from domain.schemas import EvidenceResults
 from orchestration.checkpointer import open_checkpointer
 from orchestration.graph import build_course_graph
@@ -25,6 +25,34 @@ from storage.portal import acknowledge, assigned_interviews, create_course, deci
 from storage.workflow import SqlWorkflowStore
 from test_course_architecture import program, records
 from workers.course_worker import process_next
+
+
+class SourceDisplayTests(unittest.TestCase):
+    def test_private_file_opens_escaped_excerpt_and_public_article_opens_link(self):
+        source = {"source_type": "RPD", "title": "Учебный материал", "content": "<script>text</script>",
+                  "url": "https://ai.api.cloud.yandex.net/v1/files/test"}
+        html = source_html(source)
+        self.assertIn("<details><summary", html)
+        self.assertIn("&lt;script&gt;text&lt;/script&gt;", html)
+        self.assertNotIn(source["url"], html)
+        public = dict(source, source_type="Crossref", url="https://doi.org/10.1234/test")
+        self.assertIn(f'href="{public["url"]}"', source_html(public))
+
+    def test_discipline_lists_file_once_and_keeps_distinct_excerpts(self):
+        subject = program()["subjects"][0]
+        topic = subject["topics"][0]
+        subject["justification"]["source_ids"] = ["Books", "duplicate"]
+        topic["justification"]["source_ids"] = ["duplicate", "other_excerpt"]
+        book = {"source_type": "Books", "title": "Мл4.pdf", "content": "Первый текст.",
+                "url": "https://ai.api.cloud.yandex.net/v1/files/entry1"}
+        sources = {"Books": book,
+                   "duplicate": dict(book, url="https://ai.api.cloud.yandex.net/v1/files/entry2"),
+                   "other_excerpt": dict(book, content="Другой фрагмент.")}
+        html = block_html(subject, sources)
+        self.assertEqual(1, html.count("Мл4.pdf</summary>"))
+        self.assertEqual(1, html.count("Первый текст."))
+        self.assertEqual(1, html.count("Другой фрагмент."))
+        self.assertIn("Источник 1 —", html)
 
 
 def user(role, suffix=""):
@@ -108,7 +136,9 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         active = course.active_version_id
         async with self.factory() as db:
             version = await db.get(CourseVersion, active)
-            archive = export_course(course.course_meta, version, {k: v.model_dump(mode="json") for k, v in records().items()})
+            sources = {k: v.model_dump(mode="json") for k, v in records().items()}
+            sources["Books"]["url"] = "https://ai.api.cloud.yandex.net/v1/files/test-book"
+            archive = export_course(course.course_meta, version, sources)
         with ZipFile(BytesIO(archive)) as package:
             rpd = json.loads(package.read("rpd/01/rpd.json"))
             self.assertEqual(rpd["workload"]["totalCredits"], 1)
@@ -116,7 +146,10 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(rpd["assessmentMaterials"])
             self.assertEqual(rpd["sourceNotes"], notes)
             self.assertEqual(json.loads(package.read("course.json"))["source_notices"], notes)
-            self.assertIn("color:", package.read("rpd/01/rpd.html").decode())
+            html = package.read("rpd/01/rpd.html").decode()
+            self.assertIn("color:", html)
+            self.assertIn("<details><summary", html)
+            self.assertNotIn("url", rpd["readingList"][0])
         self.assertEqual(await schedule_due(self.factory), 0)
         for needs_update in (False, True):
             self.model.relevance = needs_update
@@ -201,6 +234,37 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.process()).status, "waiting_for_review")
         async with self.factory() as db:
             self.assertEqual((await db.get(Interview, interview.id)).status, "closed")
+
+    async def test_twelve_auto_subjects_plus_manual_survive_batch_timeout(self):
+        self.model.gap = True
+        original = self.model.generate
+
+        async def generate(output, prompt, payload, context, flash=False):
+            if output.__name__ == "SubjectPlan":
+                return output.model_validate({"subjects": [
+                    {"name": f"Дисциплина {i}", "is_fundamental": True, "conflict_with": None, "source_ids": ["Books"]}
+                    for i in range(14)]}, context=context)
+            if output.__name__ == "CourseProgramModel":
+                self.assertLessEqual(len(payload["batch_subjects"]), 4)
+                raise RuntimeError("Внешняя модель не ответила")
+            return await original(output, prompt, payload, context, flash)
+
+        self.model.generate = AsyncMock(side_effect=generate)
+        async with self.factory.begin() as db:
+            course = await db.get(Course, "course")
+            course.course_meta = dict(course.course_meta, manual_subjects=["Ручной предмет"])
+        course = await self.process()
+        async with self.factory() as db:
+            interview = await db.scalar(select(Interview))
+        await finish_without_answer(self.factory, self.teacher, course.id, interview.id)
+        course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        async with self.factory() as db:
+            version = await db.get(CourseVersion, course.draft_version_id)
+            subjects = version.content["program"]["subjects"]
+            self.assertEqual(sum(subject["origin"] == "auto" for subject in subjects), 12)
+            self.assertEqual([s["title"] for s in subjects if s["origin"] == "manual"], ["Ручной предмет"])
+            self.assertTrue(version.content["source_notices"])
 
 
 class DirectoryTests(unittest.TestCase):

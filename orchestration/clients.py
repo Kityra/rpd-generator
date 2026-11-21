@@ -124,6 +124,7 @@ class YandexModelClient:
         model = (f"gpt://{self.settings['YANDEX_FOLDER_ID']}/aliceai-llm-flash" if flash
                  else self.settings["YANDEX_MODEL_URI"])
         request = payload
+        draft_batch = "batch_subjects" in payload
         with open_yandex(self.settings) as client:
             for attempt in range(2):
                 response = model_response(client, self.settings,
@@ -131,8 +132,8 @@ class YandexModelClient:
                     input=json.dumps(request, ensure_ascii=False),
                     text={"format": {"type": "json_schema", "name": output.__name__,
                                      "schema": grounded_schema(output, context), "strict": True}},
-                    max_output_tokens=8192 if flash else 16384, store=False,
-                    budget=45 if flash else 120,
+                    max_output_tokens=4096 if draft_batch else (8192 if flash else 16384), store=False,
+                    budget=60 if draft_batch else (45 if flash else 120),
                 )
                 raw = require_response_text(response)
                 try:

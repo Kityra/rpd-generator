@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import Annotated, Any, Protocol, TypedDict
 from uuid import NAMESPACE_URL, uuid5
@@ -13,10 +14,15 @@ from domain.schemas import (AppliedActivityModel, BusinessCourseAudit, CoursePro
                             VerificationReport, all_blocks, block_value)
 from orchestration.clients import EvidenceClient, ModelClient, NoActivityEvidence, source_record
 from orchestration import prompts
+from orchestration.draft import make_outline
 from orchestration.interview_methods import load_interview_methods
 from orchestration.rabota_business import SOURCE, SOURCE_GUIDANCE
 from orchestration.resilience import ExternalUnavailable
 from run_rpd import YandexModeratedResponse
+
+
+AUTO_DRAFT_SUBJECT_LIMIT = 12
+DRAFT_SUBJECT_BATCH_SIZE = 4
 
 
 def merge_records(previous: list[dict], additions: list[dict]) -> list[dict]:
@@ -47,6 +53,7 @@ class GraphState(TypedDict, total=False):
     university_report: dict
     interview_source_notices: list[str]
     factcheck_source_notices: list[str]
+    draft_source_notices: list[str]
     applied_activity: dict
     gap_report: dict
     interview_session_id: str
@@ -78,7 +85,7 @@ def run_source_notices(state: GraphState) -> list[str]:
     notices = [note for role in ("business", "science", "books", "university")
                for note in state.get(f"{role}_report", {}).get("source_notices", [])]
     return list(dict.fromkeys([*notices, *state.get("interview_source_notices", []),
-                               *state.get("factcheck_source_notices", [])]))
+                               *state.get("factcheck_source_notices", []), *state.get("draft_source_notices", [])]))
 
 
 class WorkflowStore(Protocol):
@@ -117,7 +124,11 @@ def planned_subjects(state: GraphState) -> list[dict]:
     unique = {}
     for subject in suggestions:
         unique.setdefault(" ".join(subject["name"].casefold().split()), subject)
-    return sorted(unique.values(), key=lambda subject: not subject["is_fundamental"])[:5]
+    ordered = sorted(unique.values(), key=lambda subject: not subject["is_fundamental"])
+    manual = {" ".join(name.casefold().split()) for name in state.get("manual_subjects", [])}
+    known = [subject for subject in ordered if " ".join(subject["name"].casefold().split()) in manual]
+    suggested = [subject for subject in ordered if " ".join(subject["name"].casefold().split()) not in manual]
+    return [*known, *suggested[:AUTO_DRAFT_SUBJECT_LIMIT]]
 
 
 def context(state: GraphState) -> dict:
@@ -164,7 +175,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         await store.set_status(state["request_id"], "agents_running", state["owner_user_id"])
         return {"status": "agents_running", "interview_round": 0, "review_iteration": 0,
                 "interview_answers": [], "review_feedback": [], "revision_baseline": None,
-                "interview_source_notices": [], "factcheck_source_notices": [],
+                "interview_source_notices": [], "factcheck_source_notices": [], "draft_source_notices": [],
                 "applied_activity": {}, "gap_report": {}, "verification": {}, "auto_subjects": {},
                 "course_program": {}, "consumed_review_id": "", "closed_interview_id": "", "version_id": ""}
 
@@ -341,13 +352,80 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def design(state: GraphState) -> dict:
         await store.set_status(state["request_id"], "designing", state["owner_user_id"])
-        program = await llm.generate(CourseProgramModel, prompts.DESIGN, payload(state), context(state))
+        suggestions = planned_subjects(state)
+        manual = {" ".join(name.casefold().split()): name for name in state.get("manual_subjects", [])}
+        automatic = {" ".join(item["name"].casefold().split()): item["name"] for item in suggestions}
+        names = {**automatic, **manual}
+        ctx = context(state)
+        if ctx["allow_incomplete_activity"] and not ctx.get("baseline") and len(names) > DRAFT_SUBJECT_BATCH_SIZE:
+            return await design_batched(state, list(names.items()), suggestions, manual)
+        program = await llm.generate(CourseProgramModel, prompts.DESIGN, payload(state), ctx)
         return {"course_program": program.model_dump(mode="json"), "status": "designing"}
 
+    async def design_batched(state: GraphState, names: list[tuple[str, str]], suggestions: list[dict],
+                             manual: dict[str, str]) -> dict:
+        semaphore = asyncio.Semaphore(3)
+        manual_source = None
+        if manual:
+            url = f"{settings.public_origin}/teacher?course={state['request_id']}"
+            manual_source = source_record("teacher", url, "Список дисциплин преподавателя", "\n".join(manual.values()))
+            state = {**state, "sources": merge_records(state.get("sources", []), [manual_source.model_dump(mode="json")])}
+
+        async def generate_batch(offset: int) -> tuple[CourseProgramModel, bool]:
+            batch = dict(names[offset:offset + DRAFT_SUBJECT_BATCH_SIZE])
+            manual_subjects = [name for key, name in batch.items() if key in manual]
+            batch_state = {**state, "manual_subjects": manual_subjects,
+                           "course_meta": {**state["course_meta"], "manual_subjects": manual_subjects},
+                           "auto_subjects": {"subjects": [item for item in suggestions
+                                             if " ".join(item["name"].casefold().split()) in batch]}}
+            ctx = {**context(batch_state), "required_subject_names": set(batch)}
+            if manual_source:
+                ctx["manual_subject_source_id"] = manual_source.source_id
+            request = {**payload(batch_state), "batch_subjects": list(batch.values())}
+            try:
+                async with semaphore:
+                    program = await llm.generate(CourseProgramModel, prompts.DESIGN, request, ctx)
+                return program, False
+            except (ValidationError, RuntimeError):
+                return make_outline(state["course_meta"]["title"], list(batch.values()), suggestions, ctx), True
+
+        async with asyncio.TaskGroup() as tasks:
+            batches = [tasks.create_task(generate_batch(offset))
+                       for offset in range(0, len(names), DRAFT_SUBJECT_BATCH_SIZE)]
+        completed = [batch.result() for batch in batches]
+        programs = [program for program, _ in completed]
+        subjects = []
+        for number, program in enumerate(programs, 1):
+            for raw in program.subjects:
+                subject = raw.model_dump(mode="json")
+                for block in [subject, *subject["topics"], *(a for topic in subject["topics"] for a in topic["assignments"])]:
+                    block["id"] = f"b{number}-{block['id']}"
+                subjects.append(subject)
+        combined = {"title": state["course_meta"]["title"], "subjects": subjects, "business_audit": None,
+                    "source_ids": list(dict.fromkeys(key for program in programs for key in program.source_ids))}
+        program = CourseProgramModel.model_validate(combined, context=context(state))
+        notices = ["Часть дисциплин собрана из сохранённых материалов. Проверьте темы и учебные источники."] if any(
+            used_outline for _, used_outline in completed) else []
+        return {"course_program": program.model_dump(mode="json"), "status": "designing",
+                "draft_source_notices": notices, "sources": [manual_source.model_dump(mode="json")] if manual_source else []}
+
     async def business_audit(state: GraphState) -> dict:
-        audit = await llm.generate(BusinessCourseAudit, prompts.BUSINESS_AUDIT, payload(state), context(state), flash=True)
+        audit_input = payload(state)
+        batched = state["gap_report"]["gap_types"] and len(state["course_program"]["subjects"]) > DRAFT_SUBJECT_BATCH_SIZE
+        if batched:
+            program = state["course_program"]
+            audit_input["course_program"] = {"title": program["title"], "subjects": [
+                {"title": subject["title"], "topics": [topic["title"] for topic in subject["topics"]]}
+                for subject in program["subjects"]]}
+        try:
+            audit = await llm.generate(BusinessCourseAudit, prompts.BUSINESS_AUDIT, audit_input, context(state), flash=True)
+        except (ValidationError, RuntimeError):
+            if not batched:
+                raise
+            notices = [*state.get("draft_source_notices", []), "Рыночная оценка пока недоступна."]
+            return {"draft_source_notices": list(dict.fromkeys(notices))}
         updated = {**state["course_program"], "business_audit": audit.model_dump(mode="json")}
-        if audit.suggested_changes:
+        if audit.suggested_changes and not batched:
             program = await llm.generate(CourseProgramModel, prompts.DESIGN,
                                         {**payload(state), "business_enrichment": audit.model_dump(mode="json")}, context(state))
             audit = await llm.generate(BusinessCourseAudit, prompts.BUSINESS_AUDIT,
