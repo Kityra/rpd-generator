@@ -5,20 +5,13 @@ import streamlit as st
 from sqlalchemy import select
 
 from apps.common import composer, portal
+from apps.presentation import course_progress, status_badge
 from domain.export import block_html, export_course, rationale_report_html, source_html
 from domain.workload import HOURS, MAX_HOURS, proposal_from_loads, propose_workload
 from storage.models import Course, CourseVersion, Interview, Notification, SourceRow
 from storage.portal import acknowledge, create_course, decide, finish_without_answer, retry_command
 from storage.workflow import SqlWorkflowStore
 
-
-STATUS = {"queued": "В очереди", "queued_audit": "В очереди на аудит", "agents_running": "Идёт анализ источников",
-          "gap_analysis": "Проверяем полноту данных", "designing": "Формируется программа",
-          "collecting_literature": "University подбирает литературу по темам",
-          "waiting_for_expert": "Ждёт интервью эксперта", "answer_queued": "Ответ эксперта принят",
-          "waiting_for_review": "Черновик на проверке", "review_queued": "Решение принято в обработку",
-          "approved": "Актуален", "pending_update_review": "Требует проверки после автообновления",
-          "failed": "Работа приостановлена"}
 
 GAP_LABELS = {"missing_tasks": "рабочие задачи и процессы", "missing_stack": "применяемые инструменты",
               "missing_artifacts": "результаты работы", "missing_quality_criteria": "критерии качества",
@@ -52,12 +45,13 @@ def interview_results(interviews, registry):
 
 
 async def new_course(actor, factory):
+    st.header("Новый курс")
     with st.form("new_course"):
         title = st.text_input("Курс или профессия", max_chars=300)
         institution = st.text_input("Вуз", max_chars=300)
         year = st.text_input("Учебный год", placeholder="2026/2027", max_chars=20)
         manual = st.text_area("Обязательные дисциплины", placeholder="По одному предмету в строке. Можно оставить пустым.")
-        auto = st.form_submit_button("✨ Добавить предметы автоматически")
+        auto = st.form_submit_button("Добавить предметы автоматически", type="primary")
         submit = st.form_submit_button("Сформировать курс")
     if auto or submit:
         if not all(s.strip() for s in (title, institution, year)):
@@ -97,9 +91,98 @@ def workload_form(subjects, version_id, proposal):
     return loads
 
 
+def course_context(meta):
+    return " · ".join(str(meta[key]) for key in ("institution", "year") if meta.get(key))
+
+
+async def expert_actions(actor, settings, factory, users, course, interview):
+    st.subheader("Интервью эксперта")
+    with st.chat_message("assistant"):
+        st.write(interview.gap_report["prompt"])
+    experts = await users.list_experts()
+    if experts:
+        choice = st.selectbox("Пригласить эксперта", experts, format_func=lambda e: e.display_name)
+        if st.button("Сформировать ссылку-приглашение", width="stretch"):
+            token = await SqlWorkflowStore(factory).invite(interview.id, choice.id, actor, users)
+            st.session_state[f"invite-{interview.id}"] = settings.public_origin.rstrip("/") + "/expert?" + urlencode({"token": token})
+        if link := st.session_state.get(f"invite-{interview.id}"):
+            st.code(link, language=None)
+            st.caption("Передайте ссылку выбранному эксперту. Приглашение также появится в его кабинете.")
+    else:
+        st.info("В справочнике нет экспертов.")
+
+
+def report_panel(version, registry, interviews):
+    program = version.content["program"]
+    st.html(rationale_report_html(program, registry))
+    audit = program.get("business_audit")
+    vacancy_ids = version.content.get("vacancy_source_ids", [])
+    if audit or vacancy_ids:
+        st.subheader("Оценка курса индустрией")
+    if audit:
+        st.metric("Покрытие рабочих задач курсом (оценка модели)", f"{audit['market_fit_score']:.0%}")
+        st.write(audit["evidence_summary"])
+        for metric in audit["metrics"]:
+            st.write(metric["name"], metric["value"], metric["unit"], metric["region"])
+        if audit["unavailable_metrics"]:
+            st.caption("Нет подтверждённых измерений — " + ", ".join(audit["unavailable_metrics"]))
+    if vacancy_ids:
+        st.write("Вакансии из выборки")
+        for key in vacancy_ids:
+            if record := registry.get(key):
+                st.html(source_html(record))
+                st.caption("\n".join(record["content"].splitlines()[:2]))
+    for notice in version.content.get("source_notices", []):
+        st.caption(notice)
+    interview_results(interviews, registry)
+
+
+def course_workspace(version, registry, interviews, can_review, active):
+    subjects = version.content["program"]["subjects"]
+    labels = ["Программа", "Отчёт по курсу"]
+    if can_review:
+        labels.append("Учебная нагрузка")
+    tabs = st.tabs(labels)
+    with tabs[0]:
+        for index, subject in enumerate(subjects):
+            with st.expander(subject["title"], expanded=index == 0):
+                st.html(block_html(subject, registry))
+    with tabs[1]:
+        report_panel(version, registry, interviews)
+    if not can_review:
+        return None, None
+    previous = version.content.get("workload_proposal")
+    if not previous and active:
+        previous = proposal_from_loads(active.content.get("workloads", {}))
+    proposal = propose_workload(subjects, previous)
+    with tabs[2]:
+        return workload_form(subjects, version.id, proposal), proposal
+
+
+async def review_actions(actor, factory, course, draft, active, loads, proposal):
+    st.subheader("Правки и утверждение")
+    with st.container():
+        change = composer("Что изменить или уточнить", f"edit-{draft.id}")
+    if change:
+        await decide(factory, actor, course.id, draft.id, "revise", *change,
+                     workloads=loads if loads != proposal["loads"] else None)
+        st.rerun()
+    if st.button("Утвердить изменения" if active else "Утвердить курс", type="primary", width="stretch"):
+        await decide(factory, actor, course.id, draft.id, "approve", workloads=loads)
+        st.rerun()
+    if st.button("Обновить материалы и обоснования", width="stretch"):
+        await decide(factory, actor, course.id, draft.id, "refresh_materials")
+        st.rerun()
+    if active and st.button("Отклонить изменения", width="stretch"):
+        await decide(factory, actor, course.id, draft.id, "reject")
+        st.rerun()
+
+
 async def course_detail(actor, settings, factory, users, course, notices):
     st.header(course.course_meta["title"])
-    st.write(STATUS.get(course.status, course.status))
+    if details := course_context(course.course_meta):
+        st.caption(details)
+    course_progress(course, database_url=settings.app_database_url)
     for notice in notices:
         if notice.course_id == course.id:
             st.info(notice.content)
@@ -111,89 +194,53 @@ async def course_detail(actor, settings, factory, users, course, notices):
                                       .order_by(Interview.created_at.desc()))).all()
         active = await db.get(CourseVersion, course.active_version_id) if course.active_version_id else None
         draft = await db.get(CourseVersion, course.draft_version_id) if course.draft_version_id else None
-    if course.status == "waiting_for_expert" and interviews:
-        current = interviews[0]
-        if st.button("Сформировать черновик по имеющимся данным", type="primary"):
-            await finish_without_answer(factory, actor, course.id, current.id)
-            st.rerun()
-        st.subheader("Вопрос эксперту")
-        st.write(current.gap_report["prompt"])
-        experts = await users.list_experts()
-        if experts:
-            choice = st.selectbox("Пригласить эксперта", experts, format_func=lambda e: e.display_name)
-            if st.button("Сформировать ссылку-приглашение"):
-                token = await SqlWorkflowStore(factory).invite(current.id, choice.id, actor, users)
-                st.session_state[f"invite-{current.id}"] = settings.public_origin.rstrip("/") + "/expert?" + urlencode({"token": token})
-            if link := st.session_state.get(f"invite-{current.id}"):
-                st.code(link, language=None)
-                st.caption("Передайте ссылку выбранному эксперту. Приглашение также появится в его кабинете.")
-        else:
-            st.info("В справочнике нет экспертов.")
     version = draft or active
-    if version:
-        program = version.content["program"]
-        label = "Черновик РПД" if draft else "Программа курса"
-        st.subheader(f"{label} · версия {version.revision}")
-        gap_types = version.content.get("evidence_gaps", {}).get("gap_types", [])
-        if gap_types:
-            gaps = ", ".join(GAP_LABELS.get(kind, kind) for kind in gap_types)
-            st.warning(f"Требуют проверки преподавателя — {gaps}.")
-        for notice in version.content.get("source_notices", []):
-            st.caption(notice)
-        audit = program.get("business_audit")
-        vacancy_ids = version.content.get("vacancy_source_ids", [])
-        with st.expander("Отчёт по курсу"):
-            st.html(rationale_report_html(program, registry))
-            if audit or vacancy_ids:
-                st.markdown("## Оценка курса индустрией")
-                if audit:
-                    st.metric("Покрытие рабочих задач курсом (оценка модели)", f"{audit['market_fit_score']:.0%}")
-                    st.write(audit["evidence_summary"])
-                    for metric in audit["metrics"]:
-                        st.write(metric["name"], metric["value"], metric["unit"], metric["region"])
-                    if audit["unavailable_metrics"]:
-                        st.caption("Нет подтверждённых измерений — " + ", ".join(audit["unavailable_metrics"]))
-                if vacancy_ids:
-                    st.write("Вакансии из выборки")
-                    for key in vacancy_ids:
-                        if record := registry.get(key):
-                            st.html(source_html(record))
-                            st.caption("\n".join(record["content"].splitlines()[:2]))
-        for index, subject in enumerate(program["subjects"]):
-            with st.expander(subject["title"], expanded=index == 0):
-                st.html(block_html(subject, registry))
-    interview_results(interviews, registry)
-    if draft and course.status in {"waiting_for_review", "pending_update_review"}:
-        update = bool(active)
-        if st.button("Обновить материалы и обоснования"):
-            await decide(factory, actor, course.id, draft.id, "refresh_materials")
-            st.rerun()
-        previous = draft.content.get("workload_proposal")
-        if not previous and active:
-            previous = proposal_from_loads(active.content.get("workloads", {}))
-        proposal = propose_workload(draft.content["program"]["subjects"], previous)
-        loads = workload_form(draft.content["program"]["subjects"], draft.id, proposal)
-        if st.button("Утвердить изменения" if update else "Утвердить курс", type="primary"):
-            await decide(factory, actor, course.id, draft.id, "approve", workloads=loads)
-            st.rerun()
-        if update and st.button("Отклонить изменения"):
-            await decide(factory, actor, course.id, draft.id, "reject")
-            st.rerun()
-        with st.container():
-            change = composer("Что изменить или уточнить", f"edit-{draft.id}")
-        if change:
-            await decide(factory, actor, course.id, draft.id, "revise", *change,
-                         workloads=loads if loads != proposal["loads"] else None)
-            st.rerun()
-    if active:
-        st.download_button(f"Скачать утверждённую версию {active.revision} · ZIP",
-                           export_course(course.course_meta, active, registry), f"course-v{active.revision}.zip", "application/zip")
-        if course.next_audit_at:
-            st.caption(f"Следующий аудит — {course.next_audit_at:%d.%m.%Y}")
-    if course.status == "failed" and st.button("Повторить обработку"):
-        await retry_command(factory, actor, course.id)
-        st.rerun()
-    st.button("Обновить статус")
+    can_review = bool(draft and course.status in {"waiting_for_review", "pending_update_review"})
+    waiting = bool(interviews and course.status == "waiting_for_expert")
+    has_actions = waiting or can_review or active or (version and course.status == "failed")
+
+    with st.container(key="course-workspace"):
+        main, side = st.columns([1.85, 1], gap="medium") if has_actions else (st.container(), None)
+        with main.container(key="course-program"):
+            if version:
+                label = "Черновик РПД" if draft else "Программа курса"
+                st.subheader(f"{label} · версия {version.revision}")
+                gap_types = version.content.get("evidence_gaps", {}).get("gap_types", [])
+                if gap_types:
+                    gaps = ", ".join(GAP_LABELS.get(kind, kind) for kind in gap_types)
+                    st.warning(f"Требуют проверки преподавателя — {gaps}.")
+                loads, proposal = course_workspace(version, registry, interviews, can_review, active)
+            else:
+                st.subheader("Программа курса")
+                if waiting:
+                    st.write("Программа появится после ответа эксперта или по имеющимся данным, если вы продолжите без интервью.")
+                elif course.status == "failed":
+                    if st.button("Повторить обработку", type="primary"):
+                        await retry_command(factory, actor, course.id)
+                        st.rerun()
+                else:
+                    st.write("Программа появится здесь после подготовки.")
+                interview_results(interviews, registry)
+        if side is not None:
+            with side.container(key="course-actions"):
+                if waiting:
+                    st.subheader("Продолжить подготовку")
+                    if st.button("Сформировать черновик по имеющимся данным", type="primary", width="stretch"):
+                        await finish_without_answer(factory, actor, course.id, interviews[0].id)
+                        st.rerun()
+                    st.caption("Сборка продолжится без интервью. Оставшиеся пробелы будут отмечены в черновике.")
+                    await expert_actions(actor, settings, factory, users, course, interviews[0])
+                if can_review:
+                    await review_actions(actor, factory, course, draft, active, loads, proposal)
+                if active:
+                    st.download_button(f"Скачать утверждённую версию {active.revision} · ZIP",
+                                       export_course(course.course_meta, active, registry), f"course-v{active.revision}.zip",
+                                       "application/zip", width="stretch")
+                    if course.next_audit_at:
+                        st.caption(f"Следующий аудит — {course.next_audit_at:%d.%m.%Y}")
+                if version and course.status == "failed" and st.button("Повторить обработку", type="primary"):
+                    await retry_command(factory, actor, course.id)
+                    st.rerun()
 
 
 async def render(actor, settings, factory, users):
@@ -206,12 +253,20 @@ async def render(actor, settings, factory, users):
         if any(course.id == requested for course in courses):
             st.session_state.update(screen="course", selected_course=requested)
         del st.query_params["course"]
-    st.sidebar.write(actor.display_name)
-    if st.sidebar.button(f"Ваши курсы ({count})" if count else "Ваши курсы"):
+    st.sidebar.text(actor.display_name)
+    if st.sidebar.button(f"Ваши курсы ({count})" if count else "Ваши курсы", width="stretch"):
         st.session_state.screen = "list"
-    if st.sidebar.button("Создать курс"):
+    if st.sidebar.button("Создать курс", type="primary", icon=":material/add:", width="stretch"):
         st.session_state.screen = "create"
     screen = st.session_state.get("screen", "list")
+    if courses and screen != "list":
+        st.sidebar.markdown("**Курсы**")
+        for course in courses:
+            selected = screen == "course" and course.id == st.session_state.get("selected_course")
+            if st.sidebar.button(course.course_meta["title"], key=f"nav-{course.id}",
+                                 type="secondary" if selected else "tertiary", width="stretch"):
+                st.session_state.update(screen="course", selected_course=course.id)
+                st.rerun()
     if screen == "create":
         await new_course(actor, factory)
         return
@@ -220,17 +275,23 @@ async def render(actor, settings, factory, users):
         if current:
             await course_detail(actor, settings, factory, users, current, notices)
             return
-    st.subheader("Ваши курсы")
+    st.header("Ваши курсы")
     if not courses:
         st.info("Курсов пока нет. Выберите «Создать курс» в меню.")
-    for course in courses:
-        if st.button(course.course_meta["title"], key=f"open-{course.id}"):
-            st.session_state.update(screen="course", selected_course=course.id)
-            st.rerun()
-        st.caption(STATUS.get(course.status, course.status))
-        for notice in notices:
-            if notice.course_id == course.id and notice.read_at is None:
-                st.info(notice.content)
+    with st.container(key="course-workspace"):
+        for offset in range(0, len(courses), 2):
+            for column, course in zip(st.columns(2, gap="medium"), courses[offset:offset + 2]):
+                with column.container(border=True):
+                    st.html(status_badge(course.status))
+                    st.subheader(course.course_meta["title"])
+                    if info := course_context(course.course_meta):
+                        st.caption(info)
+                    if st.button("Открыть курс", key=f"open-{course.id}", icon=":material/arrow_forward:"):
+                        st.session_state.update(screen="course", selected_course=course.id)
+                        st.rerun()
+                    for notice in notices:
+                        if notice.course_id == course.id and notice.read_at is None:
+                            st.info(notice.content)
 
 
 def main():

@@ -13,10 +13,20 @@ from sqlalchemy.orm import Session
 from datetime import timedelta
 from streamlit.testing.v1 import AppTest
 
+from apps.presentation import progress_html
 from storage.models import Base, Course, ExpertInvitation, Interview, now
 
 
 class PortalUITests(unittest.TestCase):
+    def test_progress_distinguishes_waiting_approval_and_failure(self):
+        waiting = progress_html("waiting_for_expert")
+        self.assertIn("Ждёт интервью эксперта", waiting)
+        self.assertIn('aria-current="step"><span class="portal-step-line" aria-hidden="true"></span><span>Модель деятельности', waiting)
+        self.assertEqual(progress_html("approved").count("portal-step--complete"), 6)
+        failed = progress_html("failed")
+        self.assertNotIn('aria-current="step"', failed)
+        self.assertNotIn("portal-step--complete", failed)
+
     def test_sign_in_create_course_and_role_boundaries(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "portal.db"
@@ -25,8 +35,12 @@ class PortalUITests(unittest.TestCase):
             with Session(engine) as db:
                 db.add(Course(id="other", thread_id="other", owner_user_id="other-teacher",
                               status="waiting_for_expert", course_meta={"title": "Интервью о данных"}))
+                db.add(Course(id="own", thread_id="own", owner_user_id="users:1",
+                              status="waiting_for_expert", course_meta={"title": "Аналитика продаж"}))
                 db.flush()
                 db.add(Interview(id="i", course_id="other", interrupt_id="ask", gap_report={"prompt": "Как сверяете данные?"}))
+                db.add(Interview(id="i-own", course_id="own", interrupt_id="ask-own",
+                                 gap_report={"prompt": "Какие метрики используете?"}))
                 db.flush()
                 db.add(ExpertInvitation(id="invite", interview_id="i", expert_user_id="users:2",
                        token_hash=hashlib.sha256(b"sample").hexdigest(), expires_at=now()+timedelta(days=1), created_by="other-teacher"))
@@ -53,10 +67,16 @@ class PortalUITests(unittest.TestCase):
                 next(b for b in app.button if b.label == "Создать курс").click().run()
                 for field, value in zip(app.text_input, ("Аналитика", "Вуз", "2026/2027"), strict=True):
                     field.set_value(value)
-                next(b for b in app.button if b.label.startswith("✨")).click().run()
+                next(b for b in app.button if b.label == "Добавить предметы автоматически").click().run()
                 self.assertFalse(app.exception)
                 self.assertIn("Аналитика", [x.value for x in app.header])
-                self.assertIn("В очереди", [x.value for x in app.markdown])
+                self.assertTrue(any("В очереди" in item.proto.body and "Статус обновляется автоматически" in item.proto.body
+                                    for item in app.get("html")))
+                self.assertNotIn("Обновить статус", [b.label for b in app.button])
+                app.button(key="nav-own").click().run()
+                next(b for b in app.button if b.label == "Сформировать черновик по имеющимся данным").click().run()
+                self.assertFalse(app.exception)
+                self.assertTrue(any("В очереди" in item.proto.body for item in app.get("html")))
                 expert = AppTest.from_string("from apps.expert_app import main\nmain()", default_timeout=30)
                 expert.session_state["session_token"] = app.session_state["session_token"]
                 expert.run()
@@ -74,4 +94,5 @@ class PortalUITests(unittest.TestCase):
                 self.assertFalse(expert.exception)
                 self.assertTrue(expert.success)
             with closing(sqlite3.connect(path)) as conn:
-                self.assertEqual(conn.execute("select count(*) from workflow_commands").fetchone()[0], 2)
+                self.assertEqual(conn.execute("select count(*) from workflow_commands").fetchone()[0], 3)
+                self.assertEqual(conn.execute("select status from interviews where id = 'i-own'").fetchone(), ("closed",))

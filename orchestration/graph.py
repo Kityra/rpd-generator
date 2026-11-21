@@ -311,6 +311,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                                         owner_scope=state["owner_user_id"])
         local_skill = load_interview_methods(settings.interview_skill_directory, state["gap_report"]["gap_types"])
         skill = (local_skill + "\n\n" + "\n\n".join(item.content for item in methods))[:18000]
+        notices = [*state.get("interview_source_notices", []), *getattr(methods, "notices", [])]
         try:
             turn = await llm.generate(InterviewTurn, prompts.INTERVIEW,
                                       {"course": state["course_meta"]["title"], "gaps": state["gap_report"]["questions"],
@@ -318,8 +319,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                                        "interview_methods": skill, "history": [a["content"] for a in state.get("interview_answers", [])]},
                                       context(state), flash=True)
             question_origin = "interviewer"
-        except ValidationError:
-            # После двух невалидных ответов задаём вопрос по реально обнаруженному пробелу.
+        except (ValidationError, YandexModeratedResponse, ExternalUnavailable) as error:
             for question in reversed(state["gap_report"]["questions"]):
                 try:
                     turn = InterviewTurn(prompt=question)
@@ -329,16 +329,18 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             else:
                 raise
             question_origin = "gap_report"
+            notices.append("Интервью: использован резервный вопрос по выявленному пробелу.")
+            logging.getLogger(__name__).warning("Интервью курса %s: использован резервный вопрос (%s).",
+                                                state["request_id"], type(error).__name__)
         report = {**state["gap_report"], "prompt": turn.prompt,
                   "question_origin": question_origin,
                   "previous_interview_id": state.get("interview_session_id") if round_number else None,
                   "method_source_ids": [item.source_id for item in methods]}
-        notices = list(dict.fromkeys([*state.get("interview_source_notices", []), *getattr(methods, "notices", [])]))
         interview_id = await store.prepare_interview(state["request_id"], identifier, report)
         await store.save_sources(state["request_id"], [*registry(state).values(), *methods])
         await store.set_status(state["request_id"], "waiting_for_expert", state["owner_user_id"])
         return {"interrupt_id": identifier, "interview_session_id": interview_id,
-                "gap_report": report, "status": "waiting_for_expert", "interview_source_notices": notices}
+                "gap_report": report, "status": "waiting_for_expert", "interview_source_notices": list(dict.fromkeys(notices))}
 
     async def interview(state: GraphState) -> dict:
         answer = interrupt({"interrupt_id": state["interrupt_id"], "interview_session_id": state["interview_session_id"],

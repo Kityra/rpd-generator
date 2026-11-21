@@ -120,7 +120,7 @@ async def require_role(service: AuthService, roles: set[str]) -> CurrentUser:
             except PermissionError as error:
                 st.error(str(error))
         st.stop()
-    if st.button("Выйти"):
+    if st.sidebar.button("Выйти", type="tertiary", icon=":material/logout:", width="stretch"):
         await service.logout(token, ip, agent)
         st.session_state.clear()
         st.rerun()

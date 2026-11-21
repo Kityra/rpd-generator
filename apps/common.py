@@ -13,6 +13,7 @@ from auth.session import AuthService, require_role
 from auth.settings import Settings
 from auth.user_repository import SqlUserRepository
 from auth.yandex_users import DirectoryError, YandexUserRepository
+from apps.presentation import portal_brand
 from run_rpd import open_yandex
 from storage.database import DatabaseSetupError, ensure_schema, make_engine
 from web_preview import read_attachment
@@ -64,6 +65,7 @@ async def authenticated(roles, render):
 
 
 def portal(title, roles, render):
+    portal_brand()
     st.title(title)
     try:
         ensure_schema(Settings().app_database_url)

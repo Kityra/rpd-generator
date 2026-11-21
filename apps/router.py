@@ -1,6 +1,7 @@
 import streamlit as st
 
 from apps import teacher_app, expert_app
+from apps.presentation import portal_brand
 
 
 def main():
@@ -9,9 +10,11 @@ def main():
     expert = st.Page(expert_app.main, title="Кабинет эксперта", url_path="expert")
 
     def landing():
-        st.title("Проектирование курсов")
-        st.page_link(teacher, label="Кабинет преподавателя")
-        st.page_link(expert, label="Кабинет эксперта")
+        portal_brand()
+        st.title("Выберите кабинет")
+        for page in (teacher, expert):
+            with st.container(border=True):
+                st.page_link(page, label=page.title)
 
     home = st.Page(landing, title="Проектирование курсов", default=True)
     st.navigation([home, teacher, expert], position="hidden").run()

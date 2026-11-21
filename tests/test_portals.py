@@ -164,6 +164,31 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await db.get(SourceRow, (course.id, filtered.source_id)))
             self.assertTrue(version.content["program"]["subjects"][0]["inclusion_rationale"])
 
+    async def test_filtered_interview_question_falls_back_and_allows_draft(self):
+        self.model.gap = True
+        original = self.model.generate
+
+        async def generate(output, prompt, payload, context, flash=False):
+            if output.__name__ == "InterviewTurn":
+                raise YandexModeratedResponse("Провайдер ограничил ответ.")
+            return await original(output, prompt, payload, context, flash)
+
+        self.model.generate = generate
+        course = await self.process()
+        self.assertEqual(course.status, "waiting_for_expert")
+        async with self.factory() as db:
+            interview = await db.scalar(select(Interview).where(Interview.course_id == course.id))
+            self.assertEqual(interview.gap_report["question_origin"], "gap_report")
+            self.assertIn(interview.gap_report["prompt"], interview.gap_report["questions"])
+
+        await finish_without_answer(self.factory, self.teacher, course.id, interview.id)
+        course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        async with self.factory() as db:
+            draft = await db.get(CourseVersion, course.draft_version_id)
+            self.assertIn("Интервью: использован резервный вопрос по выявленному пробелу.",
+                          draft.content["source_notices"])
+
     async def test_draft_workload_is_prefilled_and_text_revision_is_exported(self):
         course = await self.process()
         async with self.factory() as db:
