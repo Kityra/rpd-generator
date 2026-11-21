@@ -1,0 +1,64 @@
+# Межпрофессиональные области знаний. Знание, умение или инструмент относится к области, если в его
+# названии встречается каноническое имя или синоним (сравнение по основам слов).
+# kind: fundamental — фундаментальная область (защищает дисциплину от сокращения, правило R5);
+#       applied — прикладная.
+areas:
+  - name: Теория графов
+    kind: fundamental
+    synonyms: [граф, графы, графов, графовые, деревья, маршрутизация, кратчайший путь, топологическая сортировка,
+               граф зависимостей, graph, graphs, graph theory]
+  - name: Алгоритмы и структуры данных
+    kind: fundamental
+    synonyms: [алгоритм, алгоритмы, структуры данных, сложность алгоритмов, сортировка, хеш-таблица, очередь,
+               индекс, индексы, algorithms, data structures, big o]
+  - name: Дискретная математика
+    kind: fundamental
+    synonyms: [дискретная математика, комбинаторика, логика, булева алгебра, конечные автоматы, discrete math]
+  - name: Теория вероятностей и статистика
+    kind: fundamental
+    synonyms: [вероятность, статистика, распределение, a/b тест, ab тест, доверительный интервал,
+               probability, statistics]
+  - name: Базы данных
+    kind: fundamental
+    synonyms: [база данных, базы данных, бд, sql, реляционная модель, нормализация, транзакции, согласованность данных,
+               postgresql, mysql, nosql, redis, mongodb, clickhouse, database, databases]
+  - name: Сетевые протоколы
+    kind: fundamental
+    synonyms: [сеть, сети, сетевые протоколы, tcp, udp, http, https, dns, tls, grpc, websocket, network, networking]
+  - name: Операционные системы
+    kind: fundamental
+    synonyms: [операционная система, операционные системы, linux, процессы, потоки, многопоточность, файловая система,
+               unix, operating systems]
+  - name: Основы программирования
+    kind: fundamental
+    # Конкретные языки (Python, Java, Go…) — инструменты, а не фундамент: они в словаре навыков config/market_skills.yaml.
+    synonyms: [программирование, язык программирования, языки программирования, ооп,
+               объектно-ориентированное программирование, programming]
+  - name: Распределённые системы
+    kind: fundamental
+    synonyms: [распределённые системы, распределенные системы, консенсус, репликация, шардирование, cap,
+               очереди сообщений, kafka, rabbitmq, distributed systems]
+  - name: Информационная безопасность
+    kind: applied
+    synonyms: [безопасность, информационная безопасность, аутентификация, авторизация, oauth, owasp, шифрование,
+               уязвимость, security]
+  - name: Проектирование API
+    kind: applied
+    synonyms: [api, rest, rest api, openapi, swagger, graphql, интерфейс программирования]
+  - name: Контейнеризация и DevOps
+    kind: applied
+    synonyms: [docker, kubernetes, k8s, контейнер, контейнеризация, ci/cd, ci, cd, devops, helm, terraform,
+               развёртывание, развертывание]
+  - name: Тестирование ПО
+    kind: applied
+    synonyms: [тестирование, тест, тесты, модульные тесты, unit-тесты, интеграционные тесты, pytest, junit, testing]
+  - name: Архитектура ПО
+    kind: applied
+    synonyms: [архитектура, микросервисы, микросервисная архитектура, паттерны проектирования, монолит,
+               software architecture, microservices]
+  - name: Наблюдаемость и эксплуатация
+    kind: applied
+    synonyms: [мониторинг, логирование, метрики, трассировка, prometheus, grafana, observability, sre, инцидент]
+  - name: Машинное обучение
+    kind: applied
+    synonyms: [машинное обучение, ml, нейронная сеть, нейросеть, модель машинного обучения, machine learning]
