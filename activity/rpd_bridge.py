@@ -79,6 +79,5 @@ def origin_note(meta: dict) -> str:
     professions = ", ".join(f"«{item['name']}» v{item['version']}" for item in snapshot["professions"])
     demo = " ДЕМО: синтетические данные." if snapshot.get("is_demo") else ""
     count = len(snapshot["tasks"])
-    return (f"Задачи курса — из модели деятельности {professions} (программа «{snapshot['program']}»): "
-            f"{count} {plural(count, 'проверенная задача', 'проверенные задачи', 'проверенных задач')}, "
-            f"у каждой — источник и «почему здесь».{demo}")
+    return (f"Кандидаты для курса — из модели деятельности {professions} (программа «{snapshot['program']}»): "
+            f"{count} {plural(count, 'рабочая задача', 'рабочие задачи', 'рабочих задач')}.{demo}")

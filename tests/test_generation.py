@@ -198,14 +198,14 @@ class DesignBatchedTests(unittest.IsolatedAsyncioTestCase):
         original = model.generate
         names = [f"Дисциплина {i}" for i in range(3)]
 
-        async def generate(output, prompt, payload, context, flash=False):
+        async def generate(output, prompt, payload, context, flash=False, **options):
             if output.__name__ == "SubjectPlan":
                 return output.model_validate({"subjects": [
                     {"name": name, "is_fundamental": False, "conflict_with": None, "source_ids": ["Books"]}
                     for name in names]}, context=context)
             if output.__name__ in {"CourseProgramModel", "TopicAssignments"}:
                 return await design(output, payload, context)
-            return await original(output, prompt, payload, context, flash)
+            return await original(output, prompt, payload, context, flash, **options)
 
         model.generate = generate
         for _ in range(2):

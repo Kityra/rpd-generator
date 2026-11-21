@@ -28,7 +28,7 @@ SNAPSHOT = {
                "status": "confirmed", "status_label": "Подтверждено", "trend": "stable", "priority": 4,
                "coverage": "full", "coverage_reason": "совпали понятия", "tools": ["SQL"], "knowledge": [],
                "reason": ["Почему задача включена", "Подтвердили 36 из 39 экспертов."],
-               "quotes": [{"text": "Проектировать схемы баз данных", "source_title": "Вакансия", "date": "2026-10-01"}]}
+               "quotes": [{"text": title + " с SQL.", "source_title": "Вакансия", "date": "2026-10-01"}]}
               for index, title in enumerate(["Проектирует схемы баз данных под нагрузку", "Оптимизирует SQL-запросы"])],
 }
 
@@ -62,7 +62,7 @@ class ProfessionModelCourseTests(unittest.IsolatedAsyncioTestCase):
         original = model.generate
         requested = []
 
-        async def generate(output, prompt, payload, context, flash=False):
+        async def generate(output, prompt, payload, context, flash=False, **options):
             requested.append(output.__name__)
             if output.__name__ in ("AppliedActivityModel", "SubjectPlan"):
                 raise AssertionError(f"{output.__name__} не должен генерироваться: задачи берутся из модели профессии")
@@ -73,7 +73,7 @@ class ProfessionModelCourseTests(unittest.IsolatedAsyncioTestCase):
                     for topic in subject["topics"]:
                         topic["activity_task_ids"] = ["task-0"]
                 return output.model_validate(value, context=context)
-            return await original(output, prompt, payload, context, flash)
+            return await original(output, prompt, payload, context, flash, **options)
 
         model.generate = generate
         async with open_checkpointer(self.checkpoint) as saver:

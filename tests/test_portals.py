@@ -81,13 +81,15 @@ class Model:
         self.gap, self.relevance = gap, True
         self.claim_status = "verified"
 
-    async def generate(self, output, prompt, payload, context, flash=False):
+    async def generate(self, output, prompt, payload, context, flash=False, **options):
         name = output.__name__
         if name == "AgentReport":
             value = {"findings": []}
+        elif name == "ProfessionEvidenceVerdicts":
+            value = {"items": [{"pair_id": pair["pair_id"], "verdict": "supports"} for pair in payload["pairs"]]}
         elif name == "AppliedActivityModel":
             count = 4 if self.gap and not any(s.source_type == "expert" for s in context["sources"].values()) else 5
-            value = {"tasks": [{"id": f"task{i}", "title": "Запрос", "stack": ["SQL"], "artifacts": ["Отчёт"],
+            value = {"tasks": [{"id": f"task{i}", "title": f"Проверяет запрос SQL на этапе {i}", "stack": ["SQL"], "artifacts": ["Отчёт"],
                                 "quality_criteria": ["Время", "Корректность"], "typical_errors": [], "source_ids": ["Crossref", "HH"]}
                                for i in range(count)], "processes": [{"id": str(i), "title": "Сбор", "task_ids": ["task0"],
                                "source_ids": ["HH"]} for i in range(3)], "aspects": [], "source_ids": ["HH"]}
@@ -168,10 +170,10 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             [filtered] if role == "books" else list(records().values()))
         original = self.model.generate
 
-        async def generate(output, prompt, payload, context, flash=False):
+        async def generate(output, prompt, payload, context, flash=False, **options):
             if output.__name__ == "BusinessCourseAudit" or filtered.source_id in context.get("sources", {}):
                 raise YandexModeratedResponse("Провайдер ограничил ответ.")
-            return await original(output, prompt, payload, context, flash)
+            return await original(output, prompt, payload, context, flash, **options)
 
         self.model.generate = generate
         course = await self.process()
@@ -188,10 +190,10 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         self.model.gap = True
         original = self.model.generate
 
-        async def generate(output, prompt, payload, context, flash=False):
+        async def generate(output, prompt, payload, context, flash=False, **options):
             if output.__name__ == "InterviewTurn":
                 raise YandexModeratedResponse("Провайдер ограничил ответ.")
-            return await original(output, prompt, payload, context, flash)
+            return await original(output, prompt, payload, context, flash, **options)
 
         self.model.generate = generate
         course = await self.process()
@@ -271,7 +273,7 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         course = await self.process()
         original = self.model.generate
 
-        async def generate(output, prompt, payload, context, flash=False):
+        async def generate(output, prompt, payload, context, flash=False, **options):
             if output.__name__ == "WorkloadEdit":
                 return output.model_validate({"workload_only": False, "total_hours": 216, "total_credits": None,
                     "hours_per_credit": None, "distribute_evenly": False, "subjects": []})
@@ -282,7 +284,7 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
                 assignment.update(instructions="Составьте SQL-запрос и проверьте работу индекса.",
                                   change_status="modified", previous_value=block_value(old))
                 return output.model_validate(revised, context=context)
-            return await original(output, prompt, payload, context, flash)
+            return await original(output, prompt, payload, context, flash, **options)
 
         self.model.generate = generate
         await decide(self.factory, self.teacher, course.id, course.draft_version_id, "revise",
@@ -298,10 +300,10 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
     async def test_refresh_keeps_discipline_ids_and_adds_evidence_to_existing_draft(self):
         model = self.model.generate
 
-        async def old_model(output, prompt, payload, context, flash=False):
+        async def old_model(output, prompt, payload, context, flash=False, **options):
             if output.__name__ == "SubjectRationaleBatch":
                 return output.model_validate({"items": []}, context=context)
-            return await model(output, prompt, payload, context, flash)
+            return await model(output, prompt, payload, context, flash, **options)
 
         self.model.generate = old_model
         course = await self.process()
@@ -500,6 +502,56 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             sources = (await db.scalars(select(SourceRow))).all()
             self.assertFalse(any(source.record["source_type"] == "expert" for source in sources))
 
+    async def test_member_checking_keeps_turns_and_drafts_only_confirmed_work(self):
+        self.model.gap = True
+        original = self.model.generate
+
+        async def generate(output, prompt, payload, context, **options):
+            if output.__name__ == "ProfessionEvidenceVerdicts":
+                return output.model_validate({"items": [
+                    {"pair_id": pair["pair_id"], "verdict": "weak" if pair["statement"].endswith(("этапе 0", "этапе 1"))
+                     else "supports"} for pair in payload["pairs"]]}, context=context)
+            if output.__name__ == "CourseProgramModel":
+                tasks = {task.id: task.title for task in context["activity"].tasks}
+                self.assertIn("task0", tasks)
+                self.assertNotIn("task1", tasks)
+                self.assertIn("Сверяет миграции PostgreSQL", tasks.values())
+            return await original(output, prompt, payload, context, **options)
+
+        self.model.generate = generate
+        extra = source_record("Priklad", "https://example.org/work", "Работа с PostgreSQL", "Проверка миграций PostgreSQL.")
+        self.evidence.search.return_value = [*records().values(), extra]
+        await self.process()
+        async with self.factory() as db:
+            first = (await db.scalars(select(Interview))).one()
+        self.assertEqual(first.gap_report["profession_profile"]["interview_method_used"], "member_checking_validation")
+        self.assertIn("work_task:task0", first.gap_report["review_candidate_ids"])
+        expert = user("expert")
+        users = AsyncMock()
+        users.get_by_id.return_value = expert
+        token = await self.store.invite(first.id, expert.id, self.teacher, users)
+        await self.store.submit_interview(token, expert, first.interrupt_id, "one", "Проверка задач", [],
+                                          profession_decisions=[{"claim_id": "work_task:task0", "action": "confirm"},
+                                                                {"claim_id": "work_task:task1", "action": "reject"}],
+                                          continue_interview=True)
+        self.assertEqual((await self.process()).status, "waiting_for_expert")
+        async with self.factory() as db:
+            invitation, second, _ = next(entry for entry in (await db.execute(assigned_interviews(expert))).all()
+                                         if entry[1].id != first.id)
+        self.assertEqual(second.gap_report["interview_turn"], 2)
+        await self.store.submit_interview("", expert, second.interrupt_id, "two", "Новый рабочий кейс", [],
+                                          invitation_id=invitation.id,
+                                          profession_decisions=[{"claim_id": "new", "action": "add",
+                                                                "statement": "Сверяет миграции PostgreSQL"}])
+        course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        async with self.factory() as db:
+            version = await db.get(CourseVersion, course.draft_version_id)
+        claims = {item["claim_id"]: item for item in version.content["profession_profile"]["claims"]}
+        self.assertEqual(claims["work_task:task0"]["evidence"][-1]["source_id"], "turn:1")
+        self.assertEqual(claims["work_task:task1"]["verification_status"], "rejected")
+        self.assertEqual(claims["expert:turn:2:new"]["verification_status"], "verified")
+
     async def test_teacher_can_finish_existing_interview_and_open_draft(self):
         self.model.gap = True
         course = await self.process()
@@ -517,7 +569,7 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
         self.model.gap = True
         original = self.model.generate
 
-        async def generate(output, prompt, payload, context, flash=False):
+        async def generate(output, prompt, payload, context, flash=False, **options):
             if output.__name__ == "SubjectPlan":
                 return output.model_validate({"subjects": [
                     {"name": f"Дисциплина {i}", "is_fundamental": True, "conflict_with": None, "source_ids": ["Books"]}
@@ -525,7 +577,7 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             if output.__name__ == "CourseProgramModel":
                 self.assertLessEqual(len(payload["batch_subjects"]), 4)
                 raise RuntimeError("Внешняя модель не ответила")
-            return await original(output, prompt, payload, context, flash)
+            return await original(output, prompt, payload, context, flash, **options)
 
         self.model.generate = AsyncMock(side_effect=generate)
         async with self.factory.begin() as db:

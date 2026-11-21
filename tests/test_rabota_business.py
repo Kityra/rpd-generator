@@ -122,6 +122,9 @@ class CourseBusinessTests(unittest.IsolatedAsyncioTestCase):
             seen[output.__name__] = (instructions, payload, context)
             if output.__name__ == "SubjectPlan":
                 return output.model_validate({"subjects": []})
+            if output.__name__ == "ProfessionEvidenceVerdicts":
+                return output.model_validate({"items": [{"pair_id": pair["pair_id"], "verdict": "supports"}
+                                                       for pair in payload["pairs"]]})
             ids = [item["source_id"] for item in payload["sources"] if item["source_type"] == "RabotaRu"]
             if output.__name__ == "AppliedActivityModel":
                 value = {"source_ids": ids, "processes": [], "aspects": [], "tasks": [{
@@ -151,7 +154,7 @@ class CourseBusinessTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(state["gap_report"]["business_coverage"], 0.8)
             self.assertEqual(state["gap_report"]["science_coverage"], 0.0)
 
-        settings = SimpleNamespace(app_database_url="unused", checkpoint_url="unused",
+        settings = SimpleNamespace(app_database_url="unused", checkpoint_url="unused", public_origin="http://localhost:8501",
                                    business_coverage_threshold=0.6, science_coverage_threshold=0.6,
                                    literature_parser_enabled=False, public_vacancies_enabled=False)
         with patch.dict("os.environ", {"RABOTA_IT_DATABASE": str(self.path)}), \

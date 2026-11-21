@@ -72,15 +72,57 @@ async def interviews(actor, factory):
                     st.write(content)
                     if files:
                         st.caption(", ".join(f["name"] for f in files))
-            if st.button("Завершить интервью и передать в курс", type="primary", disabled=not pending):
-                content, files = pending
-                await SqlWorkflowStore(factory).submit_interview("", actor, interview.interrupt_id, inv.id,
-                            content or "Ответ в приложенных материалах.", files, invitation_id=inv.id)
-                del st.session_state[pending_key]
+            decisions, valid = profession_decisions(interview)
+            report = interview.gap_report
+            more = report.get("interview_turn", 1) < report.get("interview_max_turns", 1)
+            continue_interview = more and st.checkbox("Запросить следующий вопрос", key=f"more-{interview.id}")
+            label = "Ответить и продолжить интервью" if continue_interview else "Завершить интервью и передать в курс"
+            if st.button(label, type="primary", disabled=not valid or not (pending or decisions)):
+                content, files = pending or ("", [])
+                await SqlWorkflowStore(factory).submit_interview(
+                    "", actor, interview.interrupt_id, inv.id,
+                    content or ("Ответ в приложенных материалах." if files else "Решения по профилю профессии."),
+                    files, invitation_id=inv.id, profession_decisions=decisions, continue_interview=continue_interview)
+                st.session_state.pop(pending_key, None)
                 st.rerun()
         else:
             st.success("Ответ сохранён. Преподаватель увидит результаты проверки в карточке курса.")
         st.button("Обновить интервью", type="tertiary")
+
+
+def profession_decisions(interview):
+    report = interview.gap_report
+    if not report.get("profession_profile"):
+        return [], True
+    st.caption(f"Реплика {report['interview_turn']} из {report['interview_max_turns']}")
+    labels = {None: "Без решения", "confirm": "Подтвердить", "edit": "Исправить", "reject": "Отклонить"}
+    allowed = set(report["review_candidate_ids"])
+    decisions, valid = [], True
+    for claim in report["profession_profile"]["claims"]:
+        if claim["claim_id"] not in allowed:
+            continue
+        key = f"{interview.id}-{claim['claim_id']}"
+        with st.expander(claim["statement"]):
+            for ref in claim["evidence"]:
+                st.text(ref["quote_or_metric"])
+            action = st.selectbox("Решение по утверждению", list(labels), format_func=labels.get, key=key)
+            statement = st.text_input("Уточнённая формулировка", key=f"edit-{key}", max_chars=2000).strip() if action == "edit" else None
+            if action:
+                valid = valid and (action != "edit" or bool(statement))
+                decisions.append({"claim_id": claim["claim_id"], "action": action, "statement": statement})
+    categories = {"work_task": "Рабочая задача", "duty_area": "Обязанность", "work_artifact": "Результат работы",
+                  "tool_stack": "Инструмент", "domain_constraint": "Условие или критерий качества"}
+    category = st.selectbox("Что вы подтверждаете", list(categories), format_func=categories.get,
+                            key=f"expert-category-{interview.id}")
+    tasks = st.text_area("Подтверждаемые сведения", placeholder="Одно утверждение на строку. Назовите действие и результат.",
+                         key=f"expert-tasks-{interview.id}", max_chars=16000)
+    for index, line in enumerate(filter(None, (item.strip() for item in tasks.splitlines())), 1):
+        decisions.append({"claim_id": str(index), "action": "add", "statement": line, "category": category})
+        valid = valid and len(line) <= 2000
+    if len(decisions) > 40:
+        valid = False
+        st.warning("За одну реплику можно передать до 40 решений и новых задач.")
+    return decisions, valid
 
 
 def main():

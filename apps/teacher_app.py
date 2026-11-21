@@ -9,7 +9,7 @@ from apps.common import composer, portal
 from apps.teacher_programs import knowledge_screen, my_disciplines
 from apps.presentation import course_progress, status_badge
 from domain.export import (OUTLINE_LABEL, block_html, composition_html, export_course, generation_summary,
-                           rationale_report_html, source_html, subject_origin)
+                           profession_counts, profession_profile_html, rationale_report_html, source_html, subject_origin)
 from pydantic import ValidationError
 
 from domain.export import LEVEL_LABELS
@@ -251,6 +251,14 @@ async def expert_actions(actor, settings, factory, users, course, interview):
 
 def report_panel(version, registry, interviews, analysis=None):
     program = version.content["program"]
+    if profile := version.content.get("profession_profile"):
+        st.html(profession_profile_html(profile, version.content.get("profession_market", {}), registry))
+        rejected = [claim for claim in profile["claims"] if claim["verification_status"] == "rejected"]
+        if rejected:
+            with st.expander("Утверждения, отклонённые экспертом"):
+                for claim in rejected:
+                    st.text(claim["statement"])
+                    st.caption(claim["verification_reason"])
     if analysis is not None:
         market_report(analysis)
     if composition := composition_html(version.content.get("composition_check")):
@@ -358,6 +366,10 @@ async def course_detail(actor, settings, factory, users, course, notices):
                     gaps = ", ".join(GAP_LABELS.get(kind, kind) for kind in gap_types)
                     st.warning(f"Требуют проверки преподавателя — {gaps}.")
                 generation_panel(version.content["program"], await model_call_failures(factory, course.id))
+                if profile := version.content.get("profession_profile"):
+                    counts = profession_counts(profile)
+                    st.caption(f"Профиль профессии · подтверждено {counts['verified']} · "
+                               f"требует проверки {counts['needs_review']} · отклонено {counts['rejected']}")
                 analysis = course_market(course.course_meta, version.content["program"], registry,
                                          version.content.get("vacancy_source_ids", []), version.content.get("activity"))
                 loads, proposal = course_workspace(version, registry, interviews, can_review, active, course.course_meta,
@@ -377,9 +389,27 @@ async def course_detail(actor, settings, factory, users, course, notices):
             with side.container(key="course-actions"):
                 if waiting:
                     st.subheader("Продолжить подготовку")
+                    report = interviews[0].gap_report
+                    profile = report.get("profession_profile") or {}
+                    choices = {claim["claim_id"]: claim["statement"] for claim in profile.get("claims", [])
+                               if claim["verification_status"] == "needs_review"}
+                    selected = st.multiselect("Включить в черновик для проверки", list(choices),
+                                              format_func=choices.get, key=f"profile-check-{interviews[0].id}") if choices else []
+                    manual_tasks = []
+                    if profile.get("sample_adequacy") == "empty_external_data" or report.get("requires_manual_input"):
+                        st.info("Для профиля нет внешних данных. Укажите известные вам рабочие задачи или пригласите эксперта.")
+                        template = st.text_area("Рабочие задачи преподавателя", key=f"manual-{interviews[0].id}",
+                                                placeholder="Одна задача на строку\nДействие → объект → проверяемый результат",
+                                                max_chars=16000)
+                        manual_tasks = template.splitlines()
                     if st.button("Сформировать черновик по имеющимся данным", type="primary", width="stretch"):
-                        await finish_without_answer(factory, actor, course.id, interviews[0].id)
-                        st.rerun()
+                        try:
+                            await finish_without_answer(factory, actor, course.id, interviews[0].id,
+                                                        acknowledged_claim_ids=selected, manual_tasks=manual_tasks)
+                        except ValueError as error:
+                            st.warning(str(error))
+                        else:
+                            st.rerun()
                     st.caption("Сборка продолжится без интервью. Оставшиеся пробелы будут отмечены в черновике.")
                     await expert_actions(actor, settings, factory, users, course, interviews[0])
                 if can_review:

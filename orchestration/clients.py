@@ -13,6 +13,7 @@ from domain.schemas import (ActivityAspect, ActivityProcess, ActivityTask, Appli
                             EvidenceResults, LearningReference, Model, SourceRecord, SubjectPlan, TopicAssignments)
 from orchestration.call_log import CALL_STATS, GENERATION_NOTES
 from orchestration.evidence_cache import source_record
+from orchestration.profession_verifier import ProfessionEvidenceVerdicts
 from orchestration.relevance_filter import DEFAULT_MIN_SCORE, dropped_notice, filter_fragments
 from orchestration.resilience import ExternalUnavailable, snapshot_notice
 from orchestration.yandex_calls import InvalidIndexResponse, model_response, search_fragments
@@ -45,7 +46,7 @@ class ActivityStructure(Model):
 
 class ModelClient(Protocol):
     async def generate(self, output: type[Output], prompt: str, payload: dict[str, Any],
-                       context: dict[str, Any], flash: bool = False) -> Output:
+                       context: dict[str, Any], flash: bool = False, temperature: float | None = None) -> Output:
         """Выполнить реальный структурированный вызов с проверкой."""
 
 
@@ -319,8 +320,9 @@ class YandexModelClient:
         schema = grounded_schema(output, context)
         # Входной лимит модели минус запас на ответ не нужен: Yandex ограничивает именно вход.
         limit = int(int(_env(self.settings, "YANDEX_INPUT_TOKEN_LIMIT", "32768")) * 0.9)
+        schema_attempts = 1 if output is ProfessionEvidenceVerdicts else 2
         with open_yandex(self.settings) as client:
-            for attempt in range(2):
+            for attempt in range(schema_attempts):
                 if stats is not None:
                     stats.attempts += 1
                 request, shortened = fit_request(request, prompt, schema, limit)
@@ -363,7 +365,7 @@ class YandexModelClient:
                                          "Учебные источники добавит этап подбора литературы.")
                         return result
                     logger.warning("Ошибка схемы %s, попытка %s", output.__name__, attempt + 1)
-                    if attempt == 1:
+                    if attempt + 1 == schema_attempts:
                         raise
                     request = {**payload, "previous_output": raw, "repair": error.errors(
                         include_input=False, include_context=False, include_url=False)}

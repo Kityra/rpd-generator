@@ -96,8 +96,12 @@ async def decide(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, 
 
 
 async def finish_without_answer(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str,
-                                interview_id: str) -> None:
+                                interview_id: str, *, acknowledged_claim_ids: list[str] | None = None,
+                                manual_tasks: list[str] | None = None) -> None:
     require_teacher(actor)
+    tasks = list(dict.fromkeys(line.strip() for line in manual_tasks or [] if line.strip()))
+    if len(tasks) > 20 or any(len(task) > 2000 for task in tasks):
+        raise ValueError("Укажите до 20 рабочих задач, до 2000 символов каждая.")
     async with write_transaction(factory) as db:
         interview = await db.scalar(select(Interview).where(Interview.id == interview_id,
                                     Interview.course_id == course_id).with_for_update())
@@ -111,13 +115,21 @@ async def finish_without_answer(factory: async_sessionmaker[AsyncSession], actor
             return
         if existing or interview.status != "invited" or course.status != "waiting_for_expert":
             raise ValueError("Курс уже продолжил обработку. Обновите страницу.")
+        claims = interview.gap_report.get("profession_profile", {}).get("claims", [])
+        allowed = {claim["claim_id"] for claim in claims if claim["verification_status"] == "needs_review"}
+        selected = list(dict.fromkeys(acknowledged_claim_ids or []))
+        if set(selected) - allowed:
+            raise ValueError("Выберите текущие утверждения, требующие проверки.")
+        if interview.gap_report.get("requires_manual_input") and not tasks and not selected:
+            raise ValueError("Укажите хотя бы одну рабочую задачу для подготовки черновика.")
         await db.execute(update(ExpertInvitation).where(ExpertInvitation.interview_id == interview_id,
                          ExpertInvitation.status == "active").values(status="revoked"))
         interview.status = "closed"
         course.status = "queued"
         db.add(WorkflowCommand(id=key, course_id=course.id, kind="resume",
                                payload={"interrupt_id": interview.interrupt_id, "actor_user_id": actor.id,
-                                        "action": "finish_without_answer"}))
+                                        "action": "finish_without_answer", "acknowledged_claim_ids": selected,
+                                        "manual_tasks": tasks}))
 
 
 async def acknowledge(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str) -> None:

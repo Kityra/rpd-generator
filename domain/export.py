@@ -14,6 +14,7 @@ REASONS = {"market_demand": "Спрос работодателей", "scientific
 
 
 OUTLINE_LABEL = "Собрано шаблоном, нужна проверка"
+PROFESSION_REVIEW_LABEL = "[Требует проверки преподавателя — нет прямого подтверждения в источниках]"
 # Так помечал обоснование шаблон make_outline до появления поля generated_by.
 LEGACY_OUTLINE_SUMMARY = "Тема предложена для проверки преподавателем по приложенным материалам."
 
@@ -193,6 +194,7 @@ def course_report_html(content: dict, sources: dict, notices_html: str, market: 
     parts = ['<!doctype html><html lang="ru"><meta charset="utf-8">',
              f"<title>{title}</title><h1>{title}</h1>",
              generation_summary_html(program),
+             profession_profile_html(content.get("profession_profile"), content.get("profession_market", {}), sources),
              composition_html(content.get("composition_check")),
              rationale_report_html(program, sources)]
     audit = program.get("business_audit")
@@ -215,6 +217,52 @@ def course_report_html(content: dict, sources: dict, notices_html: str, market: 
         for key in vacancy_ids:
             parts.append(source_html(sources[key]))
     return "\n".join([*parts, notices_html, "</html>"])
+
+
+def profession_counts(profile: dict) -> dict:
+    counts = dict.fromkeys(("verified", "needs_review", "rejected"), 0)
+    for claim in profile.get("claims", []):
+        counts[claim["verification_status"]] += 1
+    return counts
+
+
+def profession_profile_html(profile: dict | None, market: dict, sources: dict) -> str:
+    if not profile:
+        return ""
+    counts = profile.get("counts") or profession_counts(profile)
+    parts = ["<h2>Профиль профессии</h2>", "<p>"
+             f"Подтверждено: {counts['verified']} · Требует проверки: {counts['needs_review']} · "
+             f"Отклонено экспертом: {counts['rejected']}</p>"]
+    if profile["sample_adequacy"] == "empty_external_data":
+        parts.append("<p>Внешних данных о рабочих задачах и измерений рынка нет.</p>")
+    elif profile["sample_adequacy"] == "low_sample":
+        parts.append("<p>Внешняя выборка ограничена.</p>")
+    if profile["missing_slots"]:
+        parts.append(f"<p>Требуется уточнить: {escape(', '.join(profile['missing_slots']))}.</p>")
+    parts.append("<ul>")
+    for claim in profile["claims"]:
+        if claim["verification_status"] == "rejected":
+            continue
+        badges, fragments = [], []
+        for ref in claim["evidence"]:
+            if ref["expert_status"] in {"confirmed_by_expert", "edited_by_expert"}:
+                number = ref["source_id"].removeprefix("turn:")
+                badges.append(f"[Подтверждено экспертом, реплика #{number}]")
+            if ref["judge_verdict"] == "supports" and ref["source_type"] == "market_cluster":
+                provider = market.get(ref["source_id"], {}).get("provider", "выборка вакансий")
+                metric = ref["quote_or_metric"].replace(" (", " вакансий (", 1)
+                badges.append(f"[Рынок {provider}: {metric}, подтверждено]")
+            if ref["judge_verdict"] == "supports" and ref["source_type"] == "rag_chunk":
+                badges.append("[Подтверждено источником RAG]")
+            title = sources.get(ref["source_id"], {}).get("title")
+            fragments.append(f"<p>{escape(title + ' — ' if title else '')}{escape(ref['quote_or_metric'])}</p>")
+        if claim["verification_status"] == "needs_review":
+            badges = [PROFESSION_REVIEW_LABEL]
+        labels = " ".join(escape(label) for label in dict.fromkeys(badges))
+        details = (f"<details><summary>Основание</summary>{''.join(fragments)}</details>" if fragments else "")
+        parts.append(f"<li>{escape(claim['statement'])} <strong>{labels}</strong>{details}</li>")
+    parts.append("</ul>")
+    return "\n".join(parts)
 
 
 def child_blocks(block):
@@ -301,6 +349,9 @@ def export_course(meta, version, sources, market: dict | None = None):
     if version.status != "approved":
         raise ValueError("Экспорт доступен после утверждения версии.")
     content = version.content if market is None else {**version.content, "market_analysis": market}
+    if profile := content.get("profession_profile"):
+        content = {**content, "profession_profile": {**profile, "counts": profession_counts(profile),
+                   "claims": [claim for claim in profile["claims"] if claim["verification_status"] != "rejected"]}}
     program = content["program"]
     notices = content.get("source_notices", [])
     notices_html = ""
@@ -314,6 +365,9 @@ def export_course(meta, version, sources, market: dict | None = None):
             archive.writestr(path, json.dumps(data, ensure_ascii=False, indent=2))
         write_json("course.json", content)
         source_ids = set(used_sources(content)) | set(content.get("vacancy_source_ids", ()))
+        source_ids.update(ref["source_id"] for claim in content.get("profession_profile", {}).get("claims", [])
+                          for ref in claim["evidence"] if ref["source_type"] in {"rag_chunk", "user_input"}
+                          and ref["source_id"] in sources)
         write_json("sources.json", {k: sources[k] for k in sorted(source_ids)})
         archive.writestr("course-report.html", course_report_html(content, sources, notices_html, market))
         for index, subject in enumerate(program["subjects"], 1):

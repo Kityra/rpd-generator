@@ -175,7 +175,7 @@ class OutlineProvenanceTests(unittest.IsolatedAsyncioTestCase):
         original = model.generate
         names = [f"Дисциплина {i}" for i in range(6)]
 
-        async def generate(output, prompt, payload, context, flash=False):
+        async def generate(output, prompt, payload, context, flash=False, **options):
             if output.__name__ == "SubjectPlan":
                 return output.model_validate({"subjects": [
                     {"name": name, "is_fundamental": False, "conflict_with": None, "source_ids": ["Books"]}
@@ -184,7 +184,7 @@ class OutlineProvenanceTests(unittest.IsolatedAsyncioTestCase):
                 if "Дисциплина 0" in payload["batch_subjects"]:
                     raise timeout_error()
                 return output.model_validate(batch_program(payload["batch_subjects"]), context=context)
-            return await original(output, prompt, payload, context, flash)
+            return await original(output, prompt, payload, context, flash, **options)
 
         model.generate = generate
         course = await self.process(model)

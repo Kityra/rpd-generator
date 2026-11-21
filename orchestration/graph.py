@@ -23,6 +23,12 @@ from orchestration.clients import EvidenceClient, ModelClient, NoActivityEvidenc
 from orchestration import prompts
 from orchestration.draft import make_outline
 from orchestration.interview_methods import load_interview_methods
+from orchestration.interview_skills import FALLBACK, load_interview_skills, select_interview_method
+from orchestration.profession_pipeline import (ACTIVITY_SOURCE_TYPES, activity_for_design, add_expert_proposals,
+                                               apply_expert_turn, initial_profile, manual_profile, market_evidence,
+                                               with_missing_slots)
+from orchestration.profession_profile import ProfessionProfile
+from orchestration.profession_verifier import normalized, verify_profession_profile
 from orchestration.rabota_business import SOURCE, SOURCE_GUIDANCE
 from orchestration.relevance_filter import gap_query, search_query
 from orchestration.semantic_check import composition_report, limit_fundamental, weighted_coverage
@@ -101,6 +107,15 @@ class GraphState(TypedDict, total=False):
     interview_answers: list[dict]
     interview_round: int
     verification: dict
+    profession_profile: dict
+    profession_rag: dict[str, str]
+    profession_market: dict
+    profession_market_sample: int
+    profession_turns: dict
+    raw_activity: dict
+    acknowledged_profession_claims: list[str]
+    interview_max_turns: int
+    interview_continue: bool
     course_program: dict
     baseline: dict | None
     revision_baseline: dict | None
@@ -146,7 +161,8 @@ class WorkflowStore(Protocol):
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
                          scheduled: bool, activity: dict, *, evidence_gaps: dict, source_notices: list[str],
                          vacancy_source_ids: list[str], workload_proposal: dict, generation: dict | None = None,
-                         composition: dict | None = None) -> None:
+                         composition: dict | None = None, profession_profile: dict | None = None,
+                         profession_market: dict | None = None) -> None:
         """Сохранить версию и уведомление."""
 
     async def finish_review(self, course_id: str, version_id: str, action: str, actor: str, workloads=None) -> None:
@@ -182,6 +198,7 @@ def context(state: GraphState) -> dict:
     result: dict = {"sources": registry(state), "manual_subjects": state.get("manual_subjects", []),
                     # Задачи из модели профессии проверены экспертами, но без артефактов и критериев качества.
                     "allow_incomplete_activity": bool(state.get("gap_report", {}).get("gap_types"))
+                    or (bool(state.get("profession_profile")) and not state.get("applied_activity"))
                     or state.get("activity_origin") == PROFESSION_MODEL,
                     "market_measurements": {}, "fundamental_subjects": [
                         subject["name"] for subject in planned_subjects(state)
@@ -200,6 +217,9 @@ def payload(state: GraphState) -> dict:
     excluded = {"interview_answers", "verification", "owner_user_id", "request_id", "run_id",
                 "interview_session_id", "interrupt_id", "version_id", "consumed_review_id", "closed_interview_id"}
     excluded.update({"workload_proposal", "workload_only", "workload_notice"})
+    excluded.update({"profession_profile", "profession_rag", "profession_market", "profession_market_sample",
+                     "profession_turns", "raw_activity", "acknowledged_profession_claims",
+                     "interview_max_turns", "interview_continue"})
     result = {key: value for key, value in state.items() if key not in excluded}
     if "review_feedback" in result:
         result["review_feedback"] = [{"content": item.get("content", ""), "attachments": item.get("attachments", [])}
@@ -211,10 +231,48 @@ def payload(state: GraphState) -> dict:
         if report.get("gap_types"):
             result["auto_subjects"] = {"subjects": planned_subjects(state)}
             result["sources"] = [{**source, "content": source["content"][:1800]} for source in state.get("sources", [])]
+    if state.get("profession_profile"):
+        result["course_meta"] = {k: v for k, v in state["course_meta"].items() if k not in {"activity_model", "market"}}
+        for role in ("business", "science", "university", "books"):
+            result.pop(f"{role}_report", None)
+        result["profession_basis"] = profession_basis(state)
+        result["sources"] = synthesis_sources(state)
     baseline = context(state).get("baseline")
     if baseline:
         result["previous_values"] = {key: block_value(block) for key, block in all_blocks(baseline.subjects).items()}
     return result
+
+
+def profession_basis(state: GraphState) -> list[dict]:
+    acknowledged = set(state.get("acknowledged_profession_claims", []))
+    return [{key: claim[key] for key in ("category", "statement", "verification_status")}
+            for claim in state.get("profession_profile", {}).get("claims", [])
+            if claim["verification_status"] == "verified" or
+            (claim["verification_status"] == "needs_review" and claim["claim_id"] in acknowledged)]
+
+
+def synthesis_sources(state: GraphState) -> list[dict]:
+    sources = state.get("sources", [])
+    if not state.get("profession_profile"):
+        return sources
+    excerpts: dict[str, list[str]] = {}
+    for claim in state["profession_profile"]["claims"]:
+        if claim["verification_status"] != "verified":
+            continue
+        for ref in claim["evidence"]:
+            if ref["source_type"] == "rag_chunk" and ref["judge_verdict"] == "supports":
+                excerpts.setdefault(ref["source_id"], []).append(ref["quote_or_metric"])
+    selected = []
+    activity_ids = set(state.get("applied_activity", {}).get("source_ids", []))
+    for source in sources:
+        source_id = source["source_id"]
+        if source["source_type"] in {"Books", "RPD", "Literature", "Crossref", "arXiv", "documentation", "teacher"}:
+            selected.append(source)
+        elif fragments := excerpts.get(source_id):
+            selected.append({**source, "content": "\n".join(dict.fromkeys(fragments))})
+        elif source["source_type"] == "expert" and source_id in activity_ids:
+            selected.append(source)
+    return selected
 
 
 def mark_generated(program: dict, generated_by: str, note: str | None = None, *, keep_existing: bool = False) -> dict:
@@ -249,7 +307,8 @@ def outline_hint(title: str, name: str, suggestions: list[dict], ctx: dict) -> d
 def subject_request(state: GraphState, names: list[str], suggestions: list[dict], ctx: dict) -> tuple[dict, list[str]]:
     """Запрос черновика одной дисциплины: только связанные задачи и источники, укладывается в контекст модели."""
     from orchestration.semantic_check import concepts
-    sources: dict[str, SourceRecord] = ctx["sources"]
+    sources = ({row["source_id"]: SourceRecord.model_validate(row) for row in synthesis_sources(state)}
+               if state.get("profession_profile") else ctx["sources"])
     keys = {" ".join(name.casefold().split()) for name in names}
     plan = [item for item in suggestions if " ".join(item["name"].casefold().split()) in keys]
     terms = concepts(" ".join(names))
@@ -279,6 +338,9 @@ def subject_request(state: GraphState, names: list[str], suggestions: list[dict]
     }
     if hint:
         request["outline_hint"] = hint
+    if state.get("profession_profile"):
+        request["profession_basis"] = [claim for claim in profession_basis(state)
+                                       if terms & concepts(claim["statement"])]
     if state.get("review_feedback"):
         request["review_feedback"] = [{"content": item.get("content", "")} for item in state["review_feedback"]]
     return request, selected
@@ -314,6 +376,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                 "interview_source_notices": [], "factcheck_source_notices": [], "draft_source_notices": [],
                 "literature_source_notices": [], "composition_notices": [],
                 "applied_activity": {}, "activity_origin": "", "gap_report": {}, "verification": {}, "auto_subjects": {},
+                "profession_profile": {}, "profession_turns": {}, "acknowledged_profession_claims": [],
+                "interview_max_turns": 0, "interview_continue": False,
                 "course_program": {}, "consumed_review_id": "", "closed_interview_id": "", "version_id": ""}
 
     def agent(role: str):
@@ -324,7 +388,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             sources = await evidence.search(role, query, owner_scope=state["owner_user_id"])
             notices = getattr(sources, "notices", [])
             if not sources:
-                return {f"{role}_report": {"findings": [], "source_notices": notices}, "sources": []}
+                return {f"{role}_report": {"findings": [], "source_notices": notices, "retrieved_source_ids": []},
+                        "sources": []}
             source_map = {item.source_id: item for item in sources}
             instructions = prompts.AGENT.format(role=role)
             if role == "business" and any(item.source_type == SOURCE for item in sources):
@@ -342,7 +407,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             except (ExternalUnavailable, ValidationError):
                 report = AgentReport(findings=[])
                 notices = [*notices, f"{role}: модель не сформировала сводку. Сохранены исходные материалы."]
-            report_data = {**report.model_dump(mode="json"), "source_notices": notices}
+            report_data = {**report.model_dump(mode="json"), "source_notices": notices,
+                           "retrieved_source_ids": [item.source_id for item in sources]}
             if role == "business":
                 report_data["vacancy_source_ids"] = [item.source_id for item in sources
                                                      if item.source_type in VACANCY_SOURCE_TYPES]
@@ -361,32 +427,62 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def formalize(state: GraphState) -> dict:
         snapshot = state["course_meta"].get("activity_model") or {}
+        records = []
+        raw = {}
+        all_sources = registry(state)
+        reports = [state[f"{role}_report"] for role in ("business", "science", "university", "books")]
+        current_ids = {key for report in reports for key in report.get("retrieved_source_ids", [])}
+        if any("retrieved_source_ids" not in report for report in reports):
+            current_ids.update(all_sources)  # Чекпойнты, записанные до сохранения ID текущего сбора.
         if snapshot.get("tasks"):
-            # Задачи из модели деятельности профессии: без вызова LLM, каждая задача — со своим источником.
-            activity, records = activity_from_snapshot(snapshot, settings.public_origin)
-            known = {**registry(state), **{record.source_id: record for record in records}}
-            model = AppliedActivityModel.model_validate(activity, context={"sources": known})
-            return {"applied_activity": model.model_dump(mode="json"), "activity_origin": PROFESSION_MODEL,
-                    "sources": [record.model_dump(mode="json") for record in records]}
-        sources = {k: s for k, s in registry(state).items()
-                   if s.source_type in BUSINESS_SOURCE_TYPES | {"Crossref", "arXiv", "expert", "documentation"}}
-        if not sources:
-            return {"applied_activity": {}}
-        activity_input = {"course": state["course_meta"], "business": state["business_report"],
-                          "science": state["science_report"], "sources": [s.model_dump(mode="json") for s in sources.values()]}
+            raw, records = activity_from_snapshot(snapshot, settings.public_origin)
+            all_sources.update({record.source_id: record for record in records})
+            current_ids.update(record.source_id for record in records)
+        sources = {key: source for key, source in all_sources.items()
+                   if key in current_ids and source.source_type in ACTIVITY_SOURCE_TYPES}
+        if sources and not raw:
+            activity_input = {"course": state["course_meta"], "business": state["business_report"],
+                              "science": state["science_report"], "sources": [s.model_dump(mode="json") for s in sources.values()]}
+            try:
+                instructions = prompts.ACTIVITY
+                if any(source.source_type == SOURCE for source in sources.values()):
+                    instructions += "\n" + SOURCE_GUIDANCE
+                model = await llm.generate(AppliedActivityModel, instructions, activity_input, {"sources": sources})
+                raw = model.model_dump(mode="json")
+            except (NoActivityEvidence, RuntimeError, ValidationError):
+                logging.getLogger(__name__).warning("Не сформированы кандидаты профиля курса %s.", state["request_id"])
+        rag = {key: source.content for key, source in sources.items() if source.source_type != "ActivityModel"}
+        for task, record in zip(snapshot.get("tasks", []), records):
+            if excerpts := "\n".join(quote["text"] for quote in task.get("quotes", []) if quote["text"].strip()):
+                rag[record.source_id] = excerpts
+        sample, market = market_evidence(state["course_meta"], sources, state["business_report"].get("vacancy_source_ids", []))
+        meta = state["course_meta"]
+        profile = initial_profile(meta.get("profession") or meta["title"], raw, rag, sample, market)
+        profile = await verify_profile(profile, rag, market, {})
+        update = project_profile(state, profile, raw, [], all_sources)
+        return {**update, "raw_activity": raw, "profession_rag": rag, "profession_market": market,
+                "profession_market_sample": sample, "activity_origin": PROFESSION_MODEL if snapshot.get("tasks") else "",
+                "sources": [*[record.model_dump(mode="json") for record in records], *update["sources"]]}
+
+    def project_profile(state, profile, raw, acknowledged, sources):
+        url = f"{settings.public_origin}/teacher?course={state['request_id']}"
+        profile = with_missing_slots(profile, state["course_meta"])
+        activity, records = activity_for_design(profile, raw, acknowledged, url, sources)
+        return {"profession_profile": profile.model_dump(mode="json"), "applied_activity": activity,
+                "acknowledged_profession_claims": acknowledged,
+                "sources": [record.model_dump(mode="json") for record in records]}
+
+    async def verify_profile(profile, rag, market, turns):
+        token = CALL_SCOPE.set(replace(CALL_SCOPE.get(), stage="profession_verification"))
         try:
-            instructions = prompts.ACTIVITY
-            if any(source.source_type == SOURCE for source in sources.values()):
-                instructions += "\n" + SOURCE_GUIDANCE
-            model = await llm.generate(AppliedActivityModel, instructions, activity_input, {"sources": sources})
-        except (NoActivityEvidence, YandexModeratedResponse):
-            return {"applied_activity": {}}
-        return {"applied_activity": model.model_dump(mode="json")}
+            return await verify_profession_profile(profile, rag, market, turns, llm)
+        finally:
+            CALL_SCOPE.reset(token)
 
     async def university_audit(state: GraphState) -> dict:
-        if not state["applied_activity"]:
+        if not state["applied_activity"] and not synthesis_sources(state):
             return {"auto_subjects": {"subjects": []}}
-        if state.get("activity_origin") == PROFESSION_MODEL:
+        if state.get("activity_origin") == PROFESSION_MODEL and state.get("applied_activity"):
             # Состав дисциплин решает руководитель программы: курс — это одна закреплённая дисциплина.
             ids = state["applied_activity"]["source_ids"]
             return {"auto_subjects": {"subjects": [
@@ -405,7 +501,10 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             return {"gap_report": report.model_dump(mode="json"), "status": "gap_analysis"}
         activity = AppliedActivityModel.model_validate(state["applied_activity"], context=context(state))
         sources = registry(state)
-        if state.get("activity_origin") == PROFESSION_MODEL:
+        if state.get("activity_origin") == PROFESSION_MODEL and not any(
+            claim["verification_status"] == "needs_review" and claim["category"] == "work_task"
+            for claim in state.get("profession_profile", {}).get("claims", [])
+        ):
             # Задачи уже прошли экспертную валидацию модели профессии: интервью по курсу не нужно.
             report = GapReport(gap_types=[], questions=[], business_coverage=1.0,
                                science_coverage=weighted_coverage(activity.tasks, sources, {"Crossref", "arXiv"}))
@@ -430,31 +529,57 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         if business < settings.business_coverage_threshold or science < settings.science_coverage_threshold:
             gaps.append("conflicting_evidence")
             questions.append("Какие источники подтверждают применение задач на практике и их научную основу?")
-        if state.get("verification"):
+        if state.get("verification") and not state.get("profession_profile"):
             for claim in state["verification"]["claims"]:
                 if claim["verification_status"] == "needs_clarification":
                     gaps.append("conflicting_evidence")
                     questions.append(claim["clarification_question"])
+        if any(claim["verification_status"] == "needs_review"
+               for claim in state.get("profession_profile", {}).get("claims", [])):
+            gaps.append("conflicting_evidence")
+            questions.append("Какие предложенные рабочие сведения подтверждаются вашей практикой?")
         report = GapReport(gap_types=list(dict.fromkeys(gaps)), questions=questions,
                            business_coverage=business, science_coverage=science)
         return {"gap_report": report.model_dump(mode="json"), "status": "gap_analysis"}
 
     async def prepare_interview(state: GraphState) -> dict:
         round_number = state.get("interview_round", 0)
-        if round_number:
+        saved = state.get("profession_profile")
+        if round_number and (not saved or round_number >= state.get("interview_max_turns", 0)):
             return {"status": "designing"}
         identifier = str(uuid5(NAMESPACE_URL, f"{state['request_id']}/{state['run_id']}/interview/{round_number}"))
         methods = await evidence.search("interview", gap_query(state["gap_report"], GAP_QUERY_LABELS),
                                         owner_scope=state["owner_user_id"])
-        local_skill = load_interview_methods(settings.interview_skill_directory, state["gap_report"]["gap_types"])
+        profile = ProfessionProfile.model_validate(saved) if saved else None
+        limit = 1
+        if profile:
+            pending = [claim for claim in profile.claims if claim.verification_status == "needs_review"]
+            method = profile.interview_method_used or select_interview_method(
+                sample_size=state["profession_market_sample"], rag_count=len(state["profession_rag"]),
+                has_unverified=any(ref.source_type in {"rag_chunk", "market_cluster"} for claim in pending
+                                   for ref in claim.evidence),
+                missing_lab_tasks=not any(task["artifacts"] and len(task["quality_criteria"]) >= 2
+                                          for task in state["applied_activity"].get("tasks", [])),
+                missing_slots=profile.missing_slots)
+            local = load_interview_skills(settings.interview_skill_directory).get(method, FALLBACK)
+            limit = state.get("interview_max_turns") or local.max_turns
+            profile = profile.model_copy(update={"interview_method_used": local.id})
+            local_skill = local.instructions
+        else:
+            local_skill = load_interview_methods(settings.interview_skill_directory, state["gap_report"]["gap_types"])
         skill = (local_skill + "\n\n" + "\n\n".join(item.content for item in methods))[:18000]
         notices = [*state.get("interview_source_notices", []), *getattr(methods, "notices", [])]
+        request = {"course": state["course_meta"]["title"], "gaps": state["gap_report"]["questions"],
+                   "interview_methods": skill}
+        if profile:
+            request.update(missing_slots=profile.missing_slots, evidence=[
+                {"source_id": ref.source_id, "quote_or_metric": ref.quote_or_metric}
+                for claim in profile.claims if claim.verification_status == "verified" for ref in claim.evidence
+                if ref.judge_verdict == "supports"][:12])
+        else:
+            request["tasks"] = [t["title"] for t in state["applied_activity"].get("tasks", [])]
         try:
-            turn = await llm.generate(InterviewTurn, prompts.INTERVIEW,
-                                      {"course": state["course_meta"]["title"], "gaps": state["gap_report"]["questions"],
-                                       "tasks": [t["title"] for t in state["applied_activity"].get("tasks", [])],
-                                       "interview_methods": skill, "history": [a["content"] for a in state.get("interview_answers", [])]},
-                                      context(state), flash=True)
+            turn = await llm.generate(InterviewTurn, prompts.INTERVIEW, request, {}, flash=True)
             question_origin = "interviewer"
         except (ValidationError, YandexModeratedResponse, ExternalUnavailable) as error:
             for question in reversed(state["gap_report"]["questions"]):
@@ -473,10 +598,17 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                   "question_origin": question_origin,
                   "previous_interview_id": state.get("interview_session_id") if round_number else None,
                   "method_source_ids": [item.source_id for item in methods]}
+        if profile:
+            report.update(profession_profile=profile.model_dump(mode="json"), interview_max_turns=limit,
+                          profession_market=state["profession_market"],
+                          interview_turn=round_number + 1, review_candidate_ids=[claim.claim_id for claim in pending[:20]],
+                          requires_manual_input=not (synthesis_sources(state) or state.get("manual_subjects") or
+                                                     state.get("applied_activity")))
         interview_id = await store.prepare_interview(state["request_id"], identifier, report)
         await store.save_sources(state["request_id"], [*registry(state).values(), *methods])
         await store.set_status(state["request_id"], "waiting_for_expert", state["owner_user_id"])
-        return {"interrupt_id": identifier, "interview_session_id": interview_id,
+        return {"interrupt_id": identifier, "interview_session_id": interview_id, "interview_max_turns": limit,
+                **({"profession_profile": profile.model_dump(mode="json")} if profile else {}),
                 "gap_report": report, "status": "waiting_for_expert", "interview_source_notices": list(dict.fromkeys(notices))}
 
     async def interview(state: GraphState) -> dict:
@@ -487,11 +619,34 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         if answer.get("action") == "finish_without_answer":
             if answer.get("actor_user_id") != state["owner_user_id"]:
                 raise PermissionError("Завершение интервью доступно владельцу курса.")
-            return {"closed_interview_id": state["interrupt_id"]}
+            update = {"closed_interview_id": state["interrupt_id"], "interview_continue": False}
+            if not state.get("profession_profile"):
+                return update
+            profile = ProfessionProfile.model_validate(state["profession_profile"])
+            acknowledged = [key for key in answer.get("acknowledged_claim_ids", [])
+                            if any(c.claim_id == key and c.verification_status == "needs_review" for c in profile.claims)]
+            manual = answer.get("manual_tasks", [])
+            sources = registry(state)
+            if manual or state.get("manual_subjects"):
+                url = f"{settings.public_origin}/teacher?course={state['request_id']}"
+                record = source_record("teacher", url + "&input=manual", "Ручные исходные данные преподавателя",
+                                       "\n".join([*manual, *state.get("manual_subjects", [])]))
+                sources[record.source_id] = record
+                profile = manual_profile(profile, manual, record)
+                manual_texts = {normalized(text) for text in manual}
+                acknowledged = list(dict.fromkeys([*acknowledged, *(c.claim_id for c in profile.claims
+                    if c.verification_status == "needs_review" and normalized(c.statement) in manual_texts)]))
+                update["sources"] = [record.model_dump(mode="json")]
+            if acknowledged:
+                projection = project_profile(state, profile, state["raw_activity"], acknowledged, sources)
+                projection["sources"] = [*update.get("sources", []), *projection["sources"]]
+                return {**update, **projection}
+            return update
         if not answer.get("content"):
             raise ValueError("Ответ эксперта пуст.")
         return {"interview_answers": [*state.get("interview_answers", []), answer],
-                "interview_round": state.get("interview_round", 0) + 1}
+                "interview_round": state.get("interview_round", 0) + 1,
+                "interview_continue": bool(answer.get("continue_interview"))}
 
     async def factcheck(state: GraphState) -> dict:
         answer = state["interview_answers"][-1]
@@ -510,6 +665,19 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             report = result.model_dump(mode="json")
         except (ValidationError, YandexModeratedResponse, ExternalUnavailable):
             report = {"claims": [], "assessment": "unavailable"}
+        if state.get("profession_profile"):
+            turn_id = f"turn:{state['interview_round']}"
+            profile, turn = apply_expert_turn(ProfessionProfile.model_validate(state["profession_profile"]),
+                                             answer.get("profession_decisions", []), turn_id)
+            if answer["content"] not in {"Решения по профилю профессии.", "Ответ в приложенных материалах."}:
+                profile = add_expert_proposals(profile, answer["content"], report["claims"], turn_id, turn)
+            turns = {**state.get("profession_turns", {}), turn_id: turn}
+            profile = await verify_profile(profile, state["profession_rag"], state["profession_market"], turns)
+            update = project_profile(state, profile, state["raw_activity"], state["acknowledged_profession_claims"],
+                                     registry(state))
+            await store.record_verification(state["interview_session_id"], report)
+            return {**update, "profession_turns": turns, "verification": report, "factcheck_source_notices": notices,
+                    "sources": [*[item.model_dump(mode="json") for item in fresh], *update["sources"]]}
         verified = [claim["claim"] for claim in report["claims"] if claim["verification_status"] == "verified"]
         records = [source_record("expert", f"{settings.public_origin}/teacher?course={state['request_id']}&interview={state['interview_session_id']}",
                                   "Подтверждённое утверждение эксперта", claim) for claim in verified]
@@ -709,7 +877,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         await store.save_draft(state["request_id"], identifier, program, scheduled, state["applied_activity"],
                                evidence_gaps=evidence_gaps, source_notices=notices,
                                vacancy_source_ids=state["business_report"].get("vacancy_source_ids", []),
-                               workload_proposal=proposal, generation=llm.describe(), composition=composition)
+                               workload_proposal=proposal, generation=llm.describe(), composition=composition,
+                               profession_profile=state.get("profession_profile"), profession_market=state.get("profession_market"))
         return {"version_id": identifier, "workload_proposal": proposal,
                 "status": "pending_update_review" if scheduled else "waiting_for_review"}
 
@@ -801,11 +970,15 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     graph.add_edge("formalize", "university_audit")
     graph.add_edge("university_audit", "gap_analysis")
     graph.add_conditional_edges("gap_analysis", lambda state: "prepare_interview"
-                                if state["gap_report"]["gap_types"] and not state.get("interview_round") else "design")
-    graph.add_conditional_edges("prepare_interview", lambda state: "design" if state.get("interview_round") else "interview")
-    graph.add_conditional_edges("interview", lambda state: "design"
-                                if state.get("closed_interview_id") == state["interrupt_id"] else "factcheck")
-    graph.add_edge("factcheck", "formalize")
+                                if state["gap_report"]["gap_types"] and not state.get("closed_interview_id") and
+                                (not state.get("interview_round") or (state.get("interview_continue") and
+                                 state["interview_round"] < state.get("interview_max_turns", 0))) else "design")
+    graph.add_conditional_edges("prepare_interview", lambda state: "interview"
+                                if state["status"] == "waiting_for_expert" else "design")
+    graph.add_conditional_edges("interview", lambda state: (
+        "university_audit" if state.get("acknowledged_profession_claims") else "design")
+        if state.get("closed_interview_id") == state["interrupt_id"] else "factcheck")
+    graph.add_conditional_edges("factcheck", lambda state: "university_audit" if state.get("profession_profile") else "formalize")
     graph.add_edge("design", "business_audit")
     graph.add_edge("business_audit", "subject_rationale")
     graph.add_edge("subject_rationale", "literature")

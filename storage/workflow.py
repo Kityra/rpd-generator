@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from auth.session import aware
 from auth.user_repository import CurrentUser, UserRepository
 from domain.schemas import CourseProgramModel, SourceRecord
+from orchestration.profession_profile import ExpertDecision
 from storage.database import write_transaction
 from storage.models import (Course, CourseVersion, ExpertInvitation, Interview, InterviewMessage, ModelCall, Notification,
                             SourceRow, WorkflowCommand)
@@ -93,10 +94,14 @@ class SqlWorkflowStore:
         return token
 
     async def submit_interview(self, token: str, expert: CurrentUser, interrupt_id: str,
-                               submission_id: str, content: str, attachments: list[dict], *, invitation_id: str | None = None) -> None:
+                               submission_id: str, content: str, attachments: list[dict], *, invitation_id: str | None = None,
+                               profession_decisions: list[dict] | None = None, continue_interview: bool = False) -> None:
         if expert.role != "expert" or not content.strip() or len(content) > 16000:
             raise PermissionError("Требуется ответ авторизованного эксперта.")
         at = datetime.now(timezone.utc)
+        decisions = [ExpertDecision.model_validate(item).model_dump(mode="json") for item in profession_decisions or []]
+        if len(decisions) > 40 or len({entry["claim_id"] for entry in decisions}) != len(decisions):
+            raise ValueError("Для каждого утверждения допустимо одно решение.")
         async with write_transaction(self.factory) as db:
             locator = (ExpertInvitation.id == invitation_id if invitation_id else
                        ExpertInvitation.token_hash == hashlib.sha256(token.encode()).hexdigest())
@@ -112,17 +117,34 @@ class SqlWorkflowStore:
                 expected = existing.payload
                 if expected.get("action") == "finish_without_answer":
                     raise ValueError("Преподаватель завершил интервью и запросил черновик.")
-                if expected["submission_id"] != submission_id or expected["content"] != content or expected["attachments"] != attachments:
+                if (expected["submission_id"] != submission_id or expected["content"] != content
+                        or expected["attachments"] != attachments or expected.get("profession_decisions", []) != decisions
+                        or expected.get("continue_interview", False) != continue_interview):
                     raise ValueError("Повторная отправка отличается от сохранённого ответа.")
                 return
             if invitation.status != "active" or invitation.used_at or aware(invitation.expires_at) <= at:
                 raise PermissionError("Приглашение истекло или использовано.")
             if interview.interrupt_id != interrupt_id or interview.status != "invited":
                 raise ValueError("Прерывание устарело.")
+            allowed = set(interview.gap_report.get("review_candidate_ids", []))
+            if any(entry["action"] != "add" and entry["claim_id"] not in allowed for entry in decisions):
+                raise ValueError("Утверждение отсутствует в текущем интервью.")
+            if continue_interview and interview.gap_report.get("interview_turn", 1) >= interview.gap_report.get("interview_max_turns", 1):
+                raise ValueError("Достигнут лимит реплик по методике интервью.")
             payload = {"submission_id": submission_id, "interrupt_id": interrupt_id, "content": content,
-                       "attachments": attachments, "expert_user_id": expert.id}
+                       "attachments": attachments, "expert_user_id": expert.id,
+                       "profession_decisions": decisions, "continue_interview": continue_interview}
+            candidates = {item["claim_id"]: item["statement"] for item in
+                          interview.gap_report.get("profession_profile", {}).get("claims", [])}
+            transcript = [content]
+            labels = {"confirm": "Подтверждаю", "reject": "Отклоняю"}
+            for entry in decisions:
+                if entry["action"] in labels:
+                    transcript.append(f"{labels[entry['action']]}: {candidates[entry['claim_id']]}")
+                else:
+                    transcript.append(entry["statement"])
             db.add(InterviewMessage(interview_id=interview.id, submission_id=submission_id,
-                                    role="expert", content=content, attachments=attachments))
+                                    role="expert", content="\n".join(transcript), attachments=attachments))
             db.add(WorkflowCommand(id=command_id, course_id=interview.course_id, kind="resume", payload=payload))
             interview.status, interview.submitted_at = "submitted", at
             invitation.status, invitation.used_at = "used", at
@@ -132,7 +154,8 @@ class SqlWorkflowStore:
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
                          scheduled: bool, activity: dict, *, evidence_gaps: dict, source_notices: list[str],
                          vacancy_source_ids: list[str] | None = None, workload_proposal: dict | None = None,
-                         generation: dict | None = None, composition: dict | None = None) -> None:
+                         generation: dict | None = None, composition: dict | None = None,
+                         profession_profile: dict | None = None, profession_market: dict | None = None) -> None:
         async with write_transaction(self.factory) as db:
             course = await db.scalar(select(Course).where(Course.id == course_id).with_for_update())
             if course.draft_version_id and course.draft_version_id != version_id:
@@ -152,6 +175,10 @@ class SqlWorkflowStore:
                     content["generation"] = generation
                 if composition:
                     content["composition_check"] = composition
+                if profession_profile:
+                    content["profession_profile"] = profession_profile
+                    if profession_market:
+                        content["profession_market"] = profession_market
                 db.add(CourseVersion(id=version_id, course_id=course_id, revision=revision, content=content))
                 await db.flush()
             course.draft_version_id = version_id

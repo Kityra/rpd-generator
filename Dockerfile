@@ -11,9 +11,11 @@ RUN python -m pip install --no-cache-dir -r requirements.txt \
 COPY .streamlit .streamlit
 COPY *.py final_schema.json ./
 COPY config/ config/
+COPY activity/ activity/
 COPY auth/ auth/
 COPY domain/ domain/
 COPY orchestration/ orchestration/
+COPY skills/ skills/
 COPY rabota_it/ rabota_it/
 COPY storage/ storage/
 COPY apps/ apps/
