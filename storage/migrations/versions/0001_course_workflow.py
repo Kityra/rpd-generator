@@ -12,7 +12,7 @@ depends_on = None
 
 
 # Таблицы, которые добавляют следующие миграции.
-LATER_TABLES = frozenset({"model_calls", *ACTIVITY_TABLES})
+LATER_TABLES = frozenset({"model_calls", "profession_boundaries", *ACTIVITY_TABLES})
 
 
 def upgrade() -> None:

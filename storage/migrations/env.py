@@ -15,7 +15,7 @@ url = context.config.attributes.get("database_url") or os.environ.get(
 
 
 def configure(connection) -> None:
-    context.configure(connection=connection, target_metadata=Base.metadata,
+    context.configure(connection=connection, target_metadata=Base.metadata, render_as_batch=True,
                       include_name=lambda name, kind, parent: kind != "table" or name in Base.metadata.tables)
     with context.begin_transaction():
         context.run_migrations()

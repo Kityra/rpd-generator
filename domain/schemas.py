@@ -246,6 +246,14 @@ class SubjectRationale(Grounded):
         return self
 
 
+class BoundaryWarning(Model):
+    subject_id: str
+    matched_topic: str
+    adjacent_profession: str
+    exclusive_item: str
+    source_interview_id: str | None
+
+
 class CourseSubject(ChangedBlock):
     origin: Literal["manual", "auto"]
     status: Literal["locked", "suggested", "accepted", "rejected"]
@@ -259,6 +267,8 @@ class CourseSubject(ChangedBlock):
     importance_reason: str | None = Field(default=None, json_schema_extra=SERVER_ONLY)
     # Итог проверки обоснования: status supports / weak / unrelated / missing, reason, judge.
     rationale_check: dict | None = Field(default=None, json_schema_extra=SERVER_ONLY)
+    needs_review: bool = Field(default=False, json_schema_extra=SERVER_ONLY)
+    boundary_warnings: list[BoundaryWarning] = Field(default_factory=list, json_schema_extra=SERVER_ONLY)
 
 
 class MarketMetric(Grounded):

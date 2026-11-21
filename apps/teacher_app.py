@@ -5,6 +5,7 @@ import streamlit as st
 from sqlalchemy import select
 
 from activity.rpd_bridge import origin_note
+from apps.boundary_review import boundary_review
 from apps.common import composer, portal
 from apps.teacher_programs import knowledge_screen, my_disciplines
 from apps.presentation import course_progress, status_badge
@@ -21,6 +22,7 @@ from storage.models import Course, CourseVersion, Interview, Notification, Sourc
 from storage.portal import (REBUILD_STATUSES, acknowledge, create_course, decide, finish_without_answer, rebuild_course,
                             retry_command, save_market)
 from storage.workflow import SqlWorkflowStore, model_call_failures
+from storage.profession_boundaries import course_boundaries, public_boundary
 
 
 GAP_LABELS = {"missing_tasks": "рабочие задачи и процессы", "missing_stack": "применяемые инструменты",
@@ -357,7 +359,9 @@ async def course_detail(actor, settings, factory, users, course, notices):
                                       .order_by(Interview.created_at.desc()))).all()
         active = await db.get(CourseVersion, course.active_version_id) if course.active_version_id else None
         draft = await db.get(CourseVersion, course.draft_version_id) if course.draft_version_id else None
+        boundaries = [public_boundary(row) for row in await course_boundaries(db, course.id)]
     version = draft or active
+    await boundary_review(actor, settings, factory, course.id, boundaries)
     can_review = bool(draft and course.status in {"waiting_for_review", "pending_update_review"})
     waiting = bool(interviews and course.status == "waiting_for_expert")
     has_actions = waiting or can_review or active or (version and course.status == "failed")

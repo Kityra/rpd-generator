@@ -2,7 +2,7 @@ import logging
 from pathlib import Path
 
 import yaml
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from orchestration.market_analysis import load_market_config
 from orchestration.profession_profile import Contract
@@ -11,11 +11,14 @@ from orchestration.profession_profile import Contract
 LOG = logging.getLogger(__name__)
 MIN_MARKET_SAMPLE = load_market_config()["thresholds"]["min_sample"]
 MIN_RAG_CHUNKS = 3
+BOUNDARY_METHOD = "contrastive_boundary_interview"
+BOUNDARY_SLOTS = ("exclusive_to_primary", "exclusive_to_adjacent", "shared_core", "handoff_artifacts")
 SKILL_FILES = {
     "dacum_task_analysis": "01_dacum_task_analysis.md",
     "member_checking_validation": "02_member_checking_validation.md",
     "critical_incident_technique": "03_critical_incident_technique.md",
     "gap_focused_slot_filling": "04_gap_focused_slot_filling.md",
+    BOUNDARY_METHOD: "05_contrastive_boundary_interview.md",
 }
 
 
@@ -24,6 +27,16 @@ class InterviewSkill(Contract):
     max_turns: int = Field(ge=1, le=8, strict=True)
     title: str = Field(min_length=1)
     instructions: str = Field(min_length=1)
+    output_slots: list[str] = Field(default_factory=list)
+    anti_hallucination_rules: list[str] = Field(default_factory=list)
+    noise_handling_protocol: str | None = None
+
+    @model_validator(mode="after")
+    def validate_boundary_method(self):
+        if self.id == BOUNDARY_METHOD and (tuple(self.output_slots) != BOUNDARY_SLOTS
+                                          or not self.anti_hallucination_rules or not self.noise_handling_protocol):
+            raise ValueError("Методике границ требуются четыре поля и правила проверки ответа.")
+        return self
 
 
 FALLBACK = InterviewSkill(id="gap_focused_slot_filling", max_turns=1, title="Уточнение пробела",
@@ -55,7 +68,10 @@ def load_interview_skills(directory: str | Path) -> dict[str, InterviewSkill]:
 
 
 def select_interview_method(*, sample_size: int, rag_count: int, has_unverified: bool,
-                            missing_lab_tasks: bool, missing_slots: list[str]) -> str:
+                            missing_lab_tasks: bool, missing_slots: list[str],
+                            interview_mode: str = "", overlapping_items: list[str] | None = None) -> str:
+    if interview_mode == "boundary_disambiguation" and overlapping_items:
+        return BOUNDARY_METHOD
     if sample_size < MIN_MARKET_SAMPLE and rag_count < MIN_RAG_CHUNKS:
         return "dacum_task_analysis"
     if has_unverified:

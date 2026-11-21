@@ -273,7 +273,7 @@ class MigrationTests(unittest.TestCase):
             finally:
                 connection.close()
             self.assertTrue({"model_calls", "courses", "evidence_snapshots"} <= tables)
-            self.assertEqual(version, "0005_judge_subject_id")
+            self.assertEqual(version, "0006_profession_boundaries")
 
     def test_existing_database_gets_call_log_table(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -294,7 +294,7 @@ class MigrationTests(unittest.TestCase):
             finally:
                 connection.close()
             self.assertIn("model_calls", tables)
-            self.assertEqual(version, "0005_judge_subject_id")
+            self.assertEqual(version, "0006_profession_boundaries")
 
 
 if __name__ == "__main__":

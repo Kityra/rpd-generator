@@ -1,6 +1,6 @@
 import streamlit as st
 
-from apps import expert_app, head_app, teacher_app
+from apps import boundary_guest, expert_app, head_app, teacher_app
 from apps.presentation import portal_brand
 
 
@@ -29,4 +29,5 @@ def main():
                 st.caption(description)
 
     home = st.Page(landing, title="Проектирование программ", default=True)
-    st.navigation([home, *pages.values()], position="hidden").run()
+    boundary = st.Page(boundary_guest.main, title="Интервью по границам профессий", url_path="boundary")
+    st.navigation([home, *pages.values(), boundary], position="hidden").run()

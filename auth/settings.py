@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     gap_freshness_half_life_years: float = Field(default=5, gt=0)
     gap_target_independent_sources: int = Field(default=3, ge=1)
     gap_covered_threshold: float = Field(default=0.7, gt=0, le=1)
+    boundary_conflict_threshold: float = Field(default=0.6, gt=0, le=1)
+    boundary_violation_threshold: float = Field(default=0.5, gt=0, le=1)
     interview_skill_directory: str = "skills/interview_methods"
     max_invalid_redirects: int = Field(default=2, ge=0, le=10)
     literature_parser_enabled: bool = True

@@ -199,6 +199,7 @@ def course_report_html(content: dict, sources: dict, notices_html: str, market: 
              generation_summary_html(program),
              profession_profile_html(content.get("profession_profile"), content.get("profession_market", {}), sources),
              gap_coverage_html(content.get("evidence_gaps")),
+             boundary_report_html(content.get("profession_boundaries", []), program),
              composition_html(content.get("composition_check")),
              rationale_report_html(program, sources)]
     audit = program.get("business_audit")
@@ -221,6 +222,48 @@ def course_report_html(content: dict, sources: dict, notices_html: str, market: 
         for key in vacancy_ids:
             parts.append(source_html(sources[key]))
     return "\n".join([*parts, notices_html, "</html>"])
+
+
+def boundary_table_html(row: dict) -> str:
+    headings = ("Ядро целевой профессии", "Общая база", "Зона смежной профессии (исключить)", "Конфликты")
+    columns = ("exclusive_to_primary", "shared_core", "exclusive_to_adjacent", "boundary_conflicts")
+    headings_html = "".join(f"<th>{escape(label)}</th>" for label in headings)
+    values = ["<br>".join(escape(item) for item in row.get(key, [])) or "—" for key in columns]
+    cells = "".join(f"<td>{value}</td>" for value in values)
+    artifacts = ", ".join(row.get("handoff_artifacts", []))
+    source = row.get("source_interview_id")
+    return (f'<table><thead><tr>{headings_html}</tr></thead><tbody><tr>{cells}</tr></tbody></table>'
+            + (f"<p>Артефакты передачи — {escape(artifacts)}.</p>" if artifacts else "")
+            + (f"<p>Интервью — {escape(source)}.</p>" if source else ""))
+
+
+def boundary_warning_html(subject: dict) -> str:
+    return "\n".join(
+        f"<p><strong>[Пересечение со смежной профессией «{escape(warning['adjacent_profession'])}» — "
+        f"требует решения методиста]</strong> {escape(warning['matched_topic'])} · "
+        f"{escape(warning['exclusive_item'])}</p>"
+        + (f"<p>Интервью — {escape(warning['source_interview_id'])}.</p>" if warning.get("source_interview_id") else "")
+        for warning in subject.get("boundary_warnings", [])
+    )
+
+
+def boundary_report_html(boundaries: list[dict], program: dict) -> str:
+    verified = [row for row in boundaries if row["verified_by_methodologist"]]
+    warnings = [(subject["title"], html) for subject in program["subjects"] if (html := boundary_warning_html(subject))]
+    pending = [row for row in boundaries if not row["verified_by_methodologist"] and row.get("boundary_conflicts")]
+    if not (verified or warnings or pending):
+        return ""
+    parts = ["<h2>Границы смежных профессий</h2>"]
+    for row in verified:
+        parts.append(f"<h3>{escape(row['primary_profession'])} и {escape(row['adjacent_profession'])} "
+                     f"· {row['skill_jaccard_overlap']:.0%}</h3>{boundary_table_html(row)}")
+    for row in pending:
+        conflicts = ", ".join(row["boundary_conflicts"])
+        parts.append(f"<p>Конфликты по роли «{escape(row['adjacent_profession'])}» — {escape(conflicts)}. "
+                     "Требуется решение методиста.</p>")
+    for title, html in warnings:
+        parts.append(f"<h3>{escape(title)}</h3>{html}")
+    return "\n".join(parts)
 
 
 def gap_coverage_html(gaps: dict | None) -> str:
@@ -344,6 +387,8 @@ def render_block(block, numbers, level):
         status = "Добавлено" if block["change_status"] == "added" else "Изменено"
         title = f'<span style="color:#b35400;font-weight:600">{title} · {status}</span>'
     parts = [f"<h{level}>{title}</h{level}>"]
+    if warnings := boundary_warning_html(block):
+        parts.append(warnings)
     if "topics" in block and subject_origin(block) == "outline":
         note = block.get("generation_note")
         parts.append(f'<p style="color:#b3261e"><strong>{OUTLINE_LABEL}.</strong>'

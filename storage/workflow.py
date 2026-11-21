@@ -11,9 +11,11 @@ from auth.session import aware
 from auth.user_repository import CurrentUser, UserRepository
 from domain.schemas import CourseProgramModel, SourceRecord
 from orchestration.profession_profile import ExpertDecision
+from orchestration.profession_boundaries import role_key, with_boundary_warnings
 from storage.database import write_transaction
 from storage.models import (Course, CourseVersion, ExpertInvitation, Interview, InterviewMessage, ModelCall, Notification,
                             SourceRow, WorkflowCommand)
+from storage.profession_boundaries import course_boundaries, public_boundary, sync_boundary_candidates
 
 
 async def model_call_failures(factory: async_sessionmaker[AsyncSession], course_id: str,
@@ -34,6 +36,14 @@ async def model_call_failures(factory: async_sessionmaker[AsyncSession], course_
 class SqlWorkflowStore:
     def __init__(self, factory: async_sessionmaker[AsyncSession]) -> None:
         self.factory = factory
+
+    async def sync_boundaries(self, course_id: str, profile: dict) -> list[dict]:
+        return await sync_boundary_candidates(self.factory, course_id, profile)
+
+    async def get_boundaries(self, course_id: str, primary: str | None) -> list[dict]:
+        async with self.factory() as db:
+            return [public_boundary(row) for row in await course_boundaries(db, course_id)
+                    if not primary or role_key(row.primary_profession) == role_key(primary)]
 
     async def set_status(self, course_id: str, status: str, owner: str) -> None:
         async with write_transaction(self.factory) as db:
@@ -162,7 +172,8 @@ class SqlWorkflowStore:
                          scheduled: bool, activity: dict, *, evidence_gaps: dict, source_notices: list[str],
                          vacancy_source_ids: list[str] | None = None, workload_proposal: dict | None = None,
                          generation: dict | None = None, composition: dict | None = None,
-                         profession_profile: dict | None = None, profession_market: dict | None = None) -> None:
+                         profession_profile: dict | None = None, profession_market: dict | None = None,
+                         boundary_violation_threshold: float = 0.5) -> None:
         async with write_transaction(self.factory) as db:
             course = await db.scalar(select(Course).where(Course.id == course_id).with_for_update())
             if course.draft_version_id and course.draft_version_id != version_id:
@@ -172,6 +183,13 @@ class SqlWorkflowStore:
                 revision = (await db.scalar(select(func.max(CourseVersion.revision)).where(
                     CourseVersion.course_id == course_id)) or 0) + 1
                 content = {"program": program.model_dump(mode="json"), "activity": activity, "evidence_gaps": evidence_gaps}
+                primary = (profession_profile or {}).get("profession_name")
+                boundaries = [public_boundary(row) for row in await course_boundaries(db, course_id)
+                              if not primary or role_key(row.primary_profession) == role_key(primary)]
+                if boundaries:
+                    content["profession_boundaries"] = boundaries
+                    content["program"] = with_boundary_warnings(content["program"], boundaries,
+                                                               threshold=boundary_violation_threshold)
                 if source_notices:
                     content["source_notices"] = source_notices
                 if vacancy_source_ids:

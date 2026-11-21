@@ -25,7 +25,8 @@ from orchestration.graph import build_course_graph
 from orchestration.subject_rationale import explain_subjects
 from run_rpd import YandexModeratedResponse
 from storage.database import make_engine
-from storage.models import Base, Course, CourseVersion, Interview, ModelCall, Notification, SourceRow, WorkflowCommand, now
+from storage.models import (Base, Course, CourseVersion, Interview, ModelCall, Notification, ProfessionBoundary,
+                            SourceRow, WorkflowCommand, now)
 from storage.portal import (acknowledge, assigned_interviews, create_course, decide, finish_without_answer, rebuild_course,
                             schedule_due)
 from storage.workflow import SqlWorkflowStore
@@ -166,6 +167,36 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             draft = await db.get(CourseVersion, course.draft_version_id)
         self.assertEqual(draft.revision, 2)
         self.assertTrue(all(subject["generated_by"] == "model" for subject in draft.content["program"]["subjects"]))
+
+    async def test_verified_boundary_reaches_generator_and_flags_existing_subject_without_fallback(self):
+        async with self.factory.begin() as db:
+            db.add(ProfessionBoundary(course_id="course", primary_profession="Курс", adjacent_profession="BI-аналитик",
+                skill_jaccard_overlap=0.5, exclusive_to_adjacent_json=["SQL"], verified_by_methodologist=True,
+                source_interview_id="boundary-interview"))
+            db.add(ProfessionBoundary(course_id="course", primary_profession="Курс", adjacent_profession="Аналитик",
+                skill_jaccard_overlap=0.4, exclusive_to_adjacent_json=["Python"]))
+        original = self.model.generate
+        contexts = []
+
+        async def generate(output, prompt, payload, context, **options):
+            if output.__name__ in {"SubjectPlan", "CourseProgramModel"}:
+                exclusions = payload["adjacent_profession_exclusions"]
+                self.assertEqual([item["exclusive_item"] for item in exclusions], ["SQL"])
+                contexts.append(output.__name__)
+            return await original(output, prompt, payload, context, **options)
+
+        self.model.generate = generate
+        with patch("orchestration.graph.make_outline", side_effect=AssertionError("Пересечение не повод для каркаса")) as outline:
+            course = await self.process()
+        outline.assert_not_called()
+        self.assertEqual(course.status, "waiting_for_review")
+        self.assertEqual(set(contexts), {"SubjectPlan", "CourseProgramModel"})
+        async with self.factory() as db:
+            draft = await db.get(CourseVersion, course.draft_version_id)
+        subject, = draft.content["program"]["subjects"]
+        self.assertTrue(subject["needs_review"])
+        self.assertEqual(subject["title"], program()["subjects"][0]["title"])
+        self.assertEqual({item["source_interview_id"] for item in subject["boundary_warnings"]}, {"boundary-interview"})
 
     async def test_judge_timeout_falls_back_to_needs_review_not_outline(self):
         original = self.model.generate

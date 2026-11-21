@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, false, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, synonym
 
@@ -45,6 +45,31 @@ class CourseVersion(Base):
     status: Mapped[str] = mapped_column(String(30), default="draft")
     content: Mapped[dict] = mapped_column(JsonType)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class ProfessionBoundary(Base):
+    __tablename__ = "profession_boundaries"
+    __table_args__ = (UniqueConstraint("course_id", "primary_profession", "adjacent_profession"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    course_id: Mapped[str] = mapped_column(ForeignKey("courses.id"), index=True)
+    primary_profession: Mapped[str] = mapped_column(String(300), index=True)
+    adjacent_profession: Mapped[str] = mapped_column(String(300), index=True)
+    skill_jaccard_overlap: Mapped[float] = mapped_column(Float)
+    overlap_tasks_json: Mapped[list] = mapped_column(JsonType, default=list, server_default="[]")
+    exclusive_to_primary_json: Mapped[list] = mapped_column(JsonType, default=list, server_default="[]")
+    exclusive_to_adjacent_json: Mapped[list] = mapped_column(JsonType, default=list, server_default="[]")
+    shared_core_json: Mapped[list] = mapped_column(JsonType, default=list, server_default="[]")
+    handoff_artifacts_json: Mapped[list] = mapped_column(JsonType, default=list, server_default="[]")
+    boundary_conflicts_json: Mapped[list] = mapped_column(JsonType, default=list, server_default="[]")
+    rejected_noise_turns_json: Mapped[list] = mapped_column(JsonType, default=list, server_default="[]")
+    primary_claims_json: Mapped[list] = mapped_column(JsonType, default=list, server_default="[]")
+    invite_token_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
+    invite_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_interview_id: Mapped[str | None] = mapped_column(String(36))
+    turn_count: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    interview_completed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    verified_by_methodologist: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, server_default=func.now())
 
 
 class Notification(Base):

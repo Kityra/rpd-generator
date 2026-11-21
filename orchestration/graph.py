@@ -28,6 +28,7 @@ from orchestration.interview_skills import FALLBACK, load_interview_skills, sele
 from orchestration.interviewer_turn import (CATEGORY_SLOT, SLOT_CATEGORY, SUBMISSION_PLACEHOLDERS, InterviewerRequest,
                                             classify_user_turn, extract_interview_claims, interview_result,
                                             missing_profile_fields, scoped_decisions)
+from orchestration.profession_boundaries import negative_scope, with_boundary_warnings
 from orchestration.profession_pipeline import (ACTIVITY_SOURCE_TYPES, activity_for_design, apply_expert_turn,
                                                initial_profile, manual_profile, market_evidence, with_missing_slots)
 from orchestration.profession_profile import ProfessionProfile
@@ -116,6 +117,7 @@ class GraphState(TypedDict, total=False):
     interview_round: int
     verification: dict
     profession_profile: dict
+    profession_boundaries: list[dict]
     profession_rag: dict[str, str]
     profession_market: dict
     profession_market_sample: int
@@ -227,7 +229,7 @@ def payload(state: GraphState) -> dict:
     excluded = {"interview_answers", "verification", "owner_user_id", "request_id", "run_id",
                 "interview_session_id", "interrupt_id", "version_id", "consumed_review_id", "closed_interview_id"}
     excluded.update({"workload_proposal", "workload_only", "workload_notice"})
-    excluded.update({"profession_profile", "profession_rag", "profession_market", "profession_market_sample",
+    excluded.update({"profession_profile", "profession_rag", "profession_market", "profession_market_sample", "profession_boundaries",
                      "profession_turns", "raw_activity", "acknowledged_profession_claims",
                      "interview_max_turns", "interview_continue", "interview_redirect", "interview_handoff"})
     result = {key: value for key, value in state.items() if key not in excluded}
@@ -247,6 +249,8 @@ def payload(state: GraphState) -> dict:
             result.pop(f"{role}_report", None)
         result["profession_basis"] = profession_basis(state)
         result["sources"] = synthesis_sources(state)
+    if scope := negative_scope(state.get("profession_boundaries", [])):
+        result["adjacent_profession_exclusions"] = scope
     baseline = context(state).get("baseline")
     if baseline:
         result["previous_values"] = {key: block_value(block) for key, block in all_blocks(baseline.subjects).items()}
@@ -327,7 +331,8 @@ def subject_request(state: GraphState, names: list[str], suggestions: list[dict]
     chosen = [task for task in ranked if terms & concepts(" ".join([task["title"], *task.get("stack", [])]))]
     chosen = (chosen or ranked[:3])[:SUBJECT_TASK_LIMIT]
     judge_unavailable = state.get("profession_profile", {}).get("judge_unavailable", False)
-    hint = outline_hint(state["course_meta"]["title"], names[0], suggestions, ctx) if len(names) == 1 and not judge_unavailable else None
+    scope = negative_scope(state.get("profession_boundaries", []))
+    hint = outline_hint(state["course_meta"]["title"], names[0], suggestions, ctx) if len(names) == 1 and not judge_unavailable and not scope else None
     cited = [key for item in plan for key in item.get("source_ids", [])]
     cited += [key for task in chosen for key in task.get("source_ids", [])]
     cited += hint["source_ids"] if hint else []
@@ -349,6 +354,8 @@ def subject_request(state: GraphState, names: list[str], suggestions: list[dict]
     }
     if hint:
         request["outline_hint"] = hint
+    if scope:
+        request["adjacent_profession_exclusions"] = scope
     if state.get("profession_profile"):
         request["profession_basis"] = [claim for claim in profession_basis(state)
                                        if terms & concepts(claim["statement"])]
@@ -387,7 +394,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                 "interview_source_notices": [], "factcheck_source_notices": [], "draft_source_notices": [],
                 "literature_source_notices": [], "composition_notices": [],
                 "applied_activity": {}, "activity_origin": "", "gap_report": {}, "verification": {}, "auto_subjects": {},
-                "profession_profile": {}, "profession_turns": {}, "acknowledged_profession_claims": [],
+                "profession_profile": {}, "profession_boundaries": [], "profession_turns": {}, "acknowledged_profession_claims": [],
                 "interview_max_turns": 0, "interview_continue": False, "interview_redirect": None,
                 "interview_handoff": False,
                 "course_program": {}, "consumed_review_id": "", "closed_interview_id": "", "version_id": ""}
@@ -472,6 +479,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         profile = initial_profile(meta.get("profession") or meta["title"], raw, rag, sample, market)
         profile = await verify_profile(profile, rag, market, {})
         update = project_profile(state, profile, raw, [], all_sources)
+        update["profession_boundaries"] = await sync_boundaries(state, update["profession_profile"])
         return {**update, "raw_activity": raw, "profession_rag": rag, "profession_market": market,
                 "profession_market_sample": sample, "activity_origin": PROFESSION_MODEL if snapshot.get("tasks") else "",
                 "sources": [*[record.model_dump(mode="json") for record in records], *update["sources"]]}
@@ -486,6 +494,17 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def verify_profile(profile, rag, market, turns, *, reuse=False):
         return await verify_profession_profile(profile, rag, market, turns, llm, reuse_recorded_verdicts=reuse)
+
+    async def sync_boundaries(state, profile):
+        if getattr(type(store), "sync_boundaries", None):
+            return await store.sync_boundaries(state["request_id"], profile)
+        return state.get("profession_boundaries", [])
+
+    async def current_boundaries(state):
+        if getattr(type(store), "get_boundaries", None):
+            profile = state.get("profession_profile", {})
+            return await store.get_boundaries(state["request_id"], profile.get("profession_name"))
+        return state.get("profession_boundaries", [])
 
     async def university_audit(state: GraphState) -> dict:
         if not state["applied_activity"] and not synthesis_sources(state):
@@ -777,6 +796,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             profile = await verify_profile(profile, state["profession_rag"], state["profession_market"], turns, reuse=True)
             update = project_profile(state, profile, state["raw_activity"], state["acknowledged_profession_claims"],
                                      registry(state))
+            update["profession_boundaries"] = await sync_boundaries(state, update["profession_profile"])
             report["interviewer_result"] = result.model_dump(mode="json")
             await store.record_verification(state["interview_session_id"], report)
             return {**update, "profession_turns": turns, "verification": report, "factcheck_source_notices": notices,
@@ -792,18 +812,22 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def design(state: GraphState) -> dict:
         await store.set_status(state["request_id"], "designing", state["owner_user_id"])
+        boundaries = await current_boundaries(state)
+        state = {**state, "profession_boundaries": boundaries}
         suggestions = planned_subjects(state)
         manual = {" ".join(name.casefold().split()): name for name in state.get("manual_subjects", [])}
         automatic = {" ".join(item["name"].casefold().split()): item["name"] for item in suggestions}
         names = {**automatic, **manual}
         ctx = context(state)
         if ctx["allow_incomplete_activity"] and not ctx.get("baseline") and len(names) > DRAFT_SUBJECT_BATCH_SIZE:
-            return await design_batched(state, list(names.items()), suggestions, manual)
+            return {**await design_batched(state, list(names.items()), suggestions, manual),
+                    "profession_boundaries": boundaries}
         notes: list[str] = []
         GENERATION_NOTES.set(notes)
         program = await llm.generate(CourseProgramModel, prompts.DESIGN, payload(state), ctx)
         marked = mark_generated(program.model_dump(mode="json"), "model", "; ".join(notes) or None)
-        return {"course_program": with_importance(marked, suggestions), "status": "designing"}
+        return {"course_program": with_importance(marked, suggestions), "status": "designing",
+                "profession_boundaries": boundaries}
 
     async def design_batched(state: GraphState, names: list[tuple[str, str]], suggestions: list[dict],
                              manual: dict[str, str]) -> dict:
@@ -966,7 +990,10 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     async def persist_review(state: GraphState) -> dict:
         identifier = str(uuid5(NAMESPACE_URL, f"{state['request_id']}/{state['run_id']}/version/{state.get('review_iteration', 0)}"))
         await store.save_sources(state["request_id"], list(registry(state).values()))
-        program = CourseProgramModel.model_validate(state["course_program"], context=context(state))
+        boundaries = await current_boundaries(state)
+        threshold = getattr(settings, "boundary_violation_threshold", 0.5)
+        checked = with_boundary_warnings(state["course_program"], boundaries, threshold=threshold)
+        program = CourseProgramModel.model_validate(checked, context=context(state))
         scheduled = state.get("mode") == "relevance"
         gaps = state["gap_report"]
         evidence_gaps = {key: gaps[key] for key in ("gap_types", "business_coverage", "science_coverage",
@@ -978,12 +1005,15 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         if notice := state.get("workload_notice"):
             notices.append(notice)
         composition = composition_report(state["course_program"], state["course_meta"], state.get("applied_activity"))
+        boundary_options = {"boundary_violation_threshold": threshold} if getattr(type(store), "get_boundaries", None) else {}
         await store.save_draft(state["request_id"], identifier, program, scheduled, state["applied_activity"],
                                evidence_gaps=evidence_gaps, source_notices=notices,
                                vacancy_source_ids=state["business_report"].get("vacancy_source_ids", []),
                                workload_proposal=proposal, generation=llm.describe(), composition=composition,
-                               profession_profile=state.get("profession_profile"), profession_market=state.get("profession_market"))
+                               profession_profile=state.get("profession_profile"), profession_market=state.get("profession_market"),
+                               **boundary_options)
         return {"version_id": identifier, "workload_proposal": proposal,
+                "course_program": checked, "profession_boundaries": boundaries,
                 "status": "pending_update_review" if scheduled else "waiting_for_review"}
 
     async def review(state: GraphState) -> dict:
