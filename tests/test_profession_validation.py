@@ -79,7 +79,8 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
             {"claim_id": "work_task:A", "action": "confirm"}], "turn:1")
         judge = AsyncMock()
         with self.assertLogs("orchestration.profession_verifier", "WARNING"):
-            result = await verify_profession_profile(value, {}, {}, {"turn:1": turn}, judge, rejected_noise_turns=[1])
+            value = value.model_copy(update={"rejected_noise_turns": [1]})
+            result = await verify_profession_profile(value, {}, {}, {"turn:1": turn}, judge)
         self.assertEqual(result.rejected_noise_turns, [1])
         self.assertEqual(result.claims[0].evidence, [])
         self.assertEqual(result.claims[0].verification_status, "needs_review")

@@ -6,14 +6,18 @@ import json
 from dataclasses import dataclass
 from datetime import date, datetime
 from io import BytesIO
+from pathlib import Path
 from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile
 
 from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 
 
 MAX_BYTES = 20 * 1024 * 1024
 MAX_PAGES = 300
+ATTACHMENT_MAX_MB = 10
+ATTACHMENT_MAX_CHARS = 3000
 WORD = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
@@ -50,6 +54,39 @@ def read_document(name: str, data: bytes) -> str:
     except (BadZipFile, KeyError, ElementTree.ParseError, UnicodeDecodeError) as error:
         raise ValueError(f"{name}: не удалось прочитать файл ({type(error).__name__}).") from error
     raise ValueError(f"{name}: поддерживаются TXT, DOCX и PDF.")
+
+
+def read_attachment(name: str, data: bytes) -> dict[str, str]:
+    """Короткая выдержка из вложения к правке курса или ответу эксперта."""
+    name = Path(name.replace("\\", "/")).name
+    suffix = Path(name).suffix.lower()
+    if not data or len(data) > ATTACHMENT_MAX_MB * 1024**2:
+        raise ValueError(f"{name}: допустим непустой файл размером до {ATTACHMENT_MAX_MB} МБ.")
+    try:
+        if suffix == ".txt":
+            text = data.decode("utf-8-sig")
+        elif suffix == ".docx":
+            with ZipFile(BytesIO(data)) as archive:
+                info = archive.getinfo("word/document.xml")
+                if info.file_size > 4 * 1024**2:
+                    raise ValueError("слишком большой текст документа")
+                root = ElementTree.fromstring(archive.read(info))
+            text = "\n".join("".join(node.itertext()) for node in root.iter(f"{WORD}t"))
+        elif suffix == ".pdf":
+            reader = PdfReader(BytesIO(data))
+            if reader.is_encrypted or len(reader.pages) > 50:
+                raise ValueError("используйте PDF без пароля и размером до 50 страниц")
+            chunks = []
+            for page in reader.pages:
+                chunks.append((page.extract_text() or "")[:ATTACHMENT_MAX_CHARS])
+                if sum(map(len, chunks)) >= ATTACHMENT_MAX_CHARS:
+                    break
+            text = "\n".join(chunks)
+        else:
+            raise ValueError("доступные форматы — TXT, DOCX и PDF")
+    except (BadZipFile, KeyError, ElementTree.ParseError, PdfReadError, ValueError, OSError) as error:
+        raise ValueError(f"{name}: не удалось прочитать файл. {error}") from error
+    return {"name": name[:180], "text": text.replace("\x00", "").strip()[:ATTACHMENT_MAX_CHARS]}
 
 
 @dataclass(frozen=True)

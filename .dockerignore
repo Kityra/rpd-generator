@@ -1,7 +1,10 @@
 .git
+.claude
+.vscode
 .venv
 .env
 .env.*
+.streamlit/secrets.toml
 data
 docs
 transfer
@@ -9,4 +12,7 @@ tests
 **/__pycache__
 *.sqlite*
 *.zip
+*.dump
+*.pem
+*.key
 scenario_results

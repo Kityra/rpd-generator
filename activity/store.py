@@ -360,15 +360,6 @@ async def dismiss(factory: Factory, actor, profession_id: str, key: str, note: s
         await log(db, profession_id, "dismiss", {"key": key, "note": note}, actor.id)
 
 
-async def add_item_link(factory: Factory, actor, task_id: str, item_id: str, reason: str) -> None:
-    require_head(actor)
-    async with write_transaction(factory) as db:
-        if await db.get(ItemLink, (task_id, item_id)) is None:
-            db.add(ItemLink(task_id=task_id, item_id=item_id, reason=reason.strip(), created_by=actor.id))
-        task = await db.get(ActivityItem, task_id)
-        await log(db, task.profession_id, "item_link", {"task": task_id, "item": item_id, "reason": reason}, actor.id)
-
-
 async def review_queue(db: AsyncSession, profession_id: str, content: dict | None) -> dict:
     """Кандидаты в дубли, задачи без функции с подсказкой, предложенные экспертами формулировки."""
     config = load_config()["grouping"]

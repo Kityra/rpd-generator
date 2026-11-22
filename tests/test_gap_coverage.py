@@ -42,6 +42,11 @@ class GapCoverageTests(unittest.TestCase):
         self.assertIn(gap_coverage_html(gaps), report)
         self.assertIn("0.900 × 0.500 = 0.450", report)
         self.assertEqual(saved["evidence_gaps"]["formula_breakdown"][0]["independent_sources_count"], 1)
+        portal_report = gap_coverage_html(gaps, include_methodology=False)
+        self.assertIn("<details><summary>Расчёт по утверждениям</summary>", portal_report)
+        self.assertIn("0.900 × 0.500 = 0.450", portal_report)
+        self.assertNotIn("Коэффициент независимости", portal_report)
+        self.assertNotIn("Порог покрытия", portal_report)
 
     def test_weak_unknown_year_and_rejected_evidence(self):
         source = source_record("Priklad", "https://example.org/work", "Рабочий процесс",

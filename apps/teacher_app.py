@@ -1,5 +1,8 @@
-from uuid import uuid4
+from datetime import date
+from html import escape
+from types import SimpleNamespace
 from urllib.parse import urlencode
+from uuid import uuid4
 
 import streamlit as st
 from sqlalchemy import select
@@ -15,10 +18,11 @@ from pydantic import ValidationError
 
 from domain.skill_mapper import TOOL_COLUMN_NOTE, competence_label, tool_labels
 from orchestration.call_log import OUTCOME_LABELS
+from orchestration.course_lifespan import INSUFFICIENT_EVIDENCE, LIFESPAN_UNAVAILABLE_NOTE, SUPPORT_FEED_UNAVAILABLE
 from orchestration.market_analysis import course_market, parse_market_file, with_competences
 from storage.models import Course, CourseVersion, Interview, Notification, SourceRow
-from storage.portal import (REBUILD_STATUSES, acknowledge, create_course, decide, finish_without_answer, rebuild_course,
-                            retry_command, save_market)
+from storage.portal import (REBUILD_STATUSES, acknowledge, create_course, decide, delete_course, finish_without_answer,
+                            rebuild_course, retry_command, save_market)
 from storage.workflow import SqlWorkflowStore, model_call_failures
 from storage.profession_boundaries import course_boundaries, public_boundary
 
@@ -102,7 +106,7 @@ def generation_panel(program, failures):
             if failures:
                 st.caption("Сбои вызовов модели по журналу")
                 for stage, outcome, count in failures:
-                    name = "Модель-судья" if stage == "llm_judge" else stage
+                    name = {"llm_judge": "Модель-судья", "lifespan_assessment": "Прогноз актуальности"}.get(stage, stage)
                     st.write(f"{name}: {OUTCOME_LABELS.get(outcome, outcome)} — {count}")
 
 
@@ -138,7 +142,7 @@ def market_report(analysis):
 
 
 async def market_actions(actor, factory, course, analysis, subjects):
-    with st.expander("Рыночные данные курса"):
+    with st.expander("Загрузка рыночных данных и настройка соответствий"):
         st.caption("JSON или CSV с навыками (skill, weight, vacancies) или вакансиями (title, skills). "
                    "Шаблоны — в папке templates/ репозитория. Цифры считает программа, модель их не задаёт.")
         upload = st.file_uploader("Загрузить файл", type=["json", "csv"], key=f"market-{course.id}")
@@ -172,6 +176,72 @@ async def market_actions(actor, factory, course, analysis, subjects):
                 st.rerun()
 
 
+def lifespan_unavailable_reason(content: dict) -> str:
+    if "lifespan_assessment" not in content:
+        return "Эта версия сохранена до появления прогноза актуальности."
+    prefix = f"{LIFESPAN_UNAVAILABLE_NOTE} ("
+    notices = [content["lifespan_note"]] if content.get("lifespan_note") else content.get("source_notices", [])
+    for notice in notices:
+        if notice == INSUFFICIENT_EVIDENCE:
+            return ("Горизонт пока нельзя рассчитать. Нужна дата окончания поддержки версии из программы "
+                    "или заметное изменение доли навыка в сопоставимых выборках вакансий.")
+        if notice == SUPPORT_FEED_UNAVAILABLE:
+            return "Не удалось получить дату окончания поддержки. Официальный источник временно недоступен."
+        if notice == f"{LIFESPAN_UNAVAILABLE_NOTE}: нет рыночных или научных источников.":
+            return "Для расчёта не нашлось рыночных или научных источников по курсу."
+        if notice.startswith(prefix) and notice.endswith(")."):
+            outcome = notice.removeprefix(prefix).removesuffix(").")
+            if outcome != "ok" and (reason := OUTCOME_LABELS.get(outcome)):
+                return f"Прогноз недоступен. {reason.capitalize()}."
+    return "Прогноз недоступен. Причина для этой версии не сохранилась."
+
+
+async def lifespan_actions(actor, factory, course, content, registry):
+    with st.container(border=True, key=f"lifespan-{course.id}"):
+        st.subheader("Прогноз актуальности курса")
+        if assessment := content.get("lifespan_assessment"):
+            years = f"{assessment['estimated_lifespan_years']:g}".replace(".", ",")
+            if assessment.get("calculation_method"):
+                st.metric("Горизонт до проверки программы, лет", years)
+                review_by = date.fromisoformat(assessment["review_by"])
+                st.caption(f"Проверить к {review_by:%d.%m.%Y}.")
+            else:
+                st.metric("Горизонт без пересмотра программы, лет", years)
+                st.caption("Сохранённая оценка модели. Расчёт по датам и выборкам появится при обновлении версии.")
+            with st.expander("Основания прогноза"):
+                st.markdown("**Ключевые факты по рынку и технологиям**")
+                items = "".join(f"<li>{escape(point)}</li>" for point in assessment["hr_digest_points"])
+                st.html(f"<ul>{items}</ul>")
+                evidence = "".join(source_html(registry[key]) for key in dict.fromkeys(assessment["source_ids"])
+                                   if key in registry)
+                if evidence:
+                    st.html(f"<details><summary>Источники</summary>{evidence}</details>")
+        else:
+            st.caption(lifespan_unavailable_reason(content))
+
+        if actor.role != "teacher" or actor.id != course.owner_user_id:
+            return
+        confirm = f"confirm-course-deletion-{course.id}"
+        if not st.session_state.get(confirm):
+            if not st.button("Удалить курс", key=f"delete-{course.id}", width="stretch"):
+                return
+            st.session_state[confirm] = True
+        st.caption("Курс и его версии будут архивированы. Приглашения экспертов станут недоступны.")
+        if st.button("Подтвердить удаление", key=f"delete-confirm-{course.id}", width="stretch"):
+            try:
+                await delete_course(factory, course.id, actor)
+            except (PermissionError, ValueError) as error:
+                st.warning(str(error))
+            else:
+                st.session_state.pop(confirm, None)
+                st.session_state.pop("selected_course", None)
+                st.session_state.screen = "list"
+                st.rerun()
+        if st.button("Оставить курс", key=f"delete-cancel-{course.id}", width="stretch"):
+            st.session_state.pop(confirm, None)
+            st.rerun()
+
+
 def course_context(meta):
     return " · ".join(str(meta[key]) for key in ("institution", "year") if meta.get(key))
 
@@ -202,7 +272,7 @@ def report_panel(version, registry, interviews, analysis=None):
                 for claim in rejected:
                     st.text(claim["statement"])
                     st.caption(claim["verification_reason"])
-    if coverage := gap_coverage_html(version.content.get("evidence_gaps")):
+    if coverage := gap_coverage_html(version.content.get("evidence_gaps"), include_methodology=False):
         st.html(coverage)
     if analysis is not None:
         market_report(analysis)
@@ -228,11 +298,12 @@ def report_panel(version, registry, interviews, analysis=None):
                 st.html(source_html(record))
                 st.caption("\n".join(record["content"].splitlines()[:2]))
     for notice in version.content.get("source_notices", []):
-        st.caption(notice)
+        if not notice.startswith(LIFESPAN_UNAVAILABLE_NOTE):
+            st.caption(notice)
     interview_results(interviews, registry)
 
 
-def course_workspace(version, registry, interviews, analysis=None):
+async def course_workspace(version, registry, interviews, analysis, *, actor, factory, course):
     subjects = version.content["program"]["subjects"]
     tabs = st.tabs(["Программа", "Отчёт по курсу"])
     with tabs[0]:
@@ -244,6 +315,7 @@ def course_workspace(version, registry, interviews, analysis=None):
                 st.html(block_html(subject, registry))
     with tabs[1]:
         report_panel(version, registry, interviews, analysis)
+        await market_actions(actor, factory, course, analysis, subjects)
 
 
 async def review_actions(actor, factory, course, draft, active):
@@ -287,13 +359,13 @@ async def course_detail(actor, settings, factory, users, course, notices):
     await boundary_review(actor, settings, factory, course.id, boundaries)
     can_review = bool(draft and course.status in {"waiting_for_review", "pending_update_review"})
     waiting = bool(interviews and course.status == "waiting_for_expert")
-    has_actions = waiting or can_review or active or (version and course.status == "failed")
+    has_actions = waiting or version is not None
 
     with st.container(key="course-workspace"):
         main, side = st.columns([1.85, 1], gap="medium") if has_actions else (st.container(), None)
         with main.container(key="course-program"):
             if version:
-                label = "Черновик РПД" if draft else "Программа курса"
+                label = "Черновик" if draft else "Программа курса"
                 st.subheader(f"{label} · версия {version.revision}")
                 gap_types = version.content.get("evidence_gaps", {}).get("gap_types", [])
                 if gap_types:
@@ -308,7 +380,7 @@ async def course_detail(actor, settings, factory, users, course, notices):
                                          version.content.get("vacancy_source_ids", []), version.content.get("activity"),
                                          mappings=version.content.get("skill_mappings"), saved=version.content.get("market_analysis"),
                                          profile=version.content.get("profession_profile"))
-                course_workspace(version, registry, interviews, analysis)
+                await course_workspace(version, registry, interviews, analysis, actor=actor, factory=factory, course=course)
             else:
                 st.subheader("Программа курса")
                 if waiting:
@@ -355,7 +427,7 @@ async def course_detail(actor, settings, factory, users, course, notices):
                 if can_review:
                     await review_actions(actor, factory, course, draft, active)
                 if version:
-                    await market_actions(actor, factory, course, analysis, version.content["program"]["subjects"])
+                    await lifespan_actions(actor, factory, course, version.content, registry)
                 if version and course.status in REBUILD_STATUSES:
                     summary = generation_summary(version.content["program"])
                     if summary["outline"] or summary["unknown"]:
@@ -369,8 +441,11 @@ async def course_detail(actor, settings, factory, users, course, notices):
                                            active.content.get("vacancy_source_ids", []), active.content.get("activity"),
                                            mappings=active.content.get("skill_mappings"), saved=active.content.get("market_analysis"),
                                            profile=active.content.get("profession_profile"))
+                    export_version = SimpleNamespace(status=active.status, revision=active.revision,
+                        content={key: value for key, value in active.content.items()
+                                 if key not in {"lifespan_assessment", "lifespan_market_sample", "lifespan_note"}})
                     st.download_button(f"Скачать утверждённую версию {active.revision} · ZIP",
-                                       export_course(course.course_meta, active, registry, market.model_dump(mode="json")),
+                                       export_course(course.course_meta, export_version, registry, market.model_dump(mode="json")),
                                        f"course-v{active.revision}.zip", "application/zip", width="stretch")
                     if course.last_approved_at:
                         st.caption(f"Утверждён — {course.last_approved_at:%d.%m.%Y}")
@@ -383,7 +458,8 @@ async def course_detail(actor, settings, factory, users, course, notices):
 
 async def render(actor, settings, factory, users):
     async with factory() as db:
-        courses = (await db.scalars(select(Course).where(Course.owner_user_id == actor.id).order_by(Course.updated_at.desc()))).all()
+        courses = (await db.scalars(select(Course).where(Course.owner_user_id == actor.id, Course.status != "cancelled")
+                                    .order_by(Course.updated_at.desc()))).all()
         notices = (await db.scalars(select(Notification).where(Notification.user_id == actor.id)
                                     .order_by(Notification.created_at.desc()))).all()
     count = sum(n.read_at is None for n in notices)

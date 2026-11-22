@@ -153,7 +153,7 @@ class RpdPipelineTests(unittest.TestCase):
                 )
                 graph = MagicMock()
 
-                def build(schema_path, research, generate, checkpointer=None, draft_first=False):
+                def build(schema_path, research, generate, checkpointer=None):
                     report = research("university", run_rpd.RpdRequest(**REQUEST))
                     self.assertEqual(report["fragments"], [])
                     self.assertEqual(report["findings"], [])
@@ -224,7 +224,7 @@ class SciencePipelineTests(unittest.TestCase):
                                    output_text=json.dumps(responses[name]))
 
         client.responses.create.side_effect = model
-        graph = run_rpd.create_rpd_graph(client, settings, draft_first=True)
+        graph = run_rpd.create_rpd_graph(client, settings)
         with patch.object(run_rpd, "find_course_articles", return_value=([article], [])):
             result = graph.invoke({"request": {**REQUEST, "facts": "Внутренние данные вуза"}},
                                   config={"configurable": {"thread_id": "science-in-rpd"}})

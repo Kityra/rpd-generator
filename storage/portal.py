@@ -1,12 +1,13 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from auth.user_repository import CurrentUser
+from storage.activity_models import ProgramDiscipline
 from storage.database import write_transaction
-from storage.models import Course, ExpertInvitation, Interview, Notification, WorkflowCommand
+from storage.models import Course, CourseVersion, ExpertInvitation, Interview, Notification, ProfessionBoundary, WorkflowCommand
 
 
 def require_teacher(actor: CurrentUser) -> None:
@@ -22,7 +23,8 @@ async def create_course(factory: async_sessionmaker[AsyncSession], actor: Curren
     async with write_transaction(factory) as db:
         existing = await db.get(Course, course_id)
         if existing:
-            if existing.owner_user_id != actor.id or existing.course_meta != dict(meta, manual_subjects=subjects):
+            if (existing.status == "cancelled" or existing.owner_user_id != actor.id or
+                    existing.course_meta != dict(meta, manual_subjects=subjects)):
                 raise ValueError("Заявка уже сохранена с другими параметрами.")
             return
         course = Course(id=course_id, thread_id=course_id, owner_user_id=actor.id,
@@ -32,12 +34,46 @@ async def create_course(factory: async_sessionmaker[AsyncSession], actor: Curren
         db.add(WorkflowCommand(id=f"create:{course_id}", course_id=course_id, kind="create", payload={}))
 
 
+async def delete_course(factory: async_sessionmaker[AsyncSession], course_id: str, actor: CurrentUser) -> None:
+    """Мягкое удаление курса владельцем. Источники и история команд остаются в архиве курса."""
+    if actor.role != "teacher":
+        raise PermissionError("Удалить курс может только методист-владелец.")
+    async with write_transaction(factory) as db:
+        owned = select(Course).where(Course.id == course_id, Course.owner_user_id == actor.id)
+        if not await db.scalar(owned.with_only_columns(Course.id)):
+            raise PermissionError("Курс недоступен.")
+        # Тот же порядок блокировок, что у ответа эксперта и завершения интервью.
+        interview_ids = (await db.scalars(select(Interview.id).where(Interview.course_id == course_id)
+                                          .order_by(Interview.id).with_for_update())).all()
+        course = await db.scalar(owned.with_for_update())
+        if course is None:
+            raise PermissionError("Курс недоступен.")
+        if course.status == "cancelled":
+            return
+        pending = await db.scalar(select(WorkflowCommand.id).where(WorkflowCommand.course_id == course_id,
+                                  WorkflowCommand.status == "pending").limit(1))
+        if pending is not None:
+            raise ValueError("Дождитесь завершения обработки курса и повторите удаление.")
+        await db.execute(update(CourseVersion).where(CourseVersion.course_id == course_id).values(status="archived"))
+        await db.execute(delete(Notification).where(Notification.course_id == course_id))
+        await db.execute(update(Interview).where(Interview.id.in_(interview_ids), Interview.status == "invited")
+                         .values(status="closed"))
+        await db.execute(update(ExpertInvitation).where(ExpertInvitation.interview_id.in_(interview_ids),
+                         ExpertInvitation.status == "active").values(status="revoked"))
+        await db.execute(update(ProfessionBoundary).where(ProfessionBoundary.course_id == course_id)
+                         .values(invite_token_hash=None, invite_expires_at=None))
+        await db.execute(update(ProgramDiscipline).where(ProgramDiscipline.course_id == course_id).values(course_id=None))
+        course.status = "cancelled"
+        course.active_version_id = course.draft_version_id = course.next_audit_at = None
+
+
 async def save_market(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str, *,
                       dataset: dict | None = ..., overrides: dict[str, list[str]] | None = ...) -> None:
     """Сохранить загруженные рыночные данные и/или ручные правки соответствия навыков дисциплинам."""
     require_teacher(actor)
     async with write_transaction(factory) as db:
-        course = await db.scalar(select(Course).where(Course.id == course_id, Course.owner_user_id == actor.id).with_for_update())
+        course = await db.scalar(select(Course).where(Course.id == course_id, Course.owner_user_id == actor.id,
+                                             Course.status != "cancelled").with_for_update())
         if course is None:
             raise PermissionError("Курс недоступен.")
         market = dict((course.course_meta or {}).get("market") or {})
@@ -161,7 +197,7 @@ async def rebuild_course(factory: async_sessionmaker[AsyncSession], actor: Curre
         if course.status not in REBUILD_STATUSES:
             raise ValueError("Курс сейчас обрабатывается. Дождитесь окончания текущего шага.")
         command_id = f"create:{course_id}:{uuid4()}"
-        db.add(WorkflowCommand(id=command_id, course_id=course_id, kind="create", payload={"rebuild": True}))
+        db.add(WorkflowCommand(id=command_id, course_id=course_id, kind="create", payload={}))
         course.status = "queued"
     return command_id
 
@@ -171,7 +207,7 @@ def assigned_interviews(actor: CurrentUser, *, token_hash: str | None = None):
         raise PermissionError("Требуется роль эксперта.")
     stmt = select(ExpertInvitation, Interview, Course).join(Interview, ExpertInvitation.interview_id == Interview.id).join(
         Course, Interview.course_id == Course.id).where(ExpertInvitation.expert_user_id == actor.id,
-        ExpertInvitation.status.in_(["used", "active"]))
+        ExpertInvitation.status.in_(["used", "active"]), Course.status != "cancelled")
     if token_hash is not None:
         stmt = stmt.where(ExpertInvitation.token_hash == token_hash)
     return stmt.order_by(Interview.created_at.desc())

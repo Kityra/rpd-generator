@@ -1,8 +1,8 @@
 import json
-from datetime import datetime
-from typing import Literal
+from datetime import date, datetime
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationInfo, field_validator, model_validator
 
 
 class Model(BaseModel):
@@ -44,9 +44,10 @@ class SourceRecord(Model):
 class EvidenceResults(list[SourceRecord]):
     """List of sources with backend notices about coverage and snapshot age."""
 
-    def __init__(self, records=(), notices=()):
+    def __init__(self, records=(), notices=(), *, market_records=()):
         super().__init__(records)
         self.notices = list(notices)
+        self.market_records = list(market_records)
 
 
 class Grounded(Model):
@@ -370,6 +371,25 @@ class BusinessCourseAudit(Grounded):
     unavailable_metrics: list[str]
     evidence_summary: str
     suggested_changes: list[ChangeJustification]
+
+
+class CourseLifespanAssessment(Grounded):
+    estimated_lifespan_years: float = Field(ge=0, le=15, strict=True)
+    is_short_lived: bool = Field(strict=True)
+    hr_digest_points: list[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=240)]] = Field(
+        min_length=3, max_length=5)
+    review_by: date | None = None
+    calculated_on: date | None = None
+    calculation_method: Literal["support_end", "market_shift", "combined"] | None = None
+
+    @model_validator(mode="after")
+    def check_lifespan(self) -> "CourseLifespanAssessment":
+        if self.is_short_lived != (0 <= self.estimated_lifespan_years <= 5):
+            raise ValueError("is_short_lived должен соответствовать горизонту от 0 до 5 лет включительно.")
+        prohibited = ("нецелесообразно", "не рекомендуется запускать", "устареет и не окупится")
+        if any(phrase in " ".join(point.casefold().split()) for point in self.hr_digest_points for phrase in prohibited):
+            raise ValueError("Сформулируйте тезисы нейтрально, без рекомендаций и оценок окупаемости.")
+        return self
 
 
 def all_blocks(subjects: list[CourseSubject]) -> dict[str, ChangedBlock]:

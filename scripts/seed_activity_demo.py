@@ -27,8 +27,7 @@ from storage.activity_models import (ActivityClaim, ActivityExpert, ActivityItem
 from storage.database import ensure_schema, make_engine, run_async, write_transaction
 
 from activity import store
-from activity.extract import ClaimDraft, verify
-from activity.text import canonical_key
+from activity.extract import ClaimDraft
 
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "activity_demo"

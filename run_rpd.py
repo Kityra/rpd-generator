@@ -103,8 +103,7 @@ def open_yandex(settings: dict[str, str], timeout: float = 120):
                   base_url=YANDEX_BASE_URL, timeout=timeout, max_retries=0)
 
 
-def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda message: None, checkpointer=None,
-                     draft_first: bool = False):
+def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda message: None, checkpointer=None):
     def request_json(
         model: str, instructions: str, payload: str, schema: dict[str, Any],
         schema_name: str, max_tokens: int, timeout: float,
@@ -217,8 +216,7 @@ def create_rpd_graph(client: OpenAI, settings: dict[str, str], *, notify=lambda 
         return request_json(settings["YANDEX_MODEL_URI"], instructions, payload,
                             response_schema, "rpd_draft", 16_384, 120)
 
-    return build_rpd_graph(ROOT / "final_schema.json", research, generate, checkpointer=checkpointer,
-                           draft_first=draft_first)
+    return build_rpd_graph(ROOT / "final_schema.json", research, generate, checkpointer=checkpointer)
 
 
 def main(argv: list[str] | None = None) -> int:

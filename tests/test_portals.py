@@ -1,26 +1,30 @@
 import hashlib
 import json
+import os
 import tempfile
 import unittest
-from datetime import timedelta
+from datetime import datetime, time, timedelta, timezone
 from io import BytesIO
 from functools import partial
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from zipfile import ZipFile
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from streamlit.testing.v1 import AppTest
 
 from auth.password_verifier import ExistingPasswordVerifier
 from auth.settings import Settings
 from auth.user_repository import CurrentUser
 from auth.yandex_users import accounts_from_text
 from domain.export import block_html, export_course, rationale_report_html, source_html
-from domain.schemas import EvidenceResults, block_value
+from domain.schemas import CourseLifespanAssessment, EvidenceResults, block_value
 from domain.skill_mapper import ML_COMPETENCE
 from literature_parser import LiteratureSource, TopicLiterature, enrich_course_program
 from orchestration.checkpointer import open_checkpointer
+from orchestration.course_lifespan import INSUFFICIENT_EVIDENCE, SUPPORT_FEED_UNAVAILABLE, SupportDeadline
 from orchestration.evidence_cache import source_record
 from orchestration.graph import build_course_graph
 from orchestration.market_analysis import course_market
@@ -29,11 +33,44 @@ from run_rpd import YandexModeratedResponse
 from storage.database import make_engine
 from storage.models import (Base, Course, CourseVersion, Interview, ModelCall, Notification, ProfessionBoundary,
                             SourceRow, WorkflowCommand, now)
-from storage.portal import (acknowledge, assigned_interviews, create_course, decide, finish_without_answer, rebuild_course,
-                            schedule_due)
+from storage.portal import (acknowledge, assigned_interviews, create_course, decide, delete_course, finish_without_answer,
+                            rebuild_course, schedule_due)
 from storage.workflow import SqlWorkflowStore
 from test_course_architecture import program, rationale_batch, records
 from workers.course_worker import process_next
+
+
+LIFESPAN_POINTS = ["В вакансиях встречаются новые инструменты.", "Версии библиотек регулярно обновляются.",
+                   "Рабочие задачи включают проверку результатов."]
+
+
+def lifespan_data(years):
+    return {"estimated_lifespan_years": years, "is_short_lived": years <= 5,
+            "hr_digest_points": LIFESPAN_POINTS, "source_ids": ["HH"]}
+
+
+class LifespanAssessmentTests(unittest.TestCase):
+    def test_horizon_boundaries_and_strict_flag(self):
+        for years, short in ((0, True), (5, True), (5.1, False)):
+            with self.subTest(years=years):
+                data = lifespan_data(years)
+                context = {"sources": records()}
+                model = CourseLifespanAssessment.model_validate(data, context=context)
+                self.assertIs(model.is_short_lived, short)
+                with self.assertRaises(ValidationError):
+                    CourseLifespanAssessment.model_validate({**data, "is_short_lived": not short}, context=context)
+        for years in (-0.1, 15.1):
+            with self.assertRaises(ValidationError):
+                CourseLifespanAssessment.model_validate(lifespan_data(years), context={"sources": records()})
+
+    def test_grounding_and_digest_contract(self):
+        invalid = ({"source_ids": ["invented"]}, {"source_ids": []}, {"extra_field": True},
+                   {"estimated_lifespan_years": True}, {"estimated_lifespan_years": "5"},
+                   {"hr_digest_points": ["Один тезис"]},
+                   {"hr_digest_points": [*LIFESPAN_POINTS[:2], "Запуск нецелесообразен: не рекомендуется запускать."]})
+        for override in invalid:
+            with self.subTest(override=override), self.assertRaises(ValidationError):
+                CourseLifespanAssessment.model_validate({**lifespan_data(5), **override}, context={"sources": records()})
 
 
 class SourceDisplayTests(unittest.TestCase):
@@ -153,6 +190,146 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await process_next(self.engine, self.factory, graph))
         async with self.factory() as db:
             return await db.get(Course, "course")
+
+    async def test_lifespan_card_replaces_sidebar_market_controls_and_archives(self):
+        doc = source_record("documentation", "https://example.org/schedule", "График поддержки", "Окончание поддержки")
+        deadline = SupportDeadline("Инструмент 1", "Базы данных", now().date() + timedelta(days=730), doc)
+        with patch("orchestration.graph.fetch_support_deadlines", return_value=([deadline], False)):
+            course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        async with self.factory() as db:
+            draft = await db.get(CourseVersion, course.draft_version_id)
+            calculated = draft.content["lifespan_assessment"]
+            self.assertEqual(calculated["estimated_lifespan_years"], 2)
+            self.assertEqual(calculated["review_by"], deadline.end.isoformat())
+            self.assertEqual(calculated["source_ids"], [doc.source_id])
+            self.assertIsNotNone(await db.get(SourceRow, (course.id, doc.source_id)))
+        await decide(self.factory, self.teacher, course.id, draft.id, "approve")
+        course = await self.process()
+
+        script = """from apps.teacher_app import render
+from auth.settings import Settings
+from auth.user_repository import CurrentUser
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from storage.database import make_engine, run_async
+async def open_course():
+    settings = Settings()
+    engine = make_engine(settings.app_database_url)
+    try:
+        actor = CurrentUser(id='teacher', email='teacher@example.org', display_name='Методист', role='teacher')
+        await render(actor, settings, async_sessionmaker(engine, expire_on_commit=False), None)
+    finally:
+        await engine.dispose()
+run_async(open_course())
+"""
+        settings = {"APP_DATABASE_URL": self.engine.url.render_as_string(), "SESSION_SIGNING_KEY": "s" * 40}
+        cases = (
+            (None, None, "Эта версия сохранена до появления прогноза актуальности."),
+            (None, "Оценка актуальности курса недоступна: нет рыночных или научных источников.",
+             "Для расчёта не нашлось рыночных или научных источников по курсу."),
+            (None, "Оценка актуальности курса недоступна (circuit_open).",
+             "Прогноз недоступен. Запросы к модели временно приостановлены."),
+            (None, INSUFFICIENT_EVIDENCE, "Горизонт пока нельзя рассчитать. Нужна дата окончания поддержки версии "
+             "из программы или заметное изменение доли навыка в сопоставимых выборках вакансий."),
+            (lifespan_data(5.1), None, None),
+            (calculated, None, None),
+        )
+        for assessment, notice, message in cases:
+            async with self.factory.begin() as db:
+                active = await db.get(CourseVersion, course.active_version_id)
+                content = dict(active.content)
+                content["source_notices"] = [notice] if notice else []
+                if assessment is None and notice is None:
+                    content.pop("lifespan_assessment", None)
+                else:
+                    content["lifespan_assessment"] = assessment
+                active.content = content
+            with self.subTest(assessment=assessment, notice=notice), patch.dict(os.environ, settings):
+                app = AppTest.from_string(script, default_timeout=30)
+                app.query_params["course"] = course.id
+                app.run()
+                self.assertFalse(app.exception)
+                self.assertNotIn("Рыночные данные курса", [item.label for item in app.expander])
+                self.assertIn("Загрузка рыночных данных и настройка соответствий",
+                              [item.label for item in app.tabs[1].expander])
+                self.assertIn("Прогноз актуальности курса", [item.value for item in app.subheader])
+                self.assertEqual(app.button(key=f"delete-{course.id}").label, "Удалить курс")
+                if assessment:
+                    self.assertIn("Основания прогноза", [item.label for item in app.expander])
+                    self.assertTrue(any(assessment["hr_digest_points"][0] in item.proto.body for item in app.get("html")))
+                    expected = f"{assessment['estimated_lifespan_years']:g}".replace(".", ",")
+                    self.assertIn(expected, [metric.value for metric in app.metric if metric.label.startswith("Горизонт")])
+                    if assessment.get("calculation_method"):
+                        self.assertIn(f"Проверить к {deadline.end:%d.%m.%Y}.", [item.value for item in app.caption])
+                else:
+                    captions = [item.value for item in app.caption]
+                    self.assertIn(message, captions)
+                    if notice:
+                        self.assertNotIn(notice, captions)
+                if assessment and assessment["is_short_lived"]:
+                    app.button(key=f"delete-{course.id}").click().run()
+                    async with self.factory() as db:
+                        self.assertEqual((await db.get(Course, course.id)).status, "approved")
+                    app.button(key=f"delete-confirm-{course.id}").click().run()
+                    self.assertFalse(app.exception)
+                    self.assertIn("Ваши курсы", [item.value for item in app.header])
+                    self.assertNotIn("selected_course", app.session_state)
+        async with self.factory() as db:
+            self.assertEqual((await db.get(Course, course.id)).status, "cancelled")
+            self.assertEqual((await db.get(CourseVersion, draft.id)).status, "archived")
+            self.assertIsNotNone(await db.get(SourceRow, (course.id, "HH")))
+
+    async def test_lifespan_feed_failure_leaves_reviewable_draft(self):
+        with patch("orchestration.graph.fetch_support_deadlines", return_value=([], True)):
+            course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        async with self.factory() as db:
+            version = await db.get(CourseVersion, course.draft_version_id)
+            self.assertIsNone(version.content["lifespan_assessment"])
+            self.assertEqual(version.content["lifespan_note"], SUPPORT_FEED_UNAVAILABLE)
+            self.assertIsNone(await db.scalar(select(ModelCall).where(ModelCall.stage == "lifespan_assessment")))
+
+    async def test_lifespan_compares_saved_vacancy_samples_and_keeps_source_ids(self):
+        today = now().date()
+
+        def vacancies(collected, count):
+            return [source_record("Rostrud", f"https://example.org/{collected}/{i}", "Инженер",
+                                  f"Опубликована: {collected.isoformat()}\nНавыки: {'SQL' if i < count else 'работа в команде'}",
+                                  retrieved_at=datetime.combine(collected, time(), timezone.utc)) for i in range(20)]
+
+        old = vacancies(today - timedelta(days=60), 15)
+        new = vacancies(today, 5)
+        cards = old
+        self.evidence.search.side_effect = lambda role, *args, **kwargs: EvidenceResults(
+            records().values(), market_records=cards if role == "business" else [])
+        course = await self.process()
+        async with self.factory() as db:
+            first = await db.get(CourseVersion, course.draft_version_id)
+        self.assertIsNone(first.content["lifespan_assessment"])
+        self.assertEqual(len(first.content["lifespan_market_sample"]["source_ids"]), 20)
+        cards = new
+        await rebuild_course(self.factory, self.teacher, course.id)
+        with patch("orchestration.graph.fetch_support_deadlines", return_value=([], True)):
+            course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        async with self.factory() as db:
+            draft = await db.get(CourseVersion, course.draft_version_id)
+            assessment = draft.content["lifespan_assessment"]
+            self.assertEqual(assessment["calculation_method"], "market_shift")
+            self.assertEqual(assessment["estimated_lifespan_years"], 0)
+            self.assertEqual(set(assessment["source_ids"]), {row.source_id for row in old + new})
+            self.assertIsNotNone(await db.get(SourceRow, (course.id, old[0].source_id)))
+
+    async def test_delete_requires_owner_and_waits_for_pending_commands(self):
+        for actor in (user("teacher", "-other"), user("expert")):
+            with self.assertRaises(PermissionError):
+                await delete_course(self.factory, "course", actor)
+        with self.assertRaisesRegex(ValueError, "завершения обработки"):
+            await delete_course(self.factory, "course", self.teacher)
+        course = await self.process()
+        await delete_course(self.factory, course.id, self.teacher)
+        await delete_course(self.factory, course.id, self.teacher)
+        self.assertEqual(await schedule_due(self.factory, now() + timedelta(days=275)), 0)
 
     async def test_new_market_tags_are_normalized_and_saved_once_per_version(self):
         vacancy = source_record("HH", "https://hh.ru/vacancy/123", "Инженер",

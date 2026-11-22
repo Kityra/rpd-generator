@@ -2,6 +2,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Annotated, Any, Protocol, TypedDict
 from uuid import NAMESPACE_URL, uuid5
 
@@ -9,6 +10,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
 from pydantic import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 
 from auth.settings import Settings
 from domain.schemas import (AppliedActivityModel, BusinessCourseAudit, CourseProgramModel, GapReport,
@@ -19,6 +21,9 @@ from orchestration.call_log import (CALL_SCOPE, GENERATION_NOTES, CallScope, Rec
                                     failure_note)
 from orchestration.clients import EvidenceClient, ModelClient, NoActivityEvidence, source_record
 from orchestration import prompts
+from orchestration.course_lifespan import (INSUFFICIENT_EVIDENCE, SUPPORT_FEED_UNAVAILABLE, MarketSample,
+                                          calculate_lifespan, collect_market_sample, compare_market_samples,
+                                          fetch_support_deadlines)
 from orchestration.draft import make_outline
 from orchestration.gap_coverage import GapParameters, profile_coverage
 from orchestration.interview_methods import load_interview_methods
@@ -104,6 +109,11 @@ class GraphState(TypedDict, total=False):
     draft_source_notices: list[str]
     literature_source_notices: list[str]
     composition_notices: list[str]
+    lifespan_assessment: dict | None
+    lifespan_note: str | None
+    lifespan_market_records: list[dict]
+    lifespan_market_sample: dict | None
+    lifespan_support_records: list[dict]
     applied_activity: dict
     # "profession_model" — задачи взяты из проверенной модели деятельности профессии (activity/rpd_bridge.py).
     activity_origin: str
@@ -170,8 +180,16 @@ class WorkflowStore(Protocol):
                          scheduled: bool, activity: dict, *, evidence_gaps: dict, source_notices: list[str],
                          vacancy_source_ids: list[str], generation: dict | None = None,
                          composition: dict | None = None, profession_profile: dict | None = None,
-                         profession_market: dict | None = None, skill_mappings: dict | None = None) -> None:
+                         profession_market: dict | None = None, skill_mappings: dict | None = None,
+                         lifespan_assessment: dict | None = None, lifespan_market_sample: dict | None = None,
+                         lifespan_note: str | None = None) -> None:
         """Сохранить версию и уведомление."""
+
+    async def lifespan_market_history(self, course_id: str) -> list[dict]:
+        """Прочитать сохранённые сопоставимые рыночные выборки."""
+
+    async def lifespan_sources(self, course_id: str, source_ids: list[str]) -> dict[str, SourceRecord]:
+        """Прочитать вакансии, использованные для предыдущей выборки."""
 
     async def finish_review(self, course_id: str, version_id: str, action: str, actor: str) -> None:
         """Утвердить либо отклонить конкретную версию."""
@@ -223,7 +241,9 @@ def context(state: GraphState) -> dict:
 
 def payload(state: GraphState) -> dict:
     excluded = {"interview_answers", "verification", "owner_user_id", "request_id", "run_id",
-                "interview_session_id", "interrupt_id", "version_id", "consumed_review_id", "closed_interview_id"}
+                "interview_session_id", "interrupt_id", "version_id", "consumed_review_id", "closed_interview_id",
+                "lifespan_assessment", "lifespan_notes", "lifespan_note", "lifespan_market_records", "lifespan_market_sample",
+                "lifespan_support_records"}
     excluded.update({"profession_profile", "profession_rag", "profession_market", "profession_market_sample", "profession_boundaries", "skill_mappings",
                      "profession_turns", "raw_activity", "acknowledged_profession_claims",
                      "interview_max_turns", "interview_continue", "interview_redirect", "interview_handoff"})
@@ -286,14 +306,8 @@ def synthesis_sources(state: GraphState) -> list[dict]:
     return selected
 
 
-def mark_generated(program: dict, generated_by: str, note: str | None = None, *, keep_existing: bool = False) -> dict:
-    """Записать происхождение каждой дисциплины: собрана моделью или шаблоном."""
-    subjects = []
-    for subject in program["subjects"]:
-        if keep_existing and subject.get("generated_by"):
-            subjects.append(subject)
-        else:
-            subjects.append({**subject, "generated_by": generated_by, "generation_note": note})
+def mark_model_generated(program: dict, note: str | None = None) -> dict:
+    subjects = [{**subject, "generated_by": "model", "generation_note": note} for subject in program["subjects"]]
     return {**program, "subjects": subjects}
 
 
@@ -377,7 +391,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                 "interview_answers": [], "review_feedback": [], "revision_baseline": None,
                 "refresh_only": False,
                 "interview_source_notices": [], "factcheck_source_notices": [], "draft_source_notices": [],
-                "literature_source_notices": [], "composition_notices": [],
+                "literature_source_notices": [], "composition_notices": [], "lifespan_assessment": None, "lifespan_note": None,
+                "lifespan_market_records": [], "lifespan_market_sample": None, "lifespan_support_records": [],
                 "applied_activity": {}, "activity_origin": "", "gap_report": {}, "verification": {}, "auto_subjects": {},
                 "profession_profile": {}, "profession_boundaries": [], "profession_turns": {}, "acknowledged_profession_claims": [],
                 "interview_max_turns": 0, "interview_continue": False, "interview_redirect": None,
@@ -391,9 +406,11 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                                  state.get("known_tasks", []))
             sources = await evidence.search(role, query, owner_scope=state["owner_user_id"])
             notices = getattr(sources, "notices", [])
+            market = {"lifespan_market_records": [row.model_dump(mode="json") for row in sources.market_records]
+                      } if role == "business" and getattr(sources, "market_records", None) else {}
             if not sources:
                 return {f"{role}_report": {"findings": [], "source_notices": notices, "retrieved_source_ids": []},
-                        "sources": []}
+                        "sources": [], **market}
             source_map = {item.source_id: item for item in sources}
             instructions = prompts.AGENT.format(role=role)
             if role == "business" and any(item.source_type == SOURCE for item in sources):
@@ -418,7 +435,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                 report_data["vacancy_source_ids"] = market_vacancy_ids(
                     {item.source_id: {"source_type": item.source_type, "url": item.url} for item in sources}, cards)
             return {f"{role}_report": report_data,
-                    "sources": [item.model_dump(mode="json") for item in sources]}
+                    "sources": [item.model_dump(mode="json") for item in sources], **market}
         return run
 
     async def relevance(state: GraphState) -> dict:
@@ -833,7 +850,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         notes: list[str] = []
         GENERATION_NOTES.set(notes)
         program = await llm.generate(CourseProgramModel, prompts.DESIGN, payload(state), ctx)
-        marked = mark_generated(program.model_dump(mode="json"), "model", "; ".join(notes) or None)
+        marked = mark_model_generated(program.model_dump(mode="json"), "; ".join(notes) or None)
         return {"course_program": marked, "status": "designing",
                 "profession_boundaries": boundaries}
 
@@ -958,7 +975,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                 audit = await llm.generate(BusinessCourseAudit, prompts.BUSINESS_AUDIT,
                                            {**payload(state), "course_program": program.model_dump(mode="json")},
                                            context(state), flash=True)
-                regenerated = mark_generated(program.model_dump(mode="json"), "model")
+                regenerated = mark_model_generated(program.model_dump(mode="json"))
                 updated = {**regenerated, "business_audit": audit.model_dump(mode="json")}
             except (ValidationError, RuntimeError):
                 notices = [*state.get("draft_source_notices", []), "Рыночные предложения сохранены в отчёте для проверки."]
@@ -994,10 +1011,41 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         return {"course_program": checked.model_dump(mode="json"), "sources": additions,
                 "literature_source_notices": notices}
 
+    async def assess_lifespan(state: GraphState) -> dict:
+        today = datetime.now(timezone.utc).date()
+        program = state["course_program"]
+        market_records = [SourceRecord.model_validate(row) for row in state.get("lifespan_market_records", [])]
+        sample = collect_market_sample(state["course_meta"]["title"], market_records)
+        market_sources = {row.source_id: row for row in market_records}
+        drop = None
+        if sample is not None and hasattr(type(store), "lifespan_market_history"):
+            try:
+                history = await store.lifespan_market_history(state["request_id"])
+                drop = compare_market_samples(program, sample, [MarketSample.model_validate(row) for row in history], today)
+                if drop:
+                    previous_sources = await store.lifespan_sources(state["request_id"], drop.previous.source_ids)
+                    if set(previous_sources) == set(drop.previous.source_ids):
+                        market_sources.update(previous_sources)
+                    else:
+                        drop = None
+            except (SQLAlchemyError, ValidationError):
+                logging.getLogger(__name__).warning("Прогноз курса %s: не удалось проверить историю выборок.", state["request_id"])
+                drop = None
+        deadlines, support_failed = await fetch_support_deadlines(program)
+        assessment = calculate_lifespan(today, deadlines, drop, market_sources)
+        return {"lifespan_assessment": assessment.model_dump(mode="json") if assessment else None,
+                "lifespan_market_sample": sample.model_dump(mode="json") if sample else None,
+                "lifespan_support_records": [item.source.model_dump(mode="json") for item in deadlines],
+                "lifespan_note": None if assessment else (SUPPORT_FEED_UNAVAILABLE if support_failed else INSUFFICIENT_EVIDENCE)}
+
     async def persist_review(state: GraphState) -> dict:
         identifier = str(uuid5(NAMESPACE_URL, f"{state['request_id']}/{state['run_id']}/version/{state.get('review_iteration', 0)}"))
         sources = registry(state)
-        await store.save_sources(state["request_id"], list(sources.values()))
+        sample_ids = set((state.get("lifespan_market_sample") or {}).get("source_ids", []))
+        extra = [SourceRecord.model_validate(row) for row in state.get("lifespan_support_records", [])]
+        extra.extend(SourceRecord.model_validate(row) for row in state.get("lifespan_market_records", [])
+                     if row["source_id"] in sample_ids)
+        await store.save_sources(state["request_id"], list({**sources, **{row.source_id: row for row in extra}}.values()))
         boundaries = await current_boundaries(state)
         threshold = getattr(settings, "boundary_violation_threshold", 0.5)
         checked = with_boundary_warnings(state["course_program"], boundaries, threshold=threshold)
@@ -1024,6 +1072,9 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                                vacancy_source_ids=vacancy_ids, skill_mappings=mappings,
                                generation=llm.describe(), composition=composition,
                                profession_profile=state.get("profession_profile"), profession_market=state.get("profession_market"),
+                               lifespan_assessment=state.get("lifespan_assessment"),
+                               lifespan_market_sample=state.get("lifespan_market_sample"),
+                               lifespan_note=state.get("lifespan_note"),
                                **boundary_options)
         return {"version_id": identifier, "skill_mappings": mappings,
                 "course_program": checked, "profession_boundaries": boundaries,
@@ -1077,7 +1128,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     nodes = {"relevance": relevance, "formalize": formalize, "university_audit": university_audit,
              "gap_analysis": gap_analysis, "prepare_interview": prepare_interview, "interview": interview,
              "factcheck": factcheck, "design": design, "business_audit": business_audit,
-             "subject_rationale": subject_rationale, "persist_review": persist_review, "review": review}
+             "subject_rationale": subject_rationale, "lifespan_assessment": assess_lifespan,
+             "persist_review": persist_review, "review": review}
     for name, node in nodes.items():
         graph.add_node(name, guarded(name, node))
     # Сохраняем ключ узла для возобновления сохранённых запусков.
@@ -1112,7 +1164,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     graph.add_edge("design", "business_audit")
     graph.add_edge("business_audit", "subject_rationale")
     graph.add_edge("subject_rationale", "literature")
-    graph.add_edge("literature", "persist_review")
+    graph.add_edge("literature", "lifespan_assessment")
+    graph.add_edge("lifespan_assessment", "persist_review")
     graph.add_edge("persist_review", "review")
     def after_review(state):
         if state["status"] == "approved":

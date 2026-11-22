@@ -269,19 +269,22 @@ def boundary_report_html(boundaries: list[dict], program: dict) -> str:
     return "\n".join(parts)
 
 
-def gap_coverage_html(gaps: dict | None) -> str:
+def gap_coverage_html(gaps: dict | None, *, include_methodology: bool = True) -> str:
     params = (gaps or {}).get("coverage_parameters")
     if not params:
         return ""
     labels = {"covered": "Достаточно подтверждений", "partial_gap": "Частичный пробел",
               "critical_gap": "Критический пробел"}
-    parts = ["<h2>Покрытие профиля источниками</h2>",
-             "<p>Итог — лучшее произведение качества на свежесть × коэффициент независимости источников.</p>",
-             f"<p>Коэффициент независимости — min(1, ln(1 + число источников) / "
-             f"ln(1 + {params['target_independent_sources']})). Порог покрытия — {params['covered_threshold']:.2f}. "
-             f"Год расчёта — {params['as_of_year']}. Слабая связь имеет вес {params['weak_weight']:.2f}. "
-             f"За {params['freshness_half_life_years']:g} лет свежесть снижается с 1 до 0,5. "
-             "Если год публикации неизвестен, свежесть равна 0,75.</p>"]
+    parts = ["<h2>Покрытие профиля источниками</h2>"]
+    if include_methodology:
+        parts.extend([
+            "<p>Итог — лучшее произведение качества на свежесть × коэффициент независимости источников.</p>",
+            f"<p>Коэффициент независимости — min(1, ln(1 + число источников) / "
+            f"ln(1 + {params['target_independent_sources']})). Порог покрытия — {params['covered_threshold']:.2f}. "
+            f"Год расчёта — {params['as_of_year']}. Слабая связь имеет вес {params['weak_weight']:.2f}. "
+            f"За {params['freshness_half_life_years']:g} лет свежесть снижается с 1 до 0,5. "
+            "Если год публикации неизвестен, свежесть равна 0,75.</p>",
+        ])
     rows = gaps.get("formula_breakdown", [])
     if not rows:
         return "\n".join([*parts, "<p>Нет утверждений с данными для расчёта.</p>"])

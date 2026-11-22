@@ -40,9 +40,8 @@ def _trusted_ref(claim: ProfessionClaim, ref: EvidenceRef, rag, market, turns) -
 
 async def verify_profession_profile(profile: ProfessionProfile, rag_index_map: Mapping[str, str],
                                     market_map: Mapping[str, dict], interview_turns: Mapping[str, dict],
-                                    judge_client, *, rejected_noise_turns: list[int] | None = None,
-                                    reuse_recorded_verdicts: bool = False) -> ProfessionProfile:
-    rejected_ids = {f"turn:{index}" for index in [*profile.rejected_noise_turns, *(rejected_noise_turns or [])]}
+                                    judge_client, *, reuse_recorded_verdicts: bool = False) -> ProfessionProfile:
+    rejected_ids = {f"turn:{index}" for index in profile.rejected_noise_turns}
     pending: list[tuple[str, int, JudgePair]] = []
     trusted = {}
     for claim in profile.claims:
@@ -104,5 +103,5 @@ async def verify_profession_profile(profile: ProfessionProfile, rag_index_map: M
             status, reason = "needs_review", "Прямого подтверждения в проверенных источниках нет."
         claims.append(claim.model_copy(update={"evidence": refs, "verification_status": status,
                                                "verification_reason": reason}))
-    return profile.model_copy(update={"claims": claims, "judge_unavailable": judge_failed, "rejected_noise_turns": sorted(
-        set(profile.rejected_noise_turns) | set(rejected_noise_turns or []))})
+    return profile.model_copy(update={"claims": claims, "judge_unavailable": judge_failed,
+                                      "rejected_noise_turns": sorted(set(profile.rejected_noise_turns))})

@@ -62,6 +62,18 @@ class SqlWorkflowStore:
                     db.add(SourceRow(course_id=course_id, source_id=source.source_id,
                                      record=source.model_dump(mode="json")))
 
+    async def lifespan_market_history(self, course_id: str) -> list[dict]:
+        sample = CourseVersion.content["lifespan_market_sample"]
+        async with self.factory() as db:
+            return [item for item in await db.scalars(select(sample).where(CourseVersion.course_id == course_id)
+                    .order_by(CourseVersion.revision.desc()).limit(100)) if isinstance(item, dict)]
+
+    async def lifespan_sources(self, course_id: str, source_ids: list[str]) -> dict[str, SourceRecord]:
+        async with self.factory() as db:
+            rows = await db.scalars(select(SourceRow).where(SourceRow.course_id == course_id,
+                                                           SourceRow.source_id.in_(source_ids)))
+            return {row.source_id: SourceRecord.model_validate(row.record) for row in rows}
+
     async def prepare_interview(self, course_id: str, interrupt_id: str, report: dict) -> str:
         interview_id = str(uuid5(NAMESPACE_URL, f"{course_id}/{interrupt_id}"))
         async with write_transaction(self.factory) as db:
@@ -92,7 +104,8 @@ class SqlWorkflowStore:
         async with write_transaction(self.factory) as db:
             interview = await db.scalar(select(Interview).where(Interview.id == interview_id).with_for_update())
             course = await db.get(Course, interview.course_id) if interview else None
-            if course is None or course.owner_user_id != teacher.id or interview.status != "invited":
+            if (course is None or course.owner_user_id != teacher.id or course.status == "cancelled" or
+                    interview.status != "invited"):
                 raise PermissionError("Интервью недоступно.")
             if interview.gap_report.get("methodologist_handoff"):
                 raise ValueError("Оставшиеся поля переданы методисту.")
@@ -121,6 +134,9 @@ class SqlWorkflowStore:
             if invitation is None or invitation.expert_user_id != expert.id:
                 raise PermissionError("Приглашение недоступно.")
             interview = await db.scalar(select(Interview).where(Interview.id == invitation.interview_id).with_for_update())
+            course = await db.get(Course, interview.course_id)
+            if course is None or course.status == "cancelled":
+                raise PermissionError("Интервью недоступно.")
             invitation = await db.scalar(select(ExpertInvitation).where(locator).with_for_update()
                                          .execution_options(populate_existing=True))
             command_id = f"interview:{interview.id}:{interrupt_id}"
@@ -165,7 +181,6 @@ class SqlWorkflowStore:
             db.add(WorkflowCommand(id=command_id, course_id=interview.course_id, kind="resume", payload=payload))
             interview.status, interview.submitted_at = "submitted", at
             invitation.status, invitation.used_at = "used", at
-            course = await db.get(Course, interview.course_id)
             course.status = "answer_queued"
 
     async def save_draft(self, course_id: str, version_id: str, program: CourseProgramModel,
@@ -174,6 +189,9 @@ class SqlWorkflowStore:
                          generation: dict | None = None, composition: dict | None = None,
                          profession_profile: dict | None = None, profession_market: dict | None = None,
                          skill_mappings: dict | None = None,
+                         lifespan_assessment: dict | None = None,
+                         lifespan_market_sample: dict | None = None,
+                         lifespan_note: str | None = None,
                          boundary_violation_threshold: float = 0.5) -> None:
         async with write_transaction(self.factory) as db:
             course = await db.scalar(select(Course).where(Course.id == course_id).with_for_update())
@@ -183,7 +201,12 @@ class SqlWorkflowStore:
             if await db.get(CourseVersion, version_id) is None:
                 revision = (await db.scalar(select(func.max(CourseVersion.revision)).where(
                     CourseVersion.course_id == course_id)) or 0) + 1
-                content = {"program": program.model_dump(mode="json"), "activity": activity, "evidence_gaps": evidence_gaps}
+                content = {"program": program.model_dump(mode="json"), "activity": activity, "evidence_gaps": evidence_gaps,
+                           "lifespan_assessment": lifespan_assessment}
+                if lifespan_market_sample:
+                    content["lifespan_market_sample"] = lifespan_market_sample
+                if lifespan_note:
+                    content["lifespan_note"] = lifespan_note
                 primary = (profession_profile or {}).get("profession_name")
                 boundaries = [public_boundary(row) for row in await course_boundaries(db, course_id)
                               if not primary or role_key(row.primary_profession) == role_key(primary)]

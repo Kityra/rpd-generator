@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from argon2 import PasswordHasher
@@ -13,11 +14,22 @@ from sqlalchemy.orm import Session
 from datetime import timedelta
 from streamlit.testing.v1 import AppTest
 
+from apps.common import composer
 from apps.presentation import progress_html
 from storage.models import Base, Course, ExpertInvitation, Interview, now
 
 
 class PortalUITests(unittest.TestCase):
+    def test_composer_accepts_attachment_only_and_enforces_file_limit(self):
+        upload = SimpleNamespace(name=r"folder\plan.txt", getvalue=lambda: "Добавить SQL".encode("utf-8-sig"))
+        with patch("apps.common.st.chat_input") as chat_input:
+            chat_input.return_value = SimpleNamespace(text="", files=[upload])
+            self.assertEqual(composer("Правка", "edit"), ("", [{"name": "plan.txt", "text": "Добавить SQL"}]))
+
+            chat_input.return_value = SimpleNamespace(text="Правка", files=[upload] * 4)
+            with self.assertRaisesRegex(ValueError, "трёх файлов"):
+                composer("Правка", "edit")
+
     def test_progress_distinguishes_waiting_approval_and_failure(self):
         waiting = progress_html("waiting_for_expert")
         self.assertIn("Ждёт интервью эксперта", waiting)
@@ -134,6 +146,7 @@ class PortalUITests(unittest.TestCase):
                 app.button[0].click().run()
                 next(b for b in app.button if b.label == "Открыть курс").click().run()
                 self.assertFalse(app.exception, app.exception)
+                self.assertIn("Черновик · версия 2", [heading.value for heading in app.subheader])
                 self.assertEqual([tab.label for tab in app.tabs], ["Программа", "Отчёт по курсу"])
                 html = " ".join(item.proto.body for item in app.get("html"))
                 self.assertIn("Базы данных", html)

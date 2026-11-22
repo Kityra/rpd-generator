@@ -1,5 +1,4 @@
 import logging
-from dataclasses import asdict
 from pathlib import Path
 
 import streamlit as st
@@ -8,6 +7,7 @@ from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from activity.documents import ATTACHMENT_MAX_MB, read_attachment
 from auth.password_verifier import ExistingPasswordVerifier
 from auth.session import AuthService, require_role
 from auth.settings import Settings
@@ -16,7 +16,6 @@ from auth.yandex_users import CombinedUserRepository, DirectoryError, LocalUserR
 from apps.presentation import portal_brand
 from run_rpd import open_yandex
 from storage.database import DatabaseSetupError, ensure_schema, make_engine, run_async
-from web_preview import read_attachment
 
 
 @st.cache_resource(ttl=30, show_spinner=False)
@@ -41,12 +40,13 @@ def local_users(settings: Settings) -> LocalUserRepository | None:
 
 
 def composer(label, key):
-    msg = st.chat_input(label, key=key, accept_file="multiple", file_type=["txt", "pdf", "docx"], max_upload_size=10)
+    msg = st.chat_input(label, key=key, accept_file="multiple", file_type=["txt", "pdf", "docx"],
+                        max_upload_size=ATTACHMENT_MAX_MB)
     if not msg:
         return None
     if len(msg.files) > 3 or len(msg.text) > 16000:
         raise ValueError("Одно сообщение может содержать до 16 000 символов и трёх файлов.")
-    files = [asdict(read_attachment(f.name, f.getvalue())) for f in msg.files]
+    files = [read_attachment(f.name, f.getvalue()) for f in msg.files]
     if any(not f["text"] for f in files):
         raise ValueError("В одном из файлов отсутствует читаемый текст.")
     return msg.text.strip(), files

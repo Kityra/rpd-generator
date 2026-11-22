@@ -1,0 +1,35 @@
+x-production: &production
+  APP_ENV: production
+  PUBLIC_ORIGIN: https://${RPD_DOMAIN:?Set RPD_DOMAIN to the domain name without https://}
+  LOCAL_USERS_FILE: ""
+
+services:
+  app:
+    environment: *production
+  worker:
+    environment: *production
+  scheduler:
+    environment: *production
+
+  caddy:
+    image: caddy:2-alpine
+    command: ["caddy", "reverse-proxy", "--from", "${RPD_DOMAIN:?Set RPD_DOMAIN in .env}", "--to", "http://app:8501"]
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  caddy-data:
+  caddy-config:

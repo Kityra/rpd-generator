@@ -61,6 +61,7 @@ class PublicVacancySearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("hidden@example.org", records[1].content)
         self.assertIn("Существующее примечание", records.notices)
         self.assertIn("работодателей: 2", records.notices[-1])
+        self.assertEqual([item.url for item in records.market_records], [vacancy["vac_url"]])
 
     async def test_unavailable_provider_leaves_existing_business_evidence(self):
         base = AsyncMock()
@@ -70,5 +71,6 @@ class PublicVacancySearchTests(unittest.IsolatedAsyncioTestCase):
                                         public_search=PublicVacancySearch(employer_careers=False, transport=transport))
         records = await client.search("business", "DevOps")
         self.assertFalse(records)
+        self.assertFalse(records.market_records)
         self.assertEqual(records.notices[0], "Индекс HH недоступен.")
         self.assertIn("Работа в России", records.notices[1])

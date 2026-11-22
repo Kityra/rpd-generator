@@ -284,12 +284,14 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 value = rationale_batch(payload)
             elif output.__name__ == "RationaleVerdicts":
                 value = {"items": [{"pair_id": row["pair_id"], "verdict": "supports"} for row in payload["pairs"]]}
-            else:
+            elif output.__name__ == "BusinessCourseAudit":
                 audit_calls += 1
                 value = {"source_ids": ["HH"], "market_fit_score": 0.7, "metrics": [], "unavailable_metrics": ["active_vacancies"],
                          "evidence_summary": "Практика", "suggested_changes": [
                              {"reason_type": "market_demand", "evidence_summary": "Практика SQL", "source_ids": ["HH"]}
                          ] if audit_calls == 1 else []}
+            else:
+                self.fail(f"Неожиданный вызов модели {output.__name__}")
             return output.model_validate(value, context=context)
         llm.generate.side_effect = generate
         async with self.factory.begin() as db:

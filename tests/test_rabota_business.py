@@ -86,7 +86,7 @@ class RpdBusinessTests(unittest.TestCase):
         with patch.dict("os.environ", {"RABOTA_IT_DATABASE": str(database)}), \
              patch("orchestration.evidence_cache.snapshot_store"), \
              patch.object(run_rpd, "collect_recent_articles", return_value=[]):
-            graph = run_rpd.create_rpd_graph(client, settings, draft_first=True)
+            graph = run_rpd.create_rpd_graph(client, settings)
             outcome = graph.invoke(
                 {"request": {"discipline": "Python", "institution": "Вуз", "academic_year": "2026/27"}},
                 config={"configurable": {"thread_id": self.id()}},

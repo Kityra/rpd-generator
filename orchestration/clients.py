@@ -205,7 +205,7 @@ def normalize_blocks(data, context: dict):
 
 
 def parse_output(output, raw: str, context: dict):
-    """Проверка ответа модели; для программы курса — после механического согласования блоков."""
+    """Проверить ответ модели после заполнения полей, которые вычисляет сервер."""
     if output not in (CourseProgramModel, TopicAssignments):
         return output.model_validate_json(raw, context=context)
     try:
@@ -334,12 +334,13 @@ class YandexModelClient:
                 if shortened:
                     logger.warning("%s: запрос сокращён до лимита модели (%s).", output.__name__, "; ".join(shortened))
                 body = json.dumps(request, ensure_ascii=False)
+                budget = request_budget(len(prompt) + len(body), max_tokens, flash=flash)
                 arguments = dict(
                     model=model, instructions=prompt, input=body,
                     text={"format": {"type": "json_schema", "name": output.__name__,
                                      "schema": schema, "strict": True}},
                     max_output_tokens=max_tokens, temperature=temperature, store=False,
-                    budget=request_budget(len(prompt) + len(body), max_tokens, flash=flash),
+                    budget=budget,
                     request_key=hashlib.sha256(f"{output.__name__}\0{body}".encode()).hexdigest()[:24],
                 )
                 try:

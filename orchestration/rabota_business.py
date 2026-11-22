@@ -189,4 +189,5 @@ class BusinessEvidenceClient:
             requests.append(self.public_search.records(topic))
         results = await asyncio.gather(*requests)
         return EvidenceResults((item for result in results for item in result),
-                               (note for result in results for note in getattr(result, "notices", ())))
+                               (note for result in results for note in getattr(result, "notices", ())),
+                               market_records=(item for result in results for item in getattr(result, "market_records", ())))
