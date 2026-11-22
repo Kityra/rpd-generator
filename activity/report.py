@@ -245,7 +245,7 @@ def program_document(program: dict, analysis: dict, decisions: list[dict], model
                       [[task["name"], task["status_label"], TREND_LABELS[task["trend"]], task["priority"], task["market"],
                         task["experts"]] for task in rec["tasks"][:15]])
         comment = f" — {decision['comment']}" if decision.get("comment") else ""
-        doc.p(f"Решение руководителя: {DECISION_LABELS[decision.get('decision')]}{comment}.")
+        doc.p(f"Решение методиста: {DECISION_LABELS[decision.get('decision')]}{comment}.")
     doc.h(1, "Дисциплины программы")
     doc.table(["Дисциплина", "ЗЕТ", "Часть", "Методист", "Покрыто задач", "Доля тем без связи с задачами"],
               [[d["name"], f"{d['zet']:g}", PART_LABELS.get(d["part"], d["part"]), d.get("teacher_name") or "—",
@@ -259,7 +259,7 @@ def program_document(program: dict, analysis: dict, decisions: list[dict], model
     doc.note(DISCLAIMER)
     doc.h(1, "Как разрабатывать программу")
     doc.ul([step.format(n_min=load_config()["experts"]["n_min"]) for step in METHOD_STEPS])
-    doc.h(1, "Журнал решений руководителя")
+    doc.h(1, "Журнал решений методиста")
     logged = [item for item in decisions if item.get("decision")]
     doc.table(["Дата", "Правило", "Рекомендация", "Решение", "Комментарий"],
               [[item["decided_at"], item["rule"], item["action_text"], DECISION_LABELS[item["decision"]],

@@ -46,8 +46,8 @@ def aware(value: datetime | date | None) -> datetime | None:
 
 
 def require_head(actor) -> None:
-    if actor.role not in {"program_head", "admin"}:
-        raise PermissionError("Действие доступно руководителю образовательной программы.")
+    if actor.role not in {"teacher", "admin"}:
+        raise PermissionError("Действие доступно методисту.")
 
 
 class SqlExtractionCache:
@@ -683,12 +683,13 @@ async def assign_teacher(factory: Factory, actor, discipline_id: str, teacher_id
 
 async def set_coverage(factory: Factory, actor, discipline_id: str, item_id: str, coverage: str | None, reason: str = "") -> None:
     """Ручная правка покрытия важнее автоматики. coverage=None — вернуть автоматический расчёт."""
-    if actor.role not in {"program_head", "admin", "teacher"}:
-        raise PermissionError("Правка покрытия недоступна.")
+    require_head(actor)
     async with write_transaction(factory) as db:
         discipline = await db.get(ProgramDiscipline, discipline_id)
-        if actor.role == "teacher" and discipline.teacher_user_id != actor.id:
-            raise PermissionError("Дисциплина закреплена за другим методистом.")
+        if discipline is None:
+            raise PermissionError("Дисциплина недоступна.")
+        if actor.role != "admin" and discipline.teacher_user_id != actor.id:
+            await owned_program(db, actor, discipline.program_id)
         await db.execute(delete(DisciplineLink).where(DisciplineLink.discipline_id == discipline_id,
                                                       DisciplineLink.item_id == item_id))
         if coverage:
@@ -716,7 +717,7 @@ async def program_input(db: AsyncSession, program: Program) -> tuple[ProgramInpu
 
 
 async def recompute(factory: Factory, actor, program_id: str) -> dict:
-    """Пересчитать рекомендации. Решение руководителя сохраняется, пока рекомендация не изменилась (ключ)."""
+    """Пересчитать рекомендации, сохраняя решения методиста для прежних ключей."""
     async with factory() as db:
         program = await owned_program(db, actor, program_id) if actor else await db.get(Program, program_id)
         data, contents = await program_input(db, program)

@@ -1,6 +1,6 @@
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import MetaData, Table, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -11,8 +11,14 @@ class CurrentUser(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     id: str
     email: str
-    role: Literal["teacher", "expert", "admin", "program_head"]
+    role: Literal["teacher", "expert", "admin"]
     display_name: str
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def unify_methodologist_role(cls, value):
+        # Keep legacy user IDs unchanged so saved ownership and sessions still resolve.
+        return "teacher" if value == "program_head" else value
 
 
 class UserRepository(Protocol):

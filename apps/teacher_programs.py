@@ -1,4 +1,4 @@
-"""Кабинет методиста: дисциплины, закреплённые руководителем программы, и карта знаний."""
+"""Кабинет методиста: закреплённые дисциплины и карта знаний."""
 
 from uuid import uuid4
 
@@ -20,7 +20,7 @@ async def program_state(factory, program) -> tuple[dict, dict]:
 
 async def my_disciplines(actor, factory) -> None:
     st.header("Мои дисциплины в программах")
-    st.caption("Руководитель программы закрепил за вами дисциплины. Здесь видно, какие проверенные задачи профессии "
+    st.caption("Здесь видно, какие проверенные задачи профессии "
                "покрывает ваша дисциплина. По ним строится РПД.")
     async with factory() as db:
         rows = await store.teacher_disciplines(db, actor.id)
@@ -52,7 +52,7 @@ async def my_disciplines(actor, factory) -> None:
                             st.caption("Знания и инструменты: " + "; ".join([*task["knowledge"], *task["tools"]][:10]))
             else:
                 st.warning("Дисциплина не покрывает ни одной проверенной задачи профессии. Добавьте в её содержание "
-                           "темы и результаты по задачам модели или обсудите с руководителем программы. РПД можно "
+                           "темы и результаты по задачам модели в разделе «Управление программами». РПД можно "
                            "создать по прежней схеме: задачи предложит модель по источникам курса.")
             if discipline.course_id:
                 if st.button("Открыть курс", key=f"open-course-{discipline.id}", icon=":material/arrow_forward:"):
@@ -90,6 +90,7 @@ async def knowledge_screen(factory) -> None:
     st.header("Карта знаний")
     st.caption("Выберите свою область знаний и посмотрите, в каких профессиях и реальных задачах она нужна. "
                "Каждая задача — готовая идея для проекта, с источником.")
+    st.caption("Вес области — доля приоритета связанных с ней задач среди всех подтверждённых и предварительных задач профессии.")
     async with factory() as db:
         models = await store.latest_contents(db)
     knowledge_map(models)

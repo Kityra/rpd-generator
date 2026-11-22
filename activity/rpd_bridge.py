@@ -56,7 +56,7 @@ def activity_from_snapshot(snapshot: dict, public_origin: str) -> tuple[dict, li
                  f"Задача: {task['title']}. Функция: {task['function'] or 'не размечена'}. Статус: {task['status_label']}.",
                  *task["reason"], *(f"Цитата: «{quote['text']}» — {quote['source_title']} ({quote['date']})"
                                     for quote in task["quotes"])]
-        url = f"{public_origin.rstrip('/')}/head?profession={task['profession_id']}&task={task['id']}"
+        url = f"{public_origin.rstrip('/')}/teacher?profession={task['profession_id']}&task={task['id']}"
         record = source_record("ActivityModel", url, f"Модель деятельности: {task['title']}"[:300], "\n".join(lines))
         records.append(record)
         tasks.append({"id": task["id"], "title": task["title"], "stack": task["tools"],

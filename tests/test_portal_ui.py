@@ -77,6 +77,15 @@ class PortalUITests(unittest.TestCase):
                 self.assertFalse(app.exception)
                 self.assertIn("Создать курс", [b.label for b in app.button],
                               ([e.value for e in app.error], [b.label for b in app.button]))
+                next(b for b in app.sidebar.button if b.label == "Управление программами").click().run()
+                self.assertFalse(app.exception)
+                self.assertIn("Профессии", [heading.value for heading in app.header])
+                next(field for field in app.text_input if field.label == "Название").set_value("Инженер данных")
+                next(b for b in app.button if b.label == "Создать профессию").click().run()
+                self.assertFalse(app.exception)
+                self.assertFalse(app.error)
+                next(b for b in app.sidebar.button if b.label == "Модель деятельности").click().run()
+                self.assertIn("Модель деятельности «Инженер данных»", [heading.value for heading in app.header])
                 next(b for b in app.button if b.label == "Создать курс").click().run()
                 self.assertFalse(app.number_input)
                 for field, value in zip(app.text_input, ("Аналитика", "Вуз", "2026/2027", "Аналитик данных"), strict=True):

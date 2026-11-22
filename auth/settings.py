@@ -1,4 +1,5 @@
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -15,7 +16,7 @@ class Settings(BaseSettings):
     user_database_url: str = ""
     teachers_index_id: str = ""
     experts_index_id: str = ""
-    # Справочник руководителей образовательных программ (третий файл в Yandex AI Studio, формат как у методистов).
+    # Дополнительный справочник прежних учётных записей. Они работают в кабинете методиста.
     program_heads_index_id: str = ""
     # Локальный файл учётных записей для разработки и демо (только при APP_ENV=development). Формат — local_users.example.txt.
     local_users_file: str = ""
@@ -74,6 +75,9 @@ class Settings(BaseSettings):
             raise ValueError("SESSION_SIGNING_KEY должен содержать минимум 32 символа.")
         if self.allow_rehash_on_login:
             raise ValueError("Rehash требует отдельного подтверждённого legacy-адаптера записи.")
-        if self.app_env == "production" and not self.public_origin.startswith("https://"):
-            raise ValueError("Для production требуется HTTPS PUBLIC_ORIGIN.")
+        if self.app_env == "production":
+            origin = urlsplit(self.public_origin)
+            if (origin.scheme not in {"http", "https"} or not origin.hostname or origin.username is not None
+                    or origin.path not in {"", "/"} or origin.query or origin.fragment):
+                raise ValueError("PUBLIC_ORIGIN должен быть адресом HTTP или HTTPS без пути и параметров.")
         return self

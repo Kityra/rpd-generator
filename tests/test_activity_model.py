@@ -330,9 +330,12 @@ class LocalUsersTests(unittest.TestCase):
     def test_example_file_has_all_roles(self):
         from auth.yandex_users import LocalUserRepository
         repo = LocalUserRepository(Path(__file__).resolve().parents[1] / "local_users.example.txt")
-        roles = {asyncio.run(repo.get_by_email(login)).role
-                 for login in ("head@demo.local", "teacher@demo.local", "expert@demo.local")}
-        self.assertEqual(roles, {"program_head", "teacher", "expert"})
+        legacy = asyncio.run(repo.get_by_email("head@demo.local"))
+        self.assertTrue(legacy.id.startswith("program_head:"))
+        self.assertEqual(legacy, asyncio.run(repo.get_by_id(legacy.id)))
+        self.assertEqual({user.email for user in asyncio.run(repo.list_teachers())},
+                         {"head@demo.local", "teacher@demo.local"})
+        self.assertEqual(asyncio.run(repo.get_by_email("expert@demo.local")).role, "expert")
 
 
 class DemoSeedTests(unittest.TestCase):

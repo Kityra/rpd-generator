@@ -219,7 +219,7 @@ PROGRAM = [
 
 
 def actor_for(head: str) -> SimpleNamespace:
-    return SimpleNamespace(id=head, role="program_head")
+    return SimpleNamespace(id=head, role="teacher")
 
 
 async def reset(factory) -> None:
@@ -562,7 +562,7 @@ async def run(head_login: str, teacher_login: str, expert_login: str, do_reset: 
             version = await store.latest_version(db, backend)
         statuses = version.counts["statuses"]
         print(f"{DEMO}. Модель «Backend-разработчик» v{version.number}: {statuses}.")
-        print(f"Программа {program_id}: руководитель {head_login}, методист {teacher_login}, эксперт {expert_login}.")
+        print(f"Программа {program_id}: методисты {head_login} и {teacher_login}, эксперт {expert_login}.")
     finally:
         await engine.dispose()
 
@@ -570,7 +570,7 @@ async def run(head_login: str, teacher_login: str, expert_login: str, do_reset: 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--reset", action="store_true", help="пересоздать демоданные (удаляются только записи is_demo)")
-    parser.add_argument("--head-login", default="head@demo.local", help="логин руководителя программы")
+    parser.add_argument("--head-login", default="head@demo.local", help="логин методиста-владельца программы")
     parser.add_argument("--teacher-login", default="teacher@demo.local", help="логин методиста")
     parser.add_argument("--expert-login", default="expert@demo.local", help="логин эксперта для прохождения анкеты")
     arguments = parser.parse_args()

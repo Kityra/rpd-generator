@@ -10,6 +10,7 @@ from sqlalchemy import select
 from activity.rpd_bridge import origin_note
 from apps.boundary_review import boundary_review
 from apps.common import composer, portal
+from apps.head_app import render_management
 from apps.teacher_programs import knowledge_screen, my_disciplines
 from apps.presentation import course_progress, status_badge
 from domain.export import (OUTLINE_LABEL, block_html, composition_html, export_course, gap_coverage_html, generation_summary,
@@ -463,6 +464,9 @@ async def render(actor, settings, factory, users):
         notices = (await db.scalars(select(Notification).where(Notification.user_id == actor.id)
                                     .order_by(Notification.created_at.desc()))).all()
     count = sum(n.read_at is None for n in notices)
+    if requested := st.query_params.get("profession"):
+        st.session_state.update(screen="management", profession_id=requested, head_screen="model")
+        del st.query_params["profession"]
     if requested := st.query_params.get("course"):
         if any(course.id == requested for course in courses):
             st.session_state.update(screen="course", selected_course=requested)
@@ -484,7 +488,14 @@ async def render(actor, settings, factory, users):
                          type="secondary" if screen == "map" else "tertiary"):
         st.session_state.screen = "map"
         st.rerun()
+    if st.sidebar.button("Управление программами", icon=":material/account_tree:", width="stretch",
+                         type="secondary" if screen == "management" else "tertiary"):
+        st.session_state.screen = "management"
+        st.rerun()
     screen = st.session_state.get("screen", "list")
+    if screen == "management":
+        await render_management(actor, factory, users)
+        return
     if screen == "programs":
         await my_disciplines(actor, factory)
         return

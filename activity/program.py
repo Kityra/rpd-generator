@@ -78,7 +78,7 @@ def coverage(discipline: Discipline, task: dict, config: dict, override: str | N
     outcome_hits = match(task["name"], discipline.outcomes + discipline.assignments, share)
     if override in ("full", "partial"):
         return {"coverage": override, "method": "manual", "topics": [i for i, _ in topic_hits],
-                "reason": "задано вручную методистом или руководителем программы"}
+                "reason": "задано вручную методистом"}
     if not topic_hits and not outcome_hits:
         return None
     words = sorted({word for _, common in topic_hits + outcome_hits for word in common})

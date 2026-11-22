@@ -1,4 +1,4 @@
-"""Кабинет руководителя образовательной программы (и методиста): модели деятельности, эксперты, программа."""
+"""Раздел управления образовательными программами в кабинете методиста."""
 
 from collections import Counter
 from html import escape
@@ -16,7 +16,6 @@ from activity.program import PART_LABELS, RULE_LABELS, SIGNAL_LABELS, find_profe
 from activity.report import (CONFIDENCE_LABELS, DECISION_LABELS, DISCLAIMER, justification_document, model_document,
                              model_json, program_document, program_json)
 from apps.activity_ui import (demo_banner, kpis, needed_hint, quotes_html, status_bar, task_detail, task_label)
-from apps.common import portal
 from storage.activity_models import (ActivityExpert, ActivityMergeLog, ActivitySource, ExpertVote, Profession, Program,
                                      ProgramDiscipline, Recommendation)
 
@@ -24,7 +23,7 @@ from storage.activity_models import (ActivityExpert, ActivityMergeLog, ActivityS
 SCREENS = {"professions": ("Профессии", ":material/work:"), "model": ("Модель деятельности", ":material/account_tree:"),
            "sources": ("Источники", ":material/library_books:"), "experts": ("Эксперты", ":material/groups:"),
            "program": ("Моя программа", ":material/school:"), "signal": ("Сигнал по профилю", ":material/trending_down:"),
-           "map": ("Карта знаний", ":material/hub:"), "queue": ("Очередь методиста", ":material/rule:"),
+           "queue": ("Очередь методиста", ":material/rule:"),
            "export": ("Экспорт", ":material/download:")}
 DOC_TYPES = ("employer_doc", "expert", "forecast", "science", "rpd")
 
@@ -51,7 +50,7 @@ def choose_profession(rows) -> Profession | None:
 
 async def screen_professions(actor, factory):
     st.header("Профессии")
-    st.caption("Одна проверенная модель деятельности на профессию — её видят руководитель программы и методисты.")
+    st.caption("Модели деятельности профессий доступны методистам.")
     rows, versions, experts = await professions_list(factory)
     for offset in range(0, len(rows), 2):
         for column, row in zip(st.columns(2, gap="medium"), rows[offset:offset + 2]):
@@ -556,7 +555,7 @@ async def screen_program(actor, factory, users):
               (sum(1 for row in saved.values() if row.current and row.decision), "решений принято")])
         st.caption("Рекомендации считает код по правилам R1–R5 и R7 и порогам config/activity_model.yaml. Учитываются задачи "
                    "со статусами «Подтверждено» и «Предварительно». Обязательные по ФГОС дисциплины не трогаются. "
-                   "Окончательно решает руководитель.")
+                   "Окончательно решает методист.")
         recommendations = analysis["recommendations"]
         rule_filter = st.pills("Правила", list(RULE_LABELS), selection_mode="multi", format_func=lambda r: f"{r} · {RULE_LABELS[r]}")
         # Изменения программы — сверху по Σ приоритета; «сохранить как фундамент» (R5) — отдельным блоком ниже.
@@ -662,13 +661,6 @@ async def screen_signal(actor, factory):
                      f"(по приоритету задач)" + (f"; рост рынка {growth * 100:+.0f} %." if growth is not None else "."))
             st.caption("Задача считается сохранённой, если у смежной роли есть похожая задача или все её области знаний. "
                        "Что добавить в программу — в рекомендации R7 на экране «Моя программа».")
-
-
-async def screen_map(factory):
-    st.header("Карта знаний между профессиями")
-    st.caption("Межпрофессиональные области знаний: вес области = Σ приоритета задач, которые её используют / Σ приоритета "
-               "подтверждённых задач профессии.")
-    knowledge_map(await latest_models(factory))
 
 
 def knowledge_map(models: dict[str, dict]) -> None:
@@ -854,14 +846,10 @@ async def screen_export(actor, factory):
                                    "text/markdown", width="stretch", key=f"jm-{program.id}")
 
 
-async def render(actor, settings, factory, users):
-    if requested := st.query_params.get("profession"):
-        st.session_state.update(profession_id=requested, head_screen="model")
-        del st.query_params["profession"]
-    st.sidebar.text(actor.display_name)
+async def render_management(actor, factory, users):
     screen = st.session_state.get("head_screen", "professions")
     for key, (label, icon) in SCREENS.items():
-        if st.sidebar.button(label, icon=icon, key=f"nav-{key}", width="stretch",
+        if st.sidebar.button(label, icon=icon, key=f"nav-management-{key}", width="stretch",
                              type="secondary" if key == screen else "tertiary"):
             st.session_state["head_screen"] = key
             st.rerun()
@@ -877,17 +865,7 @@ async def render(actor, settings, factory, users):
         await screen_program(actor, factory, users)
     elif screen == "signal":
         await screen_signal(actor, factory)
-    elif screen == "map":
-        await screen_map(factory)
     elif screen == "queue":
         await screen_queue(actor, factory)
     else:
         await screen_export(actor, factory)
-
-
-def main():
-    portal("Кабинет руководителя программы", {"program_head", "admin"}, render)
-
-
-if __name__ == "__main__":
-    main()

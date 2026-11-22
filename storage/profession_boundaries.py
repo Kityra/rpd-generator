@@ -101,7 +101,7 @@ async def sync_boundary_candidates(factory, course_id: str, profile: dict) -> li
 
 
 async def _owned(db, actor, course_id: str, boundary_id: int):
-    if actor.role not in {"teacher", "admin", "program_head"}:
+    if actor.role not in {"teacher", "admin"}:
         raise PermissionError("Доступно методисту курса.")
     course = await db.scalar(select(Course).where(Course.id == course_id, Course.owner_user_id == actor.id,
                              Course.status != "cancelled").with_for_update())

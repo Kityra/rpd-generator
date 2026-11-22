@@ -17,7 +17,7 @@ async def survey(actor, factory, extractor) -> None:
         rows = (await db.execute(select(ActivityExpert, Profession).join(Profession, Profession.id == ActivityExpert.profession_id)
                                  .where(ActivityExpert.user_id == actor.id).order_by(Profession.name))).all()
     if not rows:
-        st.info("Вас пока не пригласили оценить модель деятельности. Приглашение отправляет руководитель программы.")
+        st.info("Вас пока не пригласили оценить модель деятельности. Приглашение отправляет методист.")
         return
     names = {expert.id: profession.name for expert, profession in rows}
     if st.session_state.get("survey_expert") not in names:
@@ -28,7 +28,7 @@ async def survey(actor, factory, extractor) -> None:
     current = (profession.meta or {}).get("delphi_round", 1)
     round_number = 1 if 1 not in submitted else 2 if current == 2 and 2 not in submitted else None
     if round_number is None:
-        st.success("Спасибо! Ваши ответы сохранены. Если руководитель запустит следующий раунд, анкета появится здесь.")
+        st.success("Спасибо! Ваши ответы сохранены. Если методист запустит следующий раунд, анкета появится здесь.")
         return
     cards = await store.expert_cards(factory, expert.id, round_number)
     if not cards:

@@ -13,7 +13,7 @@ from auth.user_repository import CurrentUser
 
 
 ROLES = ("teacher", "expert", "program_head", "admin")
-# Старые имена ролей сохраняют прежние права и идентификаторы пользователей.
+# Старые значения нужны для вычисления прежних идентификаторов. CurrentUser объединяет права методистов.
 ROLE_NAMES = {"teacher": "teacher", "преподаватель": "teacher", "methodologist": "teacher", "методист курса": "teacher",
               "expert": "expert", "эксперт": "expert",
               "program_head": "program_head", "руководитель": "program_head", "руководитель программы": "program_head",

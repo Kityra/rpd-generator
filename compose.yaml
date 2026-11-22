@@ -1,8 +1,11 @@
 x-runtime: &runtime
   image: ${RPD_IMAGE:-rpd-generator:local}
+  pull_policy: never
   build: .
   env_file: ${RPD_ENV_FILE:-.env}
   environment:
+    APP_ENV: production
+    PUBLIC_ORIGIN: ${RPD_PUBLIC_ORIGIN:-http://localhost:${RPD_WEB_PORT:-8080}}
     APP_DATABASE_URL: postgresql://rpd:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/rpd
     CHECKPOINT_URL: ""
   volumes:
@@ -47,7 +50,7 @@ services:
       migrate:
         condition: service_completed_successfully
     ports:
-      - "127.0.0.1:${RPD_WEB_PORT:-8501}:8501"
+      - "${RPD_WEB_PORT:-8080}:8501"
     restart: unless-stopped
   worker:
     <<: *runtime

@@ -9,13 +9,13 @@ gatherUsageStats = false
 showErrorDetails = "none"
 
 [theme]
-primaryColor = "#3159A0"
+primaryColor = "#2F6FB1"
 backgroundColor = "#F7F8FA"
 secondaryBackgroundColor = "#EDF1F7"
 textColor = "#1B263B"
 font = "sans serif"
 
 [theme.sidebar]
-backgroundColor = "#A32949"
-secondaryBackgroundColor = "#81203C"
+backgroundColor = "#2F6FB1"
+secondaryBackgroundColor = "#2B659E"
 textColor = "#FFFFFF"
