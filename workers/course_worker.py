@@ -11,6 +11,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from auth.settings import Settings
+from domain.source_weights import course_source_weights
 from literature_parser import enrich_course_program, yandex_llm_expander
 from orchestration.checkpointer import open_checkpointer
 from orchestration.clients import YandexEvidenceClient, YandexModelClient, source_record
@@ -50,7 +51,12 @@ async def worker_lock(engine):
 async def execute(graph, factory, cmd):
     if cmd.kind in {"resume", "review"}:
         key = cmd.payload.get("interrupt_id") or cmd.payload["version_id"]
-        return await resume_graph(graph, cmd.course_id, key, cmd.payload)
+        payload = cmd.payload
+        if cmd.kind == "resume":
+            async with factory() as db:
+                course = await db.get(Course, cmd.course_id)
+                payload = {**payload, "source_weights": course_source_weights(course.course_meta).model_dump()}
+        return await resume_graph(graph, cmd.course_id, key, payload)
     config = {"configurable": {"thread_id": cmd.course_id}, "recursion_limit": 100}
     snapshot = await graph.aget_state(config)
     if snapshot.values.get("run_id") == cmd.id:

@@ -203,6 +203,8 @@ class SqlWorkflowStore:
                     CourseVersion.course_id == course_id)) or 0) + 1
                 content = {"program": program.model_dump(mode="json"), "activity": activity, "evidence_gaps": evidence_gaps,
                            "lifespan_assessment": lifespan_assessment}
+                if "source_weights" in course.course_meta:
+                    content["source_weights"] = course.course_meta["source_weights"]
                 if lifespan_market_sample:
                     content["lifespan_market_sample"] = lifespan_market_sample
                 if lifespan_note:

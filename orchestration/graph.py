@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Annotated, Any, Protocol, TypedDict
@@ -9,6 +10,7 @@ from uuid import NAMESPACE_URL, uuid5
 from langgraph.graph import END, START, StateGraph
 from langgraph.errors import GraphBubbleUp
 from langgraph.types import interrupt
+from openai import OpenAIError
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -17,6 +19,7 @@ from domain.schemas import (AppliedActivityModel, BusinessCourseAudit, CoursePro
                             Grounded, INDEPENDENT_EXPERT_SOURCE_TYPES, InterviewTurn, Model, RelevanceDecision, SourceRecord, SubjectPlan,
                             TopicAssignments, VerificationReport, all_blocks, block_value)
 from domain.skill_mapper import skill_mapper
+from domain.source_weights import SourceWeights, course_source_weights
 from orchestration.call_log import (CALL_SCOPE, GENERATION_NOTES, CallScope, RecordingModelClient, classify_outcome,
                                     failure_note)
 from orchestration.clients import EvidenceClient, ModelClient, NoActivityEvidence, source_record
@@ -41,8 +44,10 @@ from orchestration.rabota_business import SOURCE, SOURCE_GUIDANCE
 from orchestration.relevance_filter import gap_query, search_query
 from orchestration.semantic_check import composition_report, limit_fundamental, weighted_coverage
 from orchestration.resilience import ExternalUnavailable
+from orchestration.source_conflicts import resolve_source_conflicts
 from orchestration.subject_rationale import explain_subjects
 from orchestration.vacancy_search import VACANCY_SOURCE_TYPES
+from orchestration.weighted_revision import SubjectWeightRevision, apply_subject_revision
 from activity.rpd_bridge import activity_from_snapshot
 from run_rpd import YandexModeratedResponse
 
@@ -96,6 +101,8 @@ class GraphState(TypedDict, total=False):
     course_meta: dict
     run_id: str
     mode: str
+    source_conflicts: list[dict]
+    interview_weights_changed: bool
     manual_subjects: list[str]
     known_tasks: list[str]
     auto_subjects: dict
@@ -220,8 +227,15 @@ def planned_subjects(state: GraphState) -> list[dict]:
     return [*known, *suggested[:AUTO_DRAFT_SUBJECT_LIMIT]]
 
 
+def saved_subject_plan(state: GraphState) -> dict:
+    return {"subjects": [{"name": row["title"], "is_fundamental": row["is_fundamental"],
+                          "conflict_with": row["conflict_with"], "source_ids": row["source_ids"]}
+                         for row in state["revision_baseline"]["subjects"]]}
+
+
 def context(state: GraphState) -> dict:
     result: dict = {"sources": registry(state), "manual_subjects": state.get("manual_subjects", []),
+                    "source_weights": course_source_weights(state.get("course_meta", {})),
                     # Задачи из модели профессии проверены экспертами, но без артефактов и критериев качества.
                     "allow_incomplete_activity": bool(state.get("gap_report", {}).get("gap_types"))
                     or (bool(state.get("profession_profile")) and not state.get("applied_activity"))
@@ -246,7 +260,8 @@ def payload(state: GraphState) -> dict:
                 "lifespan_support_records"}
     excluded.update({"profession_profile", "profession_rag", "profession_market", "profession_market_sample", "profession_boundaries", "skill_mappings",
                      "profession_turns", "raw_activity", "acknowledged_profession_claims",
-                     "interview_max_turns", "interview_continue", "interview_redirect", "interview_handoff"})
+                     "interview_max_turns", "interview_continue", "interview_redirect", "interview_handoff",
+                     "interview_weights_changed", "source_conflicts"})
     result = {key: value for key, value in state.items() if key not in excluded}
     if "course_meta" in result:
         result["course_meta"] = {key: value for key, value in result["course_meta"].items() if key != "workload"}
@@ -266,6 +281,12 @@ def payload(state: GraphState) -> dict:
             result.pop(f"{role}_report", None)
         result["profession_basis"] = profession_basis(state)
         result["sources"] = synthesis_sources(state)
+    weights = course_source_weights(state.get("course_meta", {}))
+    if weights.customized:
+        result["source_weights"] = weights.model_dump()
+        result["sources"] = prioritize_source_rows(result.get("sources", []), weights)
+        if conflicts := state.get("source_conflicts"):
+            result["source_conflicts"] = conflicts
     if scope := negative_scope(state.get("profession_boundaries", [])):
         result["adjacent_profession_exclusions"] = scope
     baseline = context(state).get("baseline")
@@ -274,12 +295,29 @@ def payload(state: GraphState) -> dict:
     return result
 
 
+def prioritize_source_rows(rows: list[dict], weights: SourceWeights) -> list[dict]:
+    enriched = [{**row, "source_weight": weights.for_type(row["source_type"], row.get("content", ""))} for row in rows]
+    return sorted(enriched, key=lambda row: row["source_weight"], reverse=True)
+
+
 def profession_basis(state: GraphState) -> list[dict]:
     acknowledged = set(state.get("acknowledged_profession_claims", []))
-    return [{key: claim[key] for key in ("category", "statement", "verification_status")}
-            for claim in state.get("profession_profile", {}).get("claims", [])
-            if claim["verification_status"] == "verified" or
-            (claim["verification_status"] == "needs_review" and claim["claim_id"] in acknowledged)]
+    weights = course_source_weights(state.get("course_meta", {}))
+    claims = []
+    source_types = {row["source_id"]: row["source_type"] for row in state.get("sources", [])} if weights.customized else {}
+    for claim in state.get("profession_profile", {}).get("claims", []):
+        status = claim["verification_status"]
+        if status != "verified" and not (status == "needs_review" and claim["claim_id"] in acknowledged):
+            continue
+        item = {key: claim[key] for key in ("category", "statement", "verification_status")}
+        if weights.customized:
+            priorities = [weights.for_type("expert" if ref["source_type"] == "expert_interview" else
+                                           source_types.get(ref["source_id"], "HH" if ref["source_type"] == "market_cluster" else ""))
+                          for ref in claim["evidence"] if ref["judge_verdict"] == "supports" or
+                          ref.get("expert_status") in {"confirmed_by_expert", "edited_by_expert"}]
+            item["source_weight"] = max(priorities, default=1.0)
+        claims.append(item)
+    return sorted(claims, key=lambda claim: claim.get("source_weight", 1), reverse=True)
 
 
 def synthesis_sources(state: GraphState) -> list[dict]:
@@ -287,12 +325,15 @@ def synthesis_sources(state: GraphState) -> list[dict]:
     if not state.get("profession_profile"):
         return sources
     excerpts: dict[str, list[str]] = {}
+    expert_quotes = set()
     for claim in state["profession_profile"]["claims"]:
         if claim["verification_status"] != "verified":
             continue
         for ref in claim["evidence"]:
             if ref["source_type"] == "rag_chunk" and ref["judge_verdict"] == "supports":
                 excerpts.setdefault(ref["source_id"], []).append(ref["quote_or_metric"])
+            if ref["source_type"] == "expert_interview" and ref.get("expert_status") in {"confirmed_by_expert", "edited_by_expert"}:
+                expert_quotes.add(normalized(ref["quote_or_metric"]))
     selected = []
     activity_ids = set(state.get("applied_activity", {}).get("source_ids", []))
     for source in sources:
@@ -301,7 +342,7 @@ def synthesis_sources(state: GraphState) -> list[dict]:
             selected.append(source)
         elif fragments := excerpts.get(source_id):
             selected.append({**source, "content": "\n".join(dict.fromkeys(fragments))})
-        elif source["source_type"] == "expert" and source_id in activity_ids:
+        elif source["source_type"] == "expert" and (source_id in activity_ids or normalized(source["content"]) in expert_quotes):
             selected.append(source)
     return selected
 
@@ -334,25 +375,44 @@ def subject_request(state: GraphState, names: list[str], suggestions: list[dict]
     from orchestration.semantic_check import concepts
     sources = ({row["source_id"]: SourceRecord.model_validate(row) for row in synthesis_sources(state)}
                if state.get("profession_profile") else ctx["sources"])
+    weights = ctx.get("source_weights") or course_source_weights(state.get("course_meta", {}))
     keys = {" ".join(name.casefold().split()) for name in names}
     plan = [item for item in suggestions if " ".join(item["name"].casefold().split()) in keys]
     terms = concepts(" ".join(names))
     tasks = state.get("applied_activity", {}).get("tasks", [])
-    ranked = sorted(tasks, key=lambda task: -len(terms & concepts(" ".join([task["title"], *task.get("stack", [])]))))
+    ranked = sorted(tasks, key=lambda task: weights.for_references(task.get("source_ids", []), sources)
+                    * len(terms & concepts(" ".join([task["title"], *task.get("stack", [])]))), reverse=True)
     chosen = [task for task in ranked if terms & concepts(" ".join([task["title"], *task.get("stack", [])]))]
     chosen = (chosen or ranked[:3])[:SUBJECT_TASK_LIMIT]
     judge_unavailable = state.get("profession_profile", {}).get("judge_unavailable", False)
     scope = negative_scope(state.get("profession_boundaries", []))
-    hint = outline_hint(state["course_meta"]["title"], names[0], suggestions, ctx) if len(names) == 1 and not judge_unavailable and not scope else None
+    hint = (outline_hint(state["course_meta"]["title"], names[0], suggestions, ctx)
+            if len(names) == 1 and not judge_unavailable and not scope and not ctx.get("revision_blocks") else None)
     cited = [key for item in plan for key in item.get("source_ids", [])]
     cited += [key for task in chosen for key in task.get("source_ids", [])]
     cited += hint["source_ids"] if hint else []
+    cited += [key for block in ctx.get("revision_blocks", {}).values() for key in block.source_ids]
     if ctx.get("manual_subject_source_id"):
         cited.append(ctx["manual_subject_source_id"])
     others = sorted((source for key, source in sources.items() if source.source_type != "Interview"),
                     key=lambda source: -len(terms & concepts(f"{source.title} {source.content[:2000]}")))
     selected = list(dict.fromkeys([key for key in cited if key in sources and sources[key].source_type != "Interview"]
-                                  + [source.source_id for source in others]))[:SUBJECT_SOURCE_LIMIT]
+                                  + [source.source_id for source in others]))
+    if weights.customized:
+        cited_ids = set(cited)
+        selected.sort(key=lambda key: weights.for_source(sources[key]) * (
+            1 + len(terms & concepts(f"{sources[key].title} {sources[key].content[:2000]}")) + 2 * (key in cited_ids)),
+                      reverse=True)
+    selected = selected[:SUBJECT_SOURCE_LIMIT]
+    conflicts = state.get("source_conflicts", [])
+    if conflicts:
+        for conflict in conflicts:
+            preferred = conflict["preferred_source_id"]
+            if not preferred or preferred not in sources or preferred in selected:
+                continue
+            losing = conflict["right_source_id"] if preferred == conflict["left_source_id"] else conflict["left_source_id"]
+            if losing in selected:
+                selected[selected.index(losing)] = preferred
     request = {
         "course": {key: state["course_meta"].get(key) for key in ("title", "profession") if state["course_meta"].get(key)},
         "batch_subjects": names, "subject_plan": plan,
@@ -363,6 +423,15 @@ def subject_request(state: GraphState, names: list[str], suggestions: list[dict]
         "sources": [{**sources[key].model_dump(mode="json", exclude={"raw_hash", "relevance_score"}),
                      "content": sources[key].content[:SUBJECT_SOURCE_CHARS]} for key in selected],
     }
+    if weights.customized:
+        request["source_weights"] = weights.model_dump()
+        for row in request["sources"]:
+            row["source_weight"] = weights.for_source(sources[row["source_id"]])
+        if conflicts:
+            relevant = [row for row in conflicts if (row["left_source_id"] in selected or row["right_source_id"] in selected)
+                        and (not row["preferred_source_id"] or row["preferred_source_id"] in selected)]
+            if relevant:
+                request["source_conflicts"] = relevant
     if hint:
         request["outline_hint"] = hint
     if scope:
@@ -389,6 +458,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         return {"status": "agents_running", "interview_round": 0, "review_iteration": 0,
                 "course_meta": {key: value for key, value in state["course_meta"].items() if key != "workload"},
                 "interview_answers": [], "review_feedback": [], "revision_baseline": None,
+                "source_conflicts": [], "interview_weights_changed": False,
                 "refresh_only": False,
                 "interview_source_notices": [], "factcheck_source_notices": [], "draft_source_notices": [],
                 "literature_source_notices": [], "composition_notices": [], "lifespan_assessment": None, "lifespan_note": None,
@@ -465,6 +535,10 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         if sources and not raw:
             activity_input = {"course": state["course_meta"], "business": state["business_report"],
                               "science": state["science_report"], "sources": [s.model_dump(mode="json") for s in sources.values()]}
+            weights = course_source_weights(state["course_meta"])
+            if weights.customized:
+                activity_input["source_weights"] = weights.model_dump()
+                activity_input["sources"] = prioritize_source_rows(activity_input["sources"], weights)
             try:
                 instructions = prompts.ACTIVITY
                 if any(source.source_type == SOURCE for source in sources.values()):
@@ -510,18 +584,22 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         return state.get("profession_boundaries", [])
 
     async def university_audit(state: GraphState) -> dict:
-        if not state["applied_activity"] and not synthesis_sources(state):
-            return {"auto_subjects": {"subjects": []}}
+        sources = synthesis_sources(state)
+        conflicts = await resolve_source_conflicts(sources, course_source_weights(state["course_meta"]), llm)
+        if state.get("status") == "applying_source_weights" and state.get("revision_baseline"):
+            return {"auto_subjects": saved_subject_plan(state), "source_conflicts": conflicts}
+        if not state["applied_activity"] and not sources:
+            return {"auto_subjects": {"subjects": []}, "source_conflicts": []}
         if state.get("activity_origin") == PROFESSION_MODEL and state.get("applied_activity"):
             # Состав дисциплин решает руководитель программы: курс — это одна закреплённая дисциплина.
             ids = state["applied_activity"]["source_ids"]
-            return {"auto_subjects": {"subjects": [
+            return {"source_conflicts": conflicts, "auto_subjects": {"subjects": [
                 {"name": name, "is_fundamental": False, "conflict_with": None,
                  "source_ids": ids} for name in state.get("manual_subjects", [])]}}
-        result = await llm.generate(SubjectPlan, prompts.UNIVERSITY, payload(state), context(state))
+        result = await llm.generate(SubjectPlan, prompts.UNIVERSITY, payload({**state, "source_conflicts": conflicts}), context(state))
         # Флаг ядра: только с источником RPD/Books и в пределах доли из config/analysis.yaml.
         subjects, notes = limit_fundamental(result.model_dump(mode="json")["subjects"], registry(state))
-        return {"auto_subjects": {"subjects": subjects}, "composition_notices": notes}
+        return {"auto_subjects": {"subjects": subjects}, "composition_notices": notes, "source_conflicts": conflicts}
 
     async def gap_analysis(state: GraphState) -> dict:
         await store.set_status(state["request_id"], "gap_analysis", state["owner_user_id"])
@@ -692,10 +770,15 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                             "prompt": state["gap_report"]["prompt"], "kind": "expert"})
         if not isinstance(answer, dict) or answer.get("interrupt_id") != state["interrupt_id"]:
             raise ValueError("Ответ не соответствует текущему интервью.")
+        new_meta = {"interview_weights_changed": False}
+        if "source_weights" in answer:
+            weights = SourceWeights.model_validate(answer["source_weights"])
+            new_meta = {"course_meta": {**state["course_meta"], "source_weights": weights.model_dump()},
+                        "interview_weights_changed": weights != course_source_weights(state["course_meta"])}
         if answer.get("action") == "finish_without_answer":
             if answer.get("actor_user_id") != state["owner_user_id"]:
                 raise PermissionError("Завершение интервью доступно владельцу курса.")
-            update = {"closed_interview_id": state["interrupt_id"], "interview_continue": False}
+            update = {**new_meta, "closed_interview_id": state["interrupt_id"], "interview_continue": False}
             if not state.get("profession_profile"):
                 return update
             profile = ProfessionProfile.model_validate(state["profession_profile"])
@@ -722,7 +805,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             raise PermissionError("Оставшиеся поля переданы методисту.")
         if not answer.get("content") and not state.get("profession_profile"):
             raise ValueError("Ответ эксперта пуст.")
-        return {"interview_answers": [*state.get("interview_answers", []), answer],
+        return {**new_meta, "interview_answers": [*state.get("interview_answers", []),
+                                                  {key: value for key, value in answer.items() if key != "source_weights"}],
                 "interview_round": state.get("interview_round", 0) + 1,
                 "interview_continue": bool(answer.get("continue_interview"))}
 
@@ -839,6 +923,11 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         await store.set_status(state["request_id"], "designing", state["owner_user_id"])
         boundaries = await current_boundaries(state)
         state = {**state, "profession_boundaries": boundaries}
+        if state.get("status") == "applying_source_weights" and state.get("revision_baseline"):
+            # Older checkpoints can contain a fresh subject plan from before this node was split.
+            state["auto_subjects"] = saved_subject_plan(state)
+            return {**await revise_source_priorities(state), "auto_subjects": state["auto_subjects"],
+                    "profession_boundaries": boundaries}
         suggestions = planned_subjects(state)
         manual = {" ".join(name.casefold().split()): name for name in state.get("manual_subjects", [])}
         automatic = {" ".join(item["name"].casefold().split()): item["name"] for item in suggestions}
@@ -853,6 +942,39 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
         marked = mark_model_generated(program.model_dump(mode="json"), "; ".join(notes) or None)
         return {"course_program": marked, "status": "designing",
                 "profession_boundaries": boundaries}
+
+    async def revise_source_priorities(state: GraphState) -> dict:
+        ctx = context(state)
+        baseline = ctx["baseline"]
+        slots = asyncio.Semaphore(settings.draft_concurrency)
+
+        async def revise(subject):
+            blocks = all_blocks([subject])
+            scoped = {**ctx, "revision_blocks": blocks}
+            request, scoped["allowed_source_ids"] = subject_request(
+                state, [subject.title], state["auto_subjects"]["subjects"], scoped)
+            request["existing_blocks"] = [
+                block.model_dump(mode="json", include={"id", "title", "locked", "instructions", "expected_artifacts",
+                                                       "quality_criteria", "justification", "activity_task_ids"})
+                for block in blocks.values()]
+            CALL_SCOPE.set(replace(CALL_SCOPE.get(), subject=subject.title, subject_id=subject.id))
+            try:
+                async with slots:
+                    revision = await llm.generate(SubjectWeightRevision, prompts.REVISE_SOURCE_WEIGHTS, request, scoped)
+                return apply_subject_revision(subject, revision.edits), None
+            except (RuntimeError, OpenAIError, TimeoutError, ValidationError) as error:
+                notice = f"«{subject.title}»: сохранена предыдущая редакция дисциплины. {failure_note(error)}"
+                return apply_subject_revision(subject, []), notice
+
+        parts = await asyncio.gather(*(revise(subject) for subject in baseline.subjects))
+        program = CourseProgramModel.model_validate(
+            {"title": baseline.title, "subjects": [part for part, _ in parts], "business_audit": None,
+             "source_ids": baseline.source_ids}, context=ctx)
+        content = program.model_dump(mode="json")
+        cited = (key for block in all_blocks(program.subjects).values() for key in block.source_ids)
+        content["source_ids"] = list(dict.fromkeys([*baseline.source_ids, *cited]))
+        return {"course_program": content, "status": "applying_source_weights",
+                "draft_source_notices": [notice for _, notice in parts if notice]}
 
     async def design_batched(state: GraphState, names: list[tuple[str, str]], suggestions: list[dict],
                              manual: dict[str, str]) -> dict:
@@ -955,7 +1077,12 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def business_audit(state: GraphState) -> dict:
         audit_input = payload(state)
-        batched = state["gap_report"]["gap_types"] and len(state["course_program"]["subjects"]) > AUDIT_COMPACT_SUBJECTS
+        reweighted = state.get("status") == "applying_source_weights" and bool(state.get("revision_baseline"))
+        if reweighted:
+            for key in ("baseline", "revision_baseline", "previous_values"):
+                audit_input.pop(key, None)
+        batched = reweighted or (state["gap_report"]["gap_types"]
+                                 and len(state["course_program"]["subjects"]) > AUDIT_COMPACT_SUBJECTS)
         # Аудиту нужны названия дисциплин и тем: полная программа не помещается в контекст модели.
         program = state["course_program"]
         audit_input["course_program"] = {"title": program["title"], "subjects": [
@@ -967,7 +1094,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             notices = [*state.get("draft_source_notices", []), "Рыночная оценка пока недоступна."]
             return {"draft_source_notices": list(dict.fromkeys(notices))}
         updated = {**state["course_program"], "business_audit": audit.model_dump(mode="json")}
-        if audit.suggested_changes and not batched:
+        if audit.suggested_changes and not batched and course_source_weights(state["course_meta"]).business > 0:
             try:
                 program = await llm.generate(CourseProgramModel, prompts.DESIGN,
                                              {**payload(state), "business_enrichment": audit.model_dump(mode="json")},
@@ -985,7 +1112,7 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
 
     async def subject_rationale(state: GraphState) -> dict:
         program, records = await explain_subjects(state["course_program"], registry(state), evidence, llm,
-                                                  state["owner_user_id"])
+                                                  state["owner_user_id"], weights=course_source_weights(state["course_meta"]))
         additions = [record.model_dump(mode="json") for record in records]
         combined = merge_records(state.get("sources", []), additions)
         checked = CourseProgramModel.model_validate(program, context=context({**state, "sources": combined}))
@@ -1010,6 +1137,19 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             notices.append(f"Для {missing} из {len(results)} тем поиск не добавил проверенный учебник или статью.")
         return {"course_program": checked.model_dump(mode="json"), "sources": additions,
                 "literature_source_notices": notices}
+
+    async def apply_source_weights(state: GraphState) -> dict:
+        await store.set_status(state["request_id"], "applying_source_weights", state["owner_user_id"])
+        weights = course_source_weights(state["course_meta"])
+        if not weights.customized:
+            return {"status": "applying_source_weights"}
+        sources = registry(state)
+        program = deepcopy(state["course_program"])
+        for subject in program["subjects"]:
+            blocks = [subject, *subject["topics"], *(item for topic in subject["topics"] for item in topic["assignments"])]
+            for block in blocks:
+                block["learning_references"].sort(key=lambda ref: weights.for_source(sources[ref["source_id"]]), reverse=True)
+        return {"course_program": program, "status": "applying_source_weights"}
 
     async def assess_lifespan(state: GraphState) -> dict:
         today = datetime.now(timezone.utc).date()
@@ -1095,6 +1235,12 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
             return {"consumed_review_id": state["version_id"], "refresh_only": True,
                     "review_iteration": state.get("review_iteration", 0) + 1,
                     "revision_baseline": state["course_program"], "status": "collecting_literature"}
+        if action == "reweight":
+            weights = SourceWeights.model_validate(decision["source_weights"])
+            return {"consumed_review_id": state["version_id"], "refresh_only": False,
+                    "course_meta": {**state["course_meta"], "source_weights": weights.model_dump()},
+                    "review_iteration": state.get("review_iteration", 0) + 1,
+                    "revision_baseline": state["course_program"], "status": "applying_source_weights"}
         if action != "revise" or not decision.get("content"):
             raise ValueError("Укажите правку или решение ревью.")
         url = f"{settings.public_origin}/teacher?course={state['request_id']}&version={state['version_id']}"
@@ -1128,7 +1274,8 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
     nodes = {"relevance": relevance, "formalize": formalize, "university_audit": university_audit,
              "gap_analysis": gap_analysis, "prepare_interview": prepare_interview, "interview": interview,
              "factcheck": factcheck, "design": design, "business_audit": business_audit,
-             "subject_rationale": subject_rationale, "lifespan_assessment": assess_lifespan,
+             "subject_rationale": subject_rationale, "apply_source_weights": apply_source_weights,
+             "reweight_plan": university_audit, "lifespan_assessment": assess_lifespan,
              "persist_review": persist_review, "review": review}
     for name, node in nodes.items():
         graph.add_node(name, guarded(name, node))
@@ -1148,28 +1295,37 @@ def build_course_graph(settings: Settings, llm: ModelClient, evidence: EvidenceC
                                  < state.get("interview_max_turns", 0))) else "design")
     graph.add_conditional_edges("prepare_interview", lambda state: "interview"
                                 if state["status"] == "waiting_for_expert" else "design")
-    graph.add_conditional_edges("interview", lambda state: (
-        "university_audit" if state.get("acknowledged_profession_claims") else "design")
-        if state.get("closed_interview_id") == state["interrupt_id"] else "factcheck")
+    def after_interview(state):
+        if state.get("closed_interview_id") != state["interrupt_id"]:
+            return "factcheck"
+        if state.get("interview_weights_changed"):
+            return "reweight_plan"
+        return "university_audit" if state.get("acknowledged_profession_claims") else "design"
+
+    graph.add_conditional_edges("interview", after_interview)
     def after_factcheck(state):
         if not state.get("profession_profile"):
             return "formalize"
         if state.get("interview_redirect") or state.get("interview_handoff"):
             return "prepare_interview"
         if state["interview_round"] in state["profession_profile"].get("rejected_noise_turns", []):
-            return "design"
+            return "reweight_plan" if state.get("interview_weights_changed") else "design"
         return "university_audit"
 
     graph.add_conditional_edges("factcheck", after_factcheck)
     graph.add_edge("design", "business_audit")
     graph.add_edge("business_audit", "subject_rationale")
     graph.add_edge("subject_rationale", "literature")
-    graph.add_edge("literature", "lifespan_assessment")
+    graph.add_edge("literature", "apply_source_weights")
+    graph.add_edge("apply_source_weights", "lifespan_assessment")
+    graph.add_edge("reweight_plan", "design")
     graph.add_edge("lifespan_assessment", "persist_review")
     graph.add_edge("persist_review", "review")
     def after_review(state):
         if state["status"] == "approved":
             return END
+        if state["status"] == "applying_source_weights":
+            return "reweight_plan"
         return "subject_rationale" if state.get("refresh_only") else "design"
 
     graph.add_conditional_edges("review", after_review)

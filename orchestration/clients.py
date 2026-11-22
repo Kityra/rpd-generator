@@ -16,6 +16,7 @@ from orchestration.call_log import CALL_STATS, GENERATION_NOTES
 from orchestration.evidence_cache import source_record
 from orchestration.llm_judge import JudgeVerdicts
 from orchestration.relevance_filter import DEFAULT_MIN_SCORE, dropped_notice, filter_fragments
+from orchestration.weighted_revision import SubjectWeightRevision
 from orchestration.resilience import ExternalUnavailable, snapshot_notice
 from orchestration.yandex_calls import InvalidIndexResponse, model_response, search_fragments
 from run_rpd import ScientificSearch, collect_recent_articles, open_yandex, require_response_text
@@ -110,7 +111,7 @@ def _env(settings: dict[str, str], name: str, default: str) -> str:
 @dataclass(frozen=True)
 class GenerationOptions:
     temperature: float = 0.2
-    draft_max_output_tokens: int = 12000
+    draft_max_output_tokens: int = 9000
     stream_long_responses: bool = True
 
     @classmethod
@@ -118,7 +119,7 @@ class GenerationOptions:
         temperature = float(_env(settings, "YANDEX_TEMPERATURE", "0.2"))
         if not 0 <= temperature <= 1:
             raise ValueError("YANDEX_TEMPERATURE должна быть в диапазоне 0–1.")
-        tokens = int(_env(settings, "YANDEX_DRAFT_MAX_OUTPUT_TOKENS", "12000"))
+        tokens = int(_env(settings, "YANDEX_DRAFT_MAX_OUTPUT_TOKENS", str(cls.draft_max_output_tokens)))
         stream = _env(settings, "YANDEX_STREAM_LONG_RESPONSES", "1").casefold() not in {"0", "false", "no"}
         return cls(temperature, max(1024, tokens), stream)
 
@@ -141,7 +142,8 @@ def estimate_tokens(*texts: str) -> int:
 
 def _compact_program(program: dict) -> dict:
     return {"title": program.get("title"), "subjects": [
-        {"title": subject.get("title"), "topics": [topic.get("title") for topic in subject.get("topics", [])]}
+        {"title": subject.get("title"), "topics": [topic if isinstance(topic, str) else topic.get("title")
+                                                 for topic in subject.get("topics", [])]}
         for subject in program.get("subjects", [])]}
 
 
@@ -294,7 +296,7 @@ class YandexModelClient:
             return self.settings["YANDEX_MODEL_URI_BUSINESS"]
         if flash:
             return self.settings.get("YANDEX_MODEL_URI_FLASH") or f"gpt://{self.settings['YANDEX_FOLDER_ID']}/aliceai-llm-flash"
-        if output in (CourseProgramModel, SubjectPlan):
+        if output in (CourseProgramModel, SubjectPlan, SubjectWeightRevision):
             return self.settings.get("YANDEX_MODEL_URI_COURSE_DESIGN") or self.settings["YANDEX_MODEL_URI"]
         return self.settings["YANDEX_MODEL_URI"]
 
@@ -313,7 +315,8 @@ class YandexModelClient:
         temperature = options.temperature if temperature is None else temperature
         request = payload
         draft = "batch_subjects" in payload
-        max_tokens = options.draft_max_output_tokens if draft else (8192 if flash else 16384)
+        max_tokens = (options.draft_max_output_tokens if draft or output is CourseProgramModel
+                      else (8192 if flash else 16384))
         stream = options.stream_long_responses and draft
         stats = CALL_STATS.get()
         if stats is not None:

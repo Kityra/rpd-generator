@@ -1,5 +1,6 @@
 import os
 import hashlib
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -34,7 +35,11 @@ class PortalUITests(unittest.TestCase):
         waiting = progress_html("waiting_for_expert")
         self.assertIn("Ждёт интервью эксперта", waiting)
         self.assertIn('aria-current="step"><span class="portal-step-line" aria-hidden="true"></span><span>Модель деятельности', waiting)
-        self.assertEqual(progress_html("approved").count("portal-step--complete"), 6)
+        self.assertEqual(progress_html("approved").count("portal-step--complete"), 7)
+        weight_step = progress_html("applying_source_weights", weights_link=True)
+        self.assertIn('<a href="#course-source-weights">Настройка весов</a>', weight_step)
+        self.assertLess(weight_step.index("Материалы"), weight_step.index("Настройка весов"))
+        self.assertLess(weight_step.index("Настройка весов"), weight_step.index("Проверка"))
         failed = progress_html("failed")
         self.assertNotIn('aria-current="step"', failed)
         self.assertNotIn("portal-step--complete", failed)
@@ -112,6 +117,12 @@ class PortalUITests(unittest.TestCase):
                 expert.text_input[1].set_value("fixture")
                 expert.button[0].click().run()
                 self.assertFalse(expert.exception)
+                business = next(slider for slider in expert.slider if slider.label == "Business · рынок труда")
+                self.assertEqual((business.min, business.max, business.value), (0.0, 1.0, 1.0))
+                business.set_value(0.25)
+                next(b for b in expert.button if b.label == "Сохранить веса").click().run()
+                self.assertFalse(expert.exception)
+                self.assertEqual(next(slider for slider in expert.slider if slider.label == business.label).value, 0.25)
                 expert.chat_input[0].set_value("Сверяю результаты запросов.").run()
                 next(b for b in expert.button if b.label.startswith("Завершить интервью")).click().run()
                 self.assertFalse(expert.exception)
@@ -119,6 +130,8 @@ class PortalUITests(unittest.TestCase):
             with closing(sqlite3.connect(path)) as conn:
                 self.assertEqual(conn.execute("select count(*) from workflow_commands").fetchone()[0], 3)
                 self.assertEqual(conn.execute("select status from interviews where id = 'i-own'").fetchone(), ("closed",))
+                meta = json.loads(conn.execute("select course_meta from courses where id = 'other'").fetchone()[0])
+                self.assertEqual(meta["source_weights"]["business"], 0.25)
 
     def test_course_page_with_legacy_draft_and_approved_version_renders(self):
         from test_course_architecture import program, records

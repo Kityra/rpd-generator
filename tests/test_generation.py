@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from auth.settings import Settings
 from domain.schemas import CourseProgramModel, SourceRecord
+from domain.source_weights import SourceWeights
 from orchestration import yandex_calls
 from orchestration.call_log import GENERATION_NOTES
 from orchestration.checkpointer import open_checkpointer
@@ -24,7 +25,7 @@ from orchestration.graph import build_course_graph
 from orchestration.resilience import ExternalUnavailable, Resilience
 from storage.database import make_engine
 from storage.models import Base, Course, CourseVersion, Interview, ModelCall
-from storage.portal import create_course, finish_without_answer
+from storage.portal import create_course, finish_without_answer, save_source_weights
 from storage.workflow import SqlWorkflowStore
 from test_course_architecture import program, records
 from test_model_calls import batch_program, timeout_error
@@ -121,6 +122,22 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(arguments["stream"])
         self.assertEqual(model.describe()["temperature"], 0.1)
 
+    async def test_default_output_limit_for_course_design_is_9000(self):
+        from orchestration.weighted_revision import SubjectWeightRevision
+        settings = {**self.settings, "YANDEX_STREAM_LONG_RESPONSES": "0"}
+        settings.pop("YANDEX_DRAFT_MAX_OUTPUT_TOKENS")
+        model = YandexModelClient(settings)
+        for output, payload, response in (
+            (CourseProgramModel, {}, program()),
+            (CourseProgramModel, {"batch_subjects": ["Базы данных"]}, program()),
+            (SubjectWeightRevision, {"batch_subjects": ["Базы данных"]}, {"edits": []}),
+        ):
+            self.client.responses.create.return_value = reply(json.dumps(response, ensure_ascii=False))
+            with patch.dict("os.environ", {"YANDEX_DRAFT_MAX_OUTPUT_TOKENS": ""}), \
+                 patch("orchestration.clients.open_yandex", return_value=nullcontext(self.client)):
+                await model.generate(output, "prompt", payload, {"sources": records(), "revision_blocks": {}})
+            self.assertEqual(self.client.responses.create.call_args.kwargs["max_output_tokens"], 9000)
+
     async def test_failed_quote_drops_reference_and_keeps_discipline(self):
         value = program()
         topic = value["subjects"][0]["topics"][0]
@@ -193,10 +210,10 @@ class DesignBatchedTests(unittest.IsolatedAsyncioTestCase):
     async def sleep(self, seconds):
         self.delays.append(seconds)
 
-    async def run_draft(self, design):
+    async def run_draft(self, design, subject_count=3):
         model = Model(gap=True)
         original = model.generate
-        names = [f"Дисциплина {i}" for i in range(3)]
+        names = [f"Дисциплина {i}" for i in range(subject_count)]
 
         async def generate(output, prompt, payload, context, flash=False, **options):
             if output.__name__ == "SubjectPlan":
@@ -241,6 +258,55 @@ class DesignBatchedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(subjects["Дисциплина 2"]["generated_by"], "outline")
         self.assertIn("circuit_open", subjects["Дисциплина 2"]["generation_note"])
         self.assertEqual(sorted(self.delays), sorted([30, 120] + [30, 120, 300]))
+
+    async def test_reweight_twelve_subjects_one_truncated_reply_preserves_the_saved_discipline(self):
+        async def first_draft(output, payload, context):
+            return output.model_validate(batch_program(payload["batch_subjects"]), context=context)
+
+        initial = await self.run_draft(first_draft, subject_count=12)
+        calls = []
+        model = Model(gap=True)
+        original = model.generate
+
+        async def generate(output, prompt, payload, context, **kwargs):
+            if output.__name__ == "SubjectWeightRevision":
+                name, = payload["batch_subjects"]
+                calls.append(name)
+                self.assertNotIn("course_program", payload)
+                self.assertEqual(len(payload["existing_blocks"]), 3)
+                if name == "Дисциплина 0":
+                    raise RuntimeError("incomplete, max_output_tokens")
+                assignment = initial[name]["topics"][0]["assignments"][0]
+                edit = {"block_id": assignment["id"], "instructions": "Выполните запрос в PostgreSQL.",
+                        "justification": assignment["justification"]}
+                return output.model_validate({"edits": [edit]}, context=context)
+            self.assertNotIn(output.__name__, {"CourseProgramModel", "SubjectPlan"})
+            return await original(output, prompt, payload, context, **kwargs)
+
+        model.generate = generate
+        weights = SourceWeights(interview=0, business=.55, university=.4)
+        await save_source_weights(self.factory, self.teacher, "course", weights, previous=SourceWeights())
+        async with open_checkpointer(self.checkpoint) as saver:
+            graph = build_course_graph(self.settings, model, self.evidence, self.store, saver, sleep=self.sleep)
+            self.assertTrue(await process_next(self.engine, self.factory, graph))
+        async with self.factory() as db:
+            course = await db.get(Course, "course")
+            version = await db.get(CourseVersion, course.draft_version_id)
+        self.assertEqual(course.status, "waiting_for_review")
+        self.assertEqual(version.revision, 2)
+        self.assertCountEqual(calls, initial.keys())
+        self.assertEqual(version.content["source_weights"], weights.model_dump())
+        self.assertTrue(any("Дисциплина 0" in note for note in version.content["source_notices"]))
+        for part in version.content["program"]["subjects"]:
+            name = part["title"]
+            old = initial[name]["topics"][0]["assignments"][0]
+            new = part["topics"][0]["assignments"][0]
+            self.assertEqual((part["id"], new["id"]), (initial[name]["id"], old["id"]))
+            if name == "Дисциплина 0":
+                self.assertEqual(new["instructions"], old["instructions"])
+            else:
+                self.assertEqual(new["instructions"], "Выполните запрос в PostgreSQL.")
+                self.assertEqual(json.loads(new["previous_value"])["instructions"], old["instructions"])
 
     async def test_truncated_answer_is_split_into_topics_and_assignments(self):
         calls = []
@@ -301,6 +367,14 @@ class ContextLimitTests(unittest.TestCase):
         from orchestration.clients import InputTooLarge, fit_request
         with self.assertRaises(InputTooLarge):
             fit_request({"text": "x" * 200000}, "", {}, 1000)
+
+    def test_large_audit_request_can_compact_topic_titles_a_second_time(self):
+        from orchestration.clients import fit_request
+        program = {"title": "Курс", "subjects": [{"title": "Инженерия данных", "topics": ["SQL", "Транзакции"]}]}
+        request = {"course_program": program, "sources": [{"content": "x" * 9000}]}
+        fitted, steps = fit_request(request, "", {}, 1000)
+        self.assertTrue(steps)
+        self.assertEqual(fitted["course_program"], program)
 
     def test_failed_status_with_token_limit_is_input_too_large(self):
         from orchestration.call_log import classify_outcome

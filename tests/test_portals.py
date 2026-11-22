@@ -22,6 +22,7 @@ from auth.yandex_users import accounts_from_text
 from domain.export import block_html, export_course, rationale_report_html, source_html
 from domain.schemas import CourseLifespanAssessment, EvidenceResults, block_value
 from domain.skill_mapper import ML_COMPETENCE
+from domain.source_weights import SourceWeights
 from literature_parser import LiteratureSource, TopicLiterature, enrich_course_program
 from orchestration.checkpointer import open_checkpointer
 from orchestration.course_lifespan import INSUFFICIENT_EVIDENCE, SUPPORT_FEED_UNAVAILABLE, SupportDeadline
@@ -34,7 +35,7 @@ from storage.database import make_engine
 from storage.models import (Base, Course, CourseVersion, Interview, ModelCall, Notification, ProfessionBoundary,
                             SourceRow, WorkflowCommand, now)
 from storage.portal import (acknowledge, assigned_interviews, create_course, decide, delete_course, finish_without_answer,
-                            rebuild_course, schedule_due)
+                            rebuild_course, save_source_weights, schedule_due)
 from storage.workflow import SqlWorkflowStore
 from test_course_architecture import program, rationale_batch, records
 from workers.course_worker import process_next
@@ -146,6 +147,10 @@ class Model:
                                  "clarification_question": None, "source_ids": ["HH"]}]}
         elif name == "CourseProgramModel":
             value = program()
+        elif name == "SourceConflicts":
+            value = {"pairs": []}
+        elif name == "SubjectWeightRevision":
+            value = {"edits": []}
         elif name == "SubjectRationaleBatch":
             assert all(source["index"] in {"Books", "RPD", "Priklad", "HH"}
                        for subject in payload["disciplines"] for source in subject["fragments"])
@@ -190,6 +195,23 @@ class PortalTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await process_next(self.engine, self.factory, graph))
         async with self.factory() as db:
             return await db.get(Course, "course")
+
+    async def test_weight_edit_rebuilds_draft_from_saved_checkpoint(self):
+        course = await self.process()
+        first = course.draft_version_id
+        weights = SourceWeights(business=0.25, books=0.75)
+        with self.assertRaises(PermissionError):
+            await save_source_weights(self.factory, user("teacher", "other"), course.id, weights, previous=SourceWeights())
+        self.assertTrue(await save_source_weights(self.factory, self.teacher, course.id, weights, previous=SourceWeights()))
+        course = await self.process()
+        self.assertEqual(course.status, "waiting_for_review")
+        self.assertNotEqual(first, course.draft_version_id)
+        async with self.factory() as db:
+            self.assertEqual((await db.get(CourseVersion, first)).status, "archived")
+            next_draft = await db.get(CourseVersion, course.draft_version_id)
+            self.assertEqual(next_draft.content["source_weights"], weights.model_dump())
+            self.assertEqual(next_draft.content["program"]["subjects"][0]["id"], "subject")
+        self.assertEqual(sum(call.args[0] == "business" for call in self.evidence.search.call_args_list), 1)
 
     async def test_lifespan_card_replaces_sidebar_market_controls_and_archives(self):
         doc = source_record("documentation", "https://example.org/schedule", "График поддержки", "Окончание поддержки")
@@ -766,11 +788,20 @@ run_async(open_course())
         async with self.factory() as db:
             self.assertIsNone((await db.execute(assigned_interviews(user("expert", "other")))).first())
             inv, _, _ = (await db.execute(assigned_interviews(expert, token_hash=hashlib.sha256(token.encode()).hexdigest()))).one()
+        weights = SourceWeights(business=0.4)
+        with self.assertRaises(PermissionError):
+            await save_source_weights(self.factory, user("expert", "other"), course.id, weights,
+                                      previous=SourceWeights(), invitation_id=inv.id)
+        self.assertFalse(await save_source_weights(self.factory, expert, course.id, weights,
+                                                   previous=SourceWeights(), invitation_id=inv.id))
+        self.model.generate = AsyncMock(wraps=self.model.generate)
         files = [{"name": "task.txt", "text": "Сверка отчёта"}]
         await self.store.submit_interview("", expert, interview.interrupt_id, inv.id, "Сверка", files, invitation_id=inv.id)
         await self.store.submit_interview("", expert, interview.interrupt_id, inv.id, "Сверка", files, invitation_id=inv.id)
         course = await self.process()
         self.assertEqual(course.status, "waiting_for_review")
+        design = next(call.args[2] for call in self.model.generate.await_args_list if call.args[0].__name__ == "CourseProgramModel")
+        self.assertEqual(design["source_weights"], weights.model_dump())
         initial = course.draft_version_id
         factcheck_query = next(call.args[1] for call in self.evidence.search.call_args_list if call.args[0] == "factcheck")
         self.assertTrue(factcheck_query.startswith("Курс:"))

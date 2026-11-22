@@ -12,7 +12,7 @@ from apps.boundary_review import boundary_review
 from apps.common import composer, portal
 from apps.head_app import render_management
 from apps.teacher_programs import knowledge_screen, my_disciplines
-from apps.presentation import course_progress, status_badge
+from apps.presentation import course_progress, source_weights_panel, status_badge
 from domain.export import (OUTLINE_LABEL, block_html, composition_html, export_course, gap_coverage_html, generation_summary,
                            profession_counts, rationale_report_html, source_html, subject_origin)
 from pydantic import ValidationError
@@ -344,6 +344,7 @@ async def course_detail(actor, settings, factory, users, course, notices):
     (st.success if (course.course_meta.get("activity_model") or {}).get("tasks") else st.caption)(
         origin_note(course.course_meta))
     course_progress(course, database_url=settings.app_database_url)
+    await source_weights_panel(actor, factory, course)
     for notice in notices:
         if notice.course_id == course.id:
             st.info(notice.content)

@@ -6,7 +6,7 @@ from sqlalchemy import select
 from activity.llm import build_extractor as extractor
 from apps.common import composer, portal
 from apps.expert_survey import survey
-from apps.presentation import course_progress
+from apps.presentation import course_progress, source_weights_panel
 from auth.session import aware
 from orchestration.interviewer_turn import CATEGORY_SLOT
 from storage.models import InterviewMessage, now
@@ -48,6 +48,8 @@ async def interviews(actor, factory, *, database_url=None):
         chat = [r for r in reversed(rows) if r[2].id == chosen]
         inv, interview, course = chat[-1]
         course_progress(course, database_url=database_url)
+        await source_weights_panel(actor, factory, course, invitation_id=inv.id if
+                                   inv.status == "active" and interview.status == "invited" else None)
         with st.container(key="expert-dialog"):
             st.subheader("Диалог с интервьюером")
             for _, entry, _ in chat:

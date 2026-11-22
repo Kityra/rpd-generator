@@ -5,9 +5,11 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from auth.user_repository import CurrentUser
+from auth.session import aware
+from domain.source_weights import SourceWeights, course_source_weights
 from storage.activity_models import ProgramDiscipline
 from storage.database import write_transaction
-from storage.models import Course, CourseVersion, ExpertInvitation, Interview, Notification, ProfessionBoundary, WorkflowCommand
+from storage.models import Course, CourseVersion, ExpertInvitation, Interview, Notification, ProfessionBoundary, WorkflowCommand, now
 
 
 def require_teacher(actor: CurrentUser) -> None:
@@ -110,6 +112,52 @@ async def decide(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, 
             raise ValueError("Отклонить можно обновление утверждённого курса.")
         db.add(WorkflowCommand(id=key, course_id=course_id, kind="review", payload=payload))
         course.status = "review_queued"
+
+
+WEIGHT_REVIEW_STATUSES = {"waiting_for_review", "pending_update_review"}
+WEIGHT_EDITABLE_STATUSES = WEIGHT_REVIEW_STATUSES | {"waiting_for_expert", "approved"}
+
+
+async def save_source_weights(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str,
+                              weights: SourceWeights, *, previous: SourceWeights,
+                              invitation_id: str | None = None) -> bool:
+    """Save priorities and queue a new version when the methodologist edits a draft."""
+    async with write_transaction(factory) as db:
+        if actor.role == "expert":
+            invitation, interview, _ = (await db.execute(
+                assigned_interviews(actor).where(ExpertInvitation.id == invitation_id, Course.id == course_id)
+                .with_for_update(of=Interview).execution_options(populate_existing=True)
+            )).first() or (None, None, None)
+            if (invitation is None or invitation.status != "active" or aware(invitation.expires_at) <= now()
+                    or interview.status != "invited"):
+                raise PermissionError("Настройка доступна по действующему приглашению на интервью.")
+        else:
+            require_teacher(actor)
+        course = await db.scalar(select(Course).where(Course.id == course_id).with_for_update()
+                                 .execution_options(populate_existing=True))
+        if course is None or (actor.role != "expert" and course.owner_user_id != actor.id):
+            raise PermissionError("Курс недоступен.")
+        allowed = {"waiting_for_expert"} if actor.role == "expert" else WEIGHT_EDITABLE_STATUSES
+        if course.status not in allowed:
+            raise ValueError("Дождитесь окончания текущего шага и обновите страницу.")
+        saved = course_source_weights(course.course_meta)
+        if saved == weights:
+            return False
+        if saved != previous:
+            raise ValueError("Веса уже изменились. Обновите страницу перед сохранением.")
+        recalculate = course.status in WEIGHT_REVIEW_STATUSES
+        if recalculate:
+            version_id = course.draft_version_id
+            key = f"review:{version_id}"
+            if not version_id or await db.get(WorkflowCommand, key) is not None:
+                raise ValueError("Версия уже изменилась. Обновите страницу.")
+            db.add(WorkflowCommand(id=key, course_id=course.id, kind="review", payload={
+                "action": "reweight", "actor_user_id": actor.id, "version_id": version_id,
+                "source_weights": weights.model_dump(),
+            }))
+            course.status = "review_queued"
+        course.course_meta = {**course.course_meta, "source_weights": weights.model_dump()}
+        return recalculate
 
 
 async def finish_without_answer(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str,

@@ -13,6 +13,7 @@ from openai import APIResponseValidationError, APIStatusError
 from pydantic import Field, ValidationError, ValidationInfo, model_validator
 
 from domain.schemas import Model, SUBJECT_RATIONALE_SOURCE_TYPES, SourceRecord, SubjectRationale
+from domain.source_weights import SourceWeights
 from orchestration import prompts
 from orchestration.clients import EvidenceClient, ModelClient
 from orchestration.llm_judge import JudgePair, JudgeVerdicts, can_judge, judge_batch
@@ -69,7 +70,7 @@ def checked(status: str, reason: str, *, judge: bool) -> dict:
 
 
 async def explain_subjects(program: dict, registry: dict[str, SourceRecord], evidence: EvidenceClient,
-                          llm: ModelClient, owner: str) -> tuple[dict, list[SourceRecord]]:
+                          llm: ModelClient, owner: str, *, weights: SourceWeights = SourceWeights()) -> tuple[dict, list[SourceRecord]]:
     source_limit = asyncio.Semaphore(4)
     model_limit = asyncio.Semaphore(2)
     database = {key: source for key, source in registry.items()
@@ -104,7 +105,8 @@ async def explain_subjects(program: dict, registry: dict[str, SourceRecord], evi
         candidates = {record.source_id: record for record in [*found, *previous]
                       if record.source_type in SUBJECT_RATIONALE_SOURCE_TYPES}
         # Записи, где понятия дисциплины встречаются чаще, идут первыми.
-        ordered = sorted(candidates.items(), key=lambda item: title_coverage(title, item[1].content), reverse=True)
+        ordered = sorted(candidates.items(), key=lambda item: (
+            weights.for_source(item[1]) * title_coverage(title, item[1].content)), reverse=True)
         return dict(ordered[:7])
 
     async def judge(subject_id, rationale, sources):

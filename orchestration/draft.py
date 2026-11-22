@@ -20,14 +20,20 @@ def make_outline(title: str, names: list[str], suggestions: list[dict], ctx: dic
         terms = keywords(name)
         matched = [source for source in sources.values() if source.source_type != "Interview"
                    and terms & keywords(source.title)]
+        weights = ctx.get("source_weights")
+        if weights and weights.customized:
+            matched.sort(key=weights.for_source, reverse=True)
         refs = [*selection.get("source_ids", []), *(source.source_id for source in matched[:2])]
         if key in manual and ctx.get("manual_subject_source_id"):
             refs.append(ctx["manual_subject_source_id"])
         if not refs:
             raise ValueError(f"Для дисциплины «{name}» нет подтверждающих материалов.")
         tasks = [task for task in activity.tasks if terms & keywords(" ".join([task.title, *task.stack]))] if activity else []
-        task = max(tasks, key=lambda item: len(terms & keywords(item.title)), default=None)
+        task = max(tasks, key=lambda item: len(terms & keywords(item.title)) * (
+            weights.for_references(item.source_ids, sources) if weights else 1), default=None)
         refs = list(dict.fromkeys([*refs, *(task.source_ids if task else [])]))
+        if weights and weights.customized:
+            refs.sort(key=lambda source_id: weights.for_source(sources[source_id]), reverse=True)
         learning = []
         for source_id in refs:
             source = sources[source_id]
