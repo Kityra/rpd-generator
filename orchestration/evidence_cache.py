@@ -36,11 +36,14 @@ def _key(parts: tuple) -> str:
 
 
 def source_record(kind: SourceType, url: str, title: str, content: str, *,
-                  retrieved_at: datetime | None = None) -> SourceRecord:
+                  retrieved_at: datetime | None = None, relevance_score: float | None = None,
+                  parent_document_id: str | None = None, publication_year: int | None = None) -> SourceRecord:
     digest = _digest(content)
     key = kind + "-" + _digest(f"{kind}\n{url}\n{digest}")[:20]
     return SourceRecord(source_id=key, source_type=kind, url=url, title=title,
-                        retrieved_at=retrieved_at or _now(), raw_hash=digest, content=content)
+                        retrieved_at=retrieved_at or _now(), raw_hash=digest, content=content,
+                        relevance_score=relevance_score, parent_document_id=parent_document_id,
+                        publication_year=publication_year)
 
 
 class SnapshotEvidence(Model):

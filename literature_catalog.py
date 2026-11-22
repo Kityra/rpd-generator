@@ -55,8 +55,15 @@ STRONG_AI = AcademicReference(
 )
 
 
-def references_for_discipline(discipline: str, *, reinforcement_learning: bool) -> tuple[AcademicReference, ...]:
+def course_concepts(subject_titles) -> set[str]:
+    """Понятия всех дисциплин курса — контекст для каталога (одна тема в разных курсах значит разное)."""
+    from orchestration.semantic_check import concepts
+    return set().union(*(concepts(title) for title in subject_titles)) if subject_titles else set()
+
+
+def references_for_discipline(discipline: str, *, course: set[str] = frozenset()) -> tuple[AcademicReference, ...]:
     title = " ".join(discipline.casefold().replace("ё", "е").replace("-", " ").split())
+    reinforcement_learning = bool({"c:обучение с подкреплением", "подкрепл"} & course)
     if "слабого и сильного ии" in title or "сильного и слабого ии" in title:
         return (STRONG_AI,)
     if "теория погрешности" in title or ("абсолютная" in title and "относительная" in title):

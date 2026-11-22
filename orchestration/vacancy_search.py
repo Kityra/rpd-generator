@@ -297,7 +297,16 @@ class PublicVacancySearch:
         rostrud = [item for item in unique.values() if item.kind == "Rostrud"]
         careers = [item for item in unique.values() if item.kind == "EmployerCareer"]
         selected = [*rostrud[:6], *careers[:4]]
+        # Для сравнения периодов используем только полный ответ одного и того же поставщика.
+        # Сохраняем всю ограниченную выдачу до среза для промптов и до дедупликации с другими площадками.
+        rostrud_cards, incomplete = results[0]
+        market_cards = {}
+        if not incomplete:
+            for card in sorted(rostrud_cards, key=lambda card: (-card.published.toordinal(), card.url)):
+                market_cards.setdefault((_employer_name(card.employer), _normal(card.title)), card)
         return EvidenceResults(
             [source_record(card.kind, card.url, card.title, card.content(), retrieved_at=now) for card in selected],
             notices,
+            market_records=[source_record(card.kind, card.url, card.title, card.content(), retrieved_at=now)
+                            for card in list(market_cards.values())[:50]],
         )

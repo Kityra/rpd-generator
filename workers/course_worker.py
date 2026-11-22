@@ -11,7 +11,6 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from auth.settings import Settings
-from domain.workload import proposal_from_loads
 from literature_parser import enrich_course_program, yandex_llm_expander
 from orchestration.checkpointer import open_checkpointer
 from orchestration.clients import YandexEvidenceClient, YandexModelClient, source_record
@@ -20,7 +19,7 @@ from orchestration.rabota_business import BusinessEvidenceClient, RabotaBusiness
 from orchestration.resume import resume_graph
 from orchestration.vacancy_search import PublicVacancySearch
 from run_rpd import yandex_settings
-from storage.database import DatabaseSetupError, ensure_schema, make_engine, write_transaction
+from storage.database import DatabaseSetupError, ensure_schema, make_engine, run_async, write_transaction
 from storage.models import Course, CourseVersion, WorkflowCommand
 from storage.workflow import SqlWorkflowStore
 
@@ -69,7 +68,10 @@ async def execute(graph, factory, cmd):
                  "mode": cmd.kind, "course_meta": course.course_meta,
                  "manual_subjects": course.course_meta.get("manual_subjects", []),
                  "baseline": version.content["program"] if version else None,
-                 "workload_proposal": proposal_from_loads(version.content.get("workloads", {})) if version else None}
+                 "skill_mappings": version.content.get("skill_mappings", {}) if version else {},
+                 # Повторная проверка ищет источники и по рабочим задачам утверждённой версии.
+                 "known_tasks": [task["title"] for task in (version.content.get("activity") or {}).get("tasks", [])]
+                 if version else []}
     return await graph.ainvoke(state, config)
 
 
@@ -135,4 +137,4 @@ if __name__ == "__main__":
         ensure_schema(Settings().app_database_url)
     except DatabaseSetupError as error:
         raise SystemExit(str(error))
-    asyncio.run(run(arguments.once))
+    run_async(run(arguments.once))

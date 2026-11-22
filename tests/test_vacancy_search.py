@@ -8,6 +8,7 @@ import httpx
 from domain.schemas import EvidenceResults
 from orchestration.evidence_cache import source_record
 from orchestration.rabota_business import BusinessEvidenceClient
+from orchestration.relevance_filter import search_query
 from orchestration.vacancy_search import PublicVacancySearch
 
 
@@ -52,7 +53,7 @@ class PublicVacancySearchTests(unittest.IsolatedAsyncioTestCase):
         base.search.return_value = EvidenceResults([hh], ["Существующее примечание"])
         client = BusinessEvidenceClient(base, None, source_record,
                                         public_search=PublicVacancySearch(transport=httpx.MockTransport(respond)))
-        records = await client.search("business", json.dumps({"title": "ML-инженер", "institution": "Вуз"}))
+        records = await client.search("business", search_query({"title": "ML-инженер", "institution": "Вуз"}))
         self.assertEqual([record.source_type for record in records], ["HH", "Rostrud", "EmployerCareer"])
         self.assertEqual(records[1].url, vacancy["vac_url"])
         self.assertIn("Обучать и развёртывать модели.", records[1].content)
@@ -60,6 +61,7 @@ class PublicVacancySearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("hidden@example.org", records[1].content)
         self.assertIn("Существующее примечание", records.notices)
         self.assertIn("работодателей: 2", records.notices[-1])
+        self.assertEqual([item.url for item in records.market_records], [vacancy["vac_url"]])
 
     async def test_unavailable_provider_leaves_existing_business_evidence(self):
         base = AsyncMock()
@@ -69,5 +71,6 @@ class PublicVacancySearchTests(unittest.IsolatedAsyncioTestCase):
                                         public_search=PublicVacancySearch(employer_careers=False, transport=transport))
         records = await client.search("business", "DevOps")
         self.assertFalse(records)
+        self.assertFalse(records.market_records)
         self.assertEqual(records.notices[0], "Индекс HH недоступен.")
         self.assertIn("Работа в России", records.notices[1])

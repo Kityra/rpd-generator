@@ -17,10 +17,43 @@ def _scope(settings: dict[str, str]) -> str:
     return sha256(f"{settings['YANDEX_FOLDER_ID']}\0{settings.get('YANDEX_API_KEY', '')}".encode()).hexdigest()
 
 
-def model_response(client, settings, *, model: str, budget: float = 120, **kwargs):
-    return EXTERNAL.call(("Yandex", "responses", _scope(settings), model),
-                         lambda timeout: client.responses.create(model=model, timeout=timeout, **kwargs),
-                         budget=budget, read=budget)
+MODEL_CIRCUIT_COOLDOWN = 10.0
+STREAM_READ_TIMEOUT = 60.0
+
+
+def collect_stream(events):
+    """Итоговый объект ответа из потока событий Responses API."""
+    if not hasattr(events, "__iter__") and hasattr(events, "output_text"):
+        return events  # сервер вернул обычный ответ вместо потока
+    final = None
+    for event in events:
+        if getattr(event, "type", "") in {"response.completed", "response.incomplete", "response.failed"}:
+            final = event.response
+    if final is None:
+        raise RuntimeError("Поток ответа модели оборвался без итогового события.")
+    return final
+
+
+def model_response(client, settings, *, model: str, budget: float = 120, stream: bool = False,
+                   request_key: str | None = None, judge: bool = False, single_attempt_stage: str = "", **kwargs):
+    """Вызов модели. При stream=True ответ читается потоком: лимит чтения действует на каждый фрагмент,
+    поэтому длинный ответ не обрывается, пока модель продолжает писать, а общий срок задаёт budget."""
+    if stream:
+        def request(timeout):
+            return collect_stream(client.responses.create(model=model, timeout=timeout, stream=True, **kwargs))
+        read = min(STREAM_READ_TIMEOUT, budget)
+    else:
+        def request(timeout):
+            return client.responses.create(model=model, timeout=timeout, **kwargs)
+        read = budget
+    service = ("Yandex", "responses", _scope(settings), model)
+    stage = "llm_judge" if judge else single_attempt_stage
+    if stage:
+        service = (*service, stage)
+    return EXTERNAL.call(service, request, budget=budget, read=read, attempts=1 if stage else 3,
+                         request_key=request_key, count_timeouts=request_key is None,
+                         cooldown=MODEL_CIRCUIT_COOLDOWN if request_key else None,
+                         wait_if_open=not stage and request_key is not None)
 
 
 def search_fragments(client, settings, index: SourceType, store_id: str, query: str, count: int, *,
@@ -40,7 +73,11 @@ def search_fragments(client, settings, index: SourceType, store_id: str, query: 
                 if not hit.file_id or not hit.filename:
                     raise InvalidIndexResponse("Во фрагменте индекса нет ссылки на файл.")
                 url = f"https://ai.api.cloud.yandex.net/v1/files/{quote(hit.file_id, safe='')}"
-                fragments.append(SnapshotEvidence(source=source_record(index, url, hit.filename, text[:6000])))
+                score = getattr(hit, "score", None)
+                score = float(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else None
+                fragments.append(SnapshotEvidence(source=source_record(index, url, hit.filename, text[:6000],
+                                                                       relevance_score=score,
+                                                                       parent_document_id=f"yandex:{hit.file_id}")))
         return tuple(fragments)
 
     if index == "Interview":

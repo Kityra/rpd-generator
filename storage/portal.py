@@ -1,18 +1,18 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from auth.user_repository import CurrentUser
-from domain.workload import proposal_from_loads, propose_workload, workload
+from storage.activity_models import ProgramDiscipline
 from storage.database import write_transaction
-from storage.models import Course, CourseVersion, ExpertInvitation, Interview, Notification, WorkflowCommand
+from storage.models import Course, CourseVersion, ExpertInvitation, Interview, Notification, ProfessionBoundary, WorkflowCommand
 
 
 def require_teacher(actor: CurrentUser) -> None:
     if actor.role not in {"teacher", "admin"}:
-        raise PermissionError("Требуется роль преподавателя.")
+        raise PermissionError("Требуется роль методиста.")
 
 
 async def create_course(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str,
@@ -23,7 +23,8 @@ async def create_course(factory: async_sessionmaker[AsyncSession], actor: Curren
     async with write_transaction(factory) as db:
         existing = await db.get(Course, course_id)
         if existing:
-            if existing.owner_user_id != actor.id or existing.course_meta != dict(meta, manual_subjects=subjects):
+            if (existing.status == "cancelled" or existing.owner_user_id != actor.id or
+                    existing.course_meta != dict(meta, manual_subjects=subjects)):
                 raise ValueError("Заявка уже сохранена с другими параметрами.")
             return
         course = Course(id=course_id, thread_id=course_id, owner_user_id=actor.id,
@@ -33,8 +34,61 @@ async def create_course(factory: async_sessionmaker[AsyncSession], actor: Curren
         db.add(WorkflowCommand(id=f"create:{course_id}", course_id=course_id, kind="create", payload={}))
 
 
+async def delete_course(factory: async_sessionmaker[AsyncSession], course_id: str, actor: CurrentUser) -> None:
+    """Мягкое удаление курса владельцем. Источники и история команд остаются в архиве курса."""
+    if actor.role != "teacher":
+        raise PermissionError("Удалить курс может только методист-владелец.")
+    async with write_transaction(factory) as db:
+        owned = select(Course).where(Course.id == course_id, Course.owner_user_id == actor.id)
+        if not await db.scalar(owned.with_only_columns(Course.id)):
+            raise PermissionError("Курс недоступен.")
+        # Тот же порядок блокировок, что у ответа эксперта и завершения интервью.
+        interview_ids = (await db.scalars(select(Interview.id).where(Interview.course_id == course_id)
+                                          .order_by(Interview.id).with_for_update())).all()
+        course = await db.scalar(owned.with_for_update())
+        if course is None:
+            raise PermissionError("Курс недоступен.")
+        if course.status == "cancelled":
+            return
+        pending = await db.scalar(select(WorkflowCommand.id).where(WorkflowCommand.course_id == course_id,
+                                  WorkflowCommand.status == "pending").limit(1))
+        if pending is not None:
+            raise ValueError("Дождитесь завершения обработки курса и повторите удаление.")
+        await db.execute(update(CourseVersion).where(CourseVersion.course_id == course_id).values(status="archived"))
+        await db.execute(delete(Notification).where(Notification.course_id == course_id))
+        await db.execute(update(Interview).where(Interview.id.in_(interview_ids), Interview.status == "invited")
+                         .values(status="closed"))
+        await db.execute(update(ExpertInvitation).where(ExpertInvitation.interview_id.in_(interview_ids),
+                         ExpertInvitation.status == "active").values(status="revoked"))
+        await db.execute(update(ProfessionBoundary).where(ProfessionBoundary.course_id == course_id)
+                         .values(invite_token_hash=None, invite_expires_at=None))
+        await db.execute(update(ProgramDiscipline).where(ProgramDiscipline.course_id == course_id).values(course_id=None))
+        course.status = "cancelled"
+        course.active_version_id = course.draft_version_id = course.next_audit_at = None
+
+
+async def save_market(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str, *,
+                      dataset: dict | None = ..., overrides: dict[str, list[str]] | None = ...) -> None:
+    """Сохранить загруженные рыночные данные и/или ручные правки соответствия навыков дисциплинам."""
+    require_teacher(actor)
+    async with write_transaction(factory) as db:
+        course = await db.scalar(select(Course).where(Course.id == course_id, Course.owner_user_id == actor.id,
+                                             Course.status != "cancelled").with_for_update())
+        if course is None:
+            raise PermissionError("Курс недоступен.")
+        market = dict((course.course_meta or {}).get("market") or {})
+        if dataset is not ...:
+            if dataset is None:
+                market.pop("dataset", None)
+            else:
+                market["dataset"] = dataset
+        if overrides is not ...:
+            market["overrides"] = {key: list(value) for key, value in (overrides or {}).items()}
+        course.course_meta = {**course.course_meta, "market": market}
+
+
 async def decide(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str, version_id: str,
-                 action: str, content: str = "", attachments: tuple | list = (), workloads: dict | None = None) -> None:
+                 action: str, content: str = "", attachments: tuple | list = ()) -> None:
     require_teacher(actor)
     if action not in {"approve", "reject", "revise", "refresh_materials"} or (action == "revise" and not (content.strip() or attachments)):
         raise ValueError("Укажите решение или правку.")
@@ -42,31 +96,13 @@ async def decide(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, 
         course = await db.scalar(select(Course).where(Course.id == course_id, Course.owner_user_id == actor.id).with_for_update())
         if course is None:
             raise PermissionError("Курс недоступен.")
-        proposal = None
-        if workloads or action in {"approve", "revise", "refresh_materials"}:
-            version = await db.get(CourseVersion, version_id)
-            if not version or version.course_id != course_id:
-                raise ValueError("Нагрузка не соответствует версии курса.")
-            subjects = version.content["program"]["subjects"]
-            proposal = version.content.get("workload_proposal")
-            if proposal is None and course.active_version_id:
-                active = await db.get(CourseVersion, course.active_version_id)
-                if active:
-                    proposal = proposal_from_loads(active.content.get("workloads", {}))
-            if action == "approve" and workloads is None:
-                workloads = propose_workload(subjects, proposal)["loads"]
-            if set(workloads or {}) - {subject["id"] for subject in subjects}:
-                raise ValueError("Нагрузка не соответствует версии курса.")
-            for hours in (workloads or {}).values():
-                workload(hours)
         payload = {"action": action, "actor_user_id": actor.id, "version_id": version_id,
                    "content": content.strip() or ("См. приложенные материалы." if attachments else ""),
-                   "attachments": list(attachments), "workloads": workloads or {}}
-        if proposal and action in {"revise", "refresh_materials"}:
-            payload["workload_proposal"] = proposal
+                   "attachments": list(attachments)}
         key = f"review:{version_id}"
         existing = await db.get(WorkflowCommand, key)
-        if existing and existing.payload == payload:
+        if existing and all(existing.payload.get(key) == value for key, value in payload.items()):
+            # Команды, созданные до отключения нагрузки, могут содержать дополнительные поля.
             return
         if existing or course.draft_version_id != version_id or course.status not in {"waiting_for_review", "pending_update_review"}:
             raise ValueError("Версия уже изменилась. Обновите страницу.")
@@ -77,8 +113,12 @@ async def decide(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, 
 
 
 async def finish_without_answer(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str,
-                                interview_id: str) -> None:
+                                interview_id: str, *, acknowledged_claim_ids: list[str] | None = None,
+                                manual_tasks: list[str] | None = None) -> None:
     require_teacher(actor)
+    tasks = list(dict.fromkeys(line.strip() for line in manual_tasks or [] if line.strip()))
+    if len(tasks) > 20 or any(len(task) > 2000 for task in tasks):
+        raise ValueError("Укажите до 20 рабочих задач, до 2000 символов каждая.")
     async with write_transaction(factory) as db:
         interview = await db.scalar(select(Interview).where(Interview.id == interview_id,
                                     Interview.course_id == course_id).with_for_update())
@@ -92,13 +132,21 @@ async def finish_without_answer(factory: async_sessionmaker[AsyncSession], actor
             return
         if existing or interview.status != "invited" or course.status != "waiting_for_expert":
             raise ValueError("Курс уже продолжил обработку. Обновите страницу.")
+        claims = interview.gap_report.get("profession_profile", {}).get("claims", [])
+        allowed = {claim["claim_id"] for claim in claims if claim["verification_status"] == "needs_review"}
+        selected = list(dict.fromkeys(acknowledged_claim_ids or []))
+        if set(selected) - allowed:
+            raise ValueError("Выберите текущие утверждения, требующие проверки.")
+        if interview.gap_report.get("requires_manual_input") and not tasks and not selected:
+            raise ValueError("Укажите хотя бы одну рабочую задачу для подготовки черновика.")
         await db.execute(update(ExpertInvitation).where(ExpertInvitation.interview_id == interview_id,
                          ExpertInvitation.status == "active").values(status="revoked"))
         interview.status = "closed"
         course.status = "queued"
         db.add(WorkflowCommand(id=key, course_id=course.id, kind="resume",
                                payload={"interrupt_id": interview.interrupt_id, "actor_user_id": actor.id,
-                                        "action": "finish_without_answer"}))
+                                        "action": "finish_without_answer", "acknowledged_claim_ids": selected,
+                                        "manual_tasks": tasks}))
 
 
 async def acknowledge(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str) -> None:
@@ -135,12 +183,31 @@ async def retry_command(factory: async_sessionmaker[AsyncSession], actor: Curren
         course.status = "answer_queued" if expert_reply else "queued"
 
 
+REBUILD_STATUSES = frozenset({"approved", "waiting_for_review", "pending_update_review", "failed"})
+
+
+async def rebuild_course(factory: async_sessionmaker[AsyncSession], actor: CurrentUser, course_id: str) -> str:
+    """Поставить в очередь полную пересборку курса моделью. Утверждённая версия остаётся действующей,
+    новая придёт черновиком на проверку."""
+    require_teacher(actor)
+    async with write_transaction(factory) as db:
+        course = await db.scalar(select(Course).where(Course.id == course_id, Course.owner_user_id == actor.id).with_for_update())
+        if course is None:
+            raise PermissionError("Курс недоступен.")
+        if course.status not in REBUILD_STATUSES:
+            raise ValueError("Курс сейчас обрабатывается. Дождитесь окончания текущего шага.")
+        command_id = f"create:{course_id}:{uuid4()}"
+        db.add(WorkflowCommand(id=command_id, course_id=course_id, kind="create", payload={}))
+        course.status = "queued"
+    return command_id
+
+
 def assigned_interviews(actor: CurrentUser, *, token_hash: str | None = None):
     if actor.role != "expert":
         raise PermissionError("Требуется роль эксперта.")
     stmt = select(ExpertInvitation, Interview, Course).join(Interview, ExpertInvitation.interview_id == Interview.id).join(
         Course, Interview.course_id == Course.id).where(ExpertInvitation.expert_user_id == actor.id,
-        ExpertInvitation.status.in_(["used", "active"]))
+        ExpertInvitation.status.in_(["used", "active"]), Course.status != "cancelled")
     if token_hash is not None:
         stmt = stmt.where(ExpertInvitation.token_hash == token_hash)
     return stmt.order_by(Interview.created_at.desc())

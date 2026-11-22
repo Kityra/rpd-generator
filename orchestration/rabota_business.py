@@ -3,7 +3,6 @@
 import asyncio
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
-import json
 import logging
 import os
 from pathlib import Path
@@ -58,17 +57,11 @@ def _bounded_text(value: object, limit: int) -> str:
 
 
 def _course_topic(query: str) -> str:
-    if len(query) > 16_384:
+    """Тема поиска вакансий — первая строка запроса агентов (название курса)."""
+    # Структурированные данные (JSON) не являются темой поиска: граф передаёт текстовый запрос.
+    if len(query) > 16_384 or not query.strip() or query.lstrip().startswith(("{", "[")):
         return ""
-    if not query.lstrip().startswith(("{", "[")):
-        return query
-    try:
-        scope = json.loads(query)
-    except (ValueError, RecursionError):
-        return ""
-    if not isinstance(scope, dict):
-        return ""
-    return _bounded_text(scope.get("title"), 240)
+    return _bounded_text(query.strip().splitlines()[0], 240)
 
 
 def _evidence(card: object, checked_at: object) -> VacancyEvidence | None:
@@ -196,4 +189,5 @@ class BusinessEvidenceClient:
             requests.append(self.public_search.records(topic))
         results = await asyncio.gather(*requests)
         return EvidenceResults((item for result in results for item in result),
-                               (note for result in results for note in getattr(result, "notices", ())))
+                               (note for result in results for note in getattr(result, "notices", ())),
+                               market_records=(item for result in results for item in getattr(result, "market_records", ())))

@@ -43,7 +43,7 @@ def make_outline(title: str, names: list[str], suggestions: list[dict], ctx: dic
             "is_fundamental": bool(selection.get("is_fundamental")),
             "locked": key in manual or bool(selection.get("is_fundamental")),
             "justification": {"reason_type": "fundamental_core" if selection.get("is_fundamental") else "scientific_trend",
-                              "evidence_summary": "Тема предложена для проверки преподавателем по приложенным материалам.",
+                              "evidence_summary": "Тема предложена для проверки методистом по приложенным материалам.",
                               "source_ids": refs},
             "learning_references": learning,
         }

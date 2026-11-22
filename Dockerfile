@@ -8,15 +8,20 @@ COPY requirements.txt .
 RUN python -m pip install --no-cache-dir -r requirements.txt \
     && useradd --uid 10001 --create-home appuser
 
-COPY .streamlit .streamlit
+COPY .streamlit/config.toml .streamlit/config.toml
 COPY *.py final_schema.json ./
+COPY config/ config/
+COPY activity/ activity/
 COPY auth/ auth/
 COPY domain/ domain/
 COPY orchestration/ orchestration/
+COPY skills/ skills/
 COPY rabota_it/ rabota_it/
 COPY storage/ storage/
 COPY apps/ apps/
 COPY workers/ workers/
+COPY templates/ templates/
+COPY scripts/migrate_sqlite_to_postgres.py scripts/
 COPY alembic.ini ./
 RUN mkdir -p /app/data && chown appuser:appuser /app/data
 

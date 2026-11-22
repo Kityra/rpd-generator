@@ -30,7 +30,9 @@ from storage.workflow import SqlWorkflowStore
 
 def records() -> dict:
     return {kind: SourceRecord(source_id=kind, source_type=kind, url=f"https://example.org/{kind}",
-                              title=kind, content="Дейт К. Введение в системы баз данных. Реляционные модели данных и запросы SQL",
+                              title=kind, content=("Дейт К. Введение в системы баз данных. Реляционные модели данных и запросы SQL"
+                                  + (" Сбор данных, отчёт. Критерии: время, корректность. Ошибка в запросе."
+                                     if kind in {"HH", "Crossref"} else "")),
                               raw_hash="a" * 64, retrieved_at=datetime.now(timezone.utc))
             for kind in ("HH", "Crossref", "Books", "RPD", "Interview")}
 
@@ -252,17 +254,23 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         llm = AsyncMock()
         activity_calls = 0
         audit_calls = 0
-        async def generate(output, prompt, payload, context, flash=False):
+        async def generate(output, prompt, payload, context, flash=False, **options):
             nonlocal activity_calls, audit_calls
             if output.__name__ == "AgentReport":
                 value = {"findings": []}
             elif output.__name__ == "AppliedActivityModel":
                 activity_calls += 1
-                tasks = [{"id": f"task{i}", "title": f"Задача {i}", "stack": ["SQL"], "artifacts": ["Запрос"],
+                tasks = [{"id": f"task{i}", "title": f"Проверить запрос SQL {i}", "stack": ["SQL"], "artifacts": ["Запрос"],
                           "quality_criteria": ["Корректность", "Время"], "typical_errors": ["Ошибка"],
                           "source_ids": ["HH", "Crossref"]} for i in range(4 if activity_calls == 1 else 5)]
-                value = {"tasks": tasks, "processes": [{"id": str(i), "title": "Процесс", "task_ids": ["task0"],
+                value = {"tasks": tasks, "processes": [{"id": str(i), "title": "Сбор данных", "task_ids": ["task0"],
                          "source_ids": ["HH"]} for i in range(3)], "aspects": [], "source_ids": ["HH"]}
+            elif output.__name__ == "ProfessionEvidenceVerdicts":
+                value = {"items": [{"pair_id": pair["pair_id"], "verdict": "supports"} for pair in payload["pairs"]]}
+            elif output.__name__ == "InterviewerTurnQuality":
+                value = {"classification": "valid_answer"}
+            elif output.__name__ == "InterviewerExtraction":
+                value = {"items": []}
             elif output.__name__ == "SubjectPlan":
                 value = {"subjects": [{"name": "Базы данных", "is_fundamental": True, "conflict_with": None, "source_ids": ["Books"]}]}
             elif output.__name__ == "InterviewTurn":
@@ -274,12 +282,16 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                 value = program()
             elif output.__name__ == "SubjectRationaleBatch":
                 value = rationale_batch(payload)
-            else:
+            elif output.__name__ == "RationaleVerdicts":
+                value = {"items": [{"pair_id": row["pair_id"], "verdict": "supports"} for row in payload["pairs"]]}
+            elif output.__name__ == "BusinessCourseAudit":
                 audit_calls += 1
                 value = {"source_ids": ["HH"], "market_fit_score": 0.7, "metrics": [], "unavailable_metrics": ["active_vacancies"],
                          "evidence_summary": "Практика", "suggested_changes": [
                              {"reason_type": "market_demand", "evidence_summary": "Практика SQL", "source_ids": ["HH"]}
                          ] if audit_calls == 1 else []}
+            else:
+                self.fail(f"Неожиданный вызов модели {output.__name__}")
             return output.model_validate(value, context=context)
         llm.generate.side_effect = generate
         async with self.factory.begin() as db:
@@ -298,6 +310,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             answer = {"interrupt_id": state.values["interrupt_id"], "content": "Пятая задача", "attachments": []}
             second = await graph.ainvoke(Command(resume=answer), config)
             self.assertEqual(second["status"], "waiting_for_review")
+            self.assertEqual(activity_calls, 1)
             self.assertEqual(audit_calls, 2)
             self.assertEqual(sum(call.args[0] == "business" for call in evidence.search.call_args_list), 1)
             await graph.ainvoke(Command(resume={"actor_user_id": "users:1", "version_id": second["version_id"], "action": "approve"}), config)

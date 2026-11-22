@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<script>
+  function send(type, data) {
+    window.parent.postMessage({isStreamlitMessage: true, type, ...data}, window.location.origin);
+  }
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== window.parent || event.origin !== window.location.origin ||
+        event.data?.type !== "streamlit:render") return;
+    try {
+      const location = window.parent.location;
+      const token = new URLSearchParams(location.hash.slice(1)).get("invite");
+      if (!token || !/^[A-Za-z0-9_-]{43}$/.test(token)) return;
+      window.parent.history.replaceState(window.parent.history.state, "", location.pathname + location.search);
+      send("streamlit:setComponentValue", {value: token, dataType: "json"});
+    } catch {
+      // The guest can paste the invitation when the browser blocks parent-frame access.
+    }
+  });
+  send("streamlit:componentReady", {apiVersion: 1});
+  send("streamlit:setFrameHeight", {height: 0});
+</script>

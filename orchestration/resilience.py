@@ -1,7 +1,7 @@
 """Bounded calls and a separate circuit breaker for each external operation."""
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import logging
@@ -63,6 +63,7 @@ class ExternalUnavailable(RuntimeError):
 @dataclass
 class _Circuit:
     failures: int = 0
+    failed_requests: set = field(default_factory=set)
     open_until: float | None = None
     probing: bool = False
     generation: int = 0
@@ -80,20 +81,38 @@ class Resilience:
         self._lock = Lock()
         self._circuits: dict[Service, _Circuit] = {}
 
-    def call(self, service: Service, request: Callable[[httpx.Timeout], T], *, budget: float, read: float) -> T:
+    def call(self, service: Service, request: Callable[[httpx.Timeout], T], *, budget: float, read: float,
+             request_key: str | None = None, count_timeouts: bool = True, cooldown: float | None = None,
+             wait_if_open: bool = False, attempts: int = 3) -> T:
+        """Вызов с повторами и выключателем.
+
+        request_key — сбои одного и того же запроса считаются один раз: выключатель открывается,
+        когда подряд упали `threshold` разных запросов, а не один долгий запрос в нескольких попытках.
+        count_timeouts=False — исчерпание собственного бюджета времени не считается сбоем сервиса
+        (долгий ответ модели зависит от размера запроса, а не от состояния провайдера).
+        wait_if_open — если пауза закончится раньше половины бюджета, запрос дожидается её, а не падает.
+        """
         deadline = self.clock() + budget
         name = "/".join(service[:2])
-        with self._lock:
-            circuit = self._circuits.setdefault(service, _Circuit())
-            probe = circuit.open_until is not None
-            if probe and (circuit.probing or self.clock() < circuit.open_until):
-                raise ExternalUnavailable(f"{name}: запросы временно приостановлены.")
-            circuit.probing = probe
-            generation = circuit.generation
+        pause = self.cooldown if cooldown is None else cooldown
+        while True:
+            with self._lock:
+                circuit = self._circuits.setdefault(service, _Circuit())
+                probe = circuit.open_until is not None
+                delay = (circuit.open_until - self.clock()) if probe else 0.0
+                if probe and (circuit.probing or delay > 0):
+                    if not (wait_if_open and not circuit.probing and 0 < delay <= (deadline - self.clock()) / 2):
+                        raise ExternalUnavailable(f"{name}: запросы временно приостановлены.")
+                else:
+                    circuit.probing = probe
+                    generation = circuit.generation
+                    break
+            self.wait(delay)
 
         server_delay = 0.0
         try:
-            for attempt in range(1 if probe else 3):
+            limit = 1 if probe else attempts
+            for attempt in range(limit):
                 remaining = deadline - self.clock()
                 if remaining <= 0:
                     raise TimeoutError("Исчерпан бюджет внешнего запроса.")
@@ -108,20 +127,27 @@ class Resilience:
                         raise
                     server_delay = retry_after(error)
                     delay = max(server_delay, self.jitter(0.25, 0.5) * 2 ** attempt)
-                    if isinstance(error, TimeoutError) or probe or attempt == 2 or delay >= deadline - self.clock():
+                    if isinstance(error, TimeoutError) or attempt + 1 == limit or delay >= deadline - self.clock():
                         raise
                     self.wait(delay)
         except Exception as error:
             with self._lock:
                 if generation == circuit.generation:
                     circuit.probing = False
-                    if is_temporary(error):
-                        circuit.failures += 1
-                        if probe or circuit.failures >= self.threshold or server_delay > 0:
-                            circuit.open_until = self.clock() + max(self.cooldown, server_delay)
+                    own_timeout = isinstance(error, TimeoutError) and not count_timeouts
+                    if is_temporary(error) and not own_timeout:
+                        if request_key is None:
+                            circuit.failures += 1
+                        else:
+                            circuit.failed_requests.add(request_key)
+                            circuit.failures = len(circuit.failed_requests)
+                        if probe or circuit.failures >= self.threshold or (server_delay > 0 and request_key is None):
+                            circuit.open_until = self.clock() + max(pause, server_delay)
                             circuit.generation += 1
-                    else:
+                            circuit.failed_requests.clear()
+                    elif not is_temporary(error):
                         circuit.failures = 0
+                        circuit.failed_requests.clear()
                         circuit.open_until = None
             if is_temporary(error):
                 LOG.warning("%s временно недоступен (%s).", name, type(error).__name__)
@@ -131,6 +157,7 @@ class Resilience:
             with self._lock:
                 if generation == circuit.generation:
                     circuit.failures = 0
+                    circuit.failed_requests.clear()
                     circuit.open_until = None
                     circuit.probing = False
             return result

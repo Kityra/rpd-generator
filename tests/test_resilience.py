@@ -12,7 +12,6 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 from openai import AuthenticationError, InternalServerError
-
 from orchestration import yandex_calls
 from orchestration.clients import YandexEvidenceClient, YandexModelClient
 from orchestration.graph import AgentReport
@@ -208,7 +207,7 @@ class YandexResilienceTests(DatabaseFixture, unittest.IsolatedAsyncioTestCase):
 
         self.client.responses.create.side_effect = respond
         with patch.object(run_rpd, "collect_recent_articles", return_value=[]):
-            graph = run_rpd.create_rpd_graph(self.client, self.settings, draft_first=True)
+            graph = run_rpd.create_rpd_graph(self.client, self.settings)
             result = graph.invoke({"request": request}, config={"configurable": {"thread_id": "cached-plan"}})
         payload = calls["rpd_draft"]
         self.assertEqual(payload["research"]["university"]["fragments"][0]["retrieved_at"],

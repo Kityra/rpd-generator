@@ -11,7 +11,7 @@ class CurrentUser(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     id: str
     email: str
-    role: Literal["teacher", "expert", "admin"]
+    role: Literal["teacher", "expert", "admin", "program_head"]
     display_name: str
 
 
@@ -27,6 +27,9 @@ class UserRepository(Protocol):
 
     async def list_experts(self) -> list[CurrentUser]:
         """Выбрать существующих экспертов."""
+
+    async def list_teachers(self) -> list[CurrentUser]:
+        """Выбрать существующих методистов."""
 
 
 class SqlUserRepository:
@@ -109,3 +112,6 @@ class SqlUserRepository:
 
     async def list_experts(self) -> list[CurrentUser]:
         return [user for name, row in await self._find() if (user := self._user(name, row)).role == "expert"]
+
+    async def list_teachers(self) -> list[CurrentUser]:
+        return [user for name, row in await self._find() if (user := self._user(name, row)).role == "teacher"]

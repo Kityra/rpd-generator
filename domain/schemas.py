@@ -1,8 +1,8 @@
 import json
-from datetime import datetime
-from typing import Literal
+from datetime import date, datetime
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationInfo, field_validator, model_validator
 
 
 class Model(BaseModel):
@@ -10,10 +10,11 @@ class Model(BaseModel):
 
 
 SourceType = Literal["HH", "Priklad", "Crossref", "arXiv", "Books", "RPD", "Interview", "expert", "teacher",
-                     "documentation", "RabotaRu", "Literature", "Rostrud", "EmployerCareer"]
+                     "documentation", "RabotaRu", "Literature", "Rostrud", "EmployerCareer", "ActivityModel"]
 SUBJECT_RATIONALE_SOURCE_TYPES = frozenset({"Books", "RPD", "Priklad", "HH"})
 INDEPENDENT_EXPERT_SOURCE_TYPES = frozenset({"HH", "Priklad", "Books", "Crossref", "arXiv", "documentation", "RabotaRu"})
 ChangeStatus = Literal["unchanged", "added", "modified", "fundamental_protected"]
+SERVER_ONLY = {"server_only": True}
 GapType = Literal["missing_tasks", "missing_stack", "missing_quality_criteria", "missing_artifacts", "conflicting_evidence"]
 
 
@@ -25,6 +26,10 @@ class SourceRecord(Model):
     retrieved_at: datetime
     raw_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     content: str = Field(min_length=1)
+    # Оценка близости фрагмента к запросу из векторного поиска (None — источник не из индекса или старая запись).
+    relevance_score: float | None = None
+    parent_document_id: str | None = None
+    publication_year: int | None = Field(default=None, ge=1, le=9999)
 
     @field_validator("url")
     @classmethod
@@ -39,9 +44,10 @@ class SourceRecord(Model):
 class EvidenceResults(list[SourceRecord]):
     """List of sources with backend notices about coverage and snapshot age."""
 
-    def __init__(self, records=(), notices=()):
+    def __init__(self, records=(), notices=(), *, market_records=()):
         super().__init__(records)
         self.notices = list(notices)
+        self.market_records = list(market_records)
 
 
 class Grounded(Model):
@@ -192,6 +198,11 @@ class LearningAssignment(ChangedBlock):
     quality_criteria: list[str] = Field(min_length=2)
 
 
+class TopicAssignments(Model):
+    """Задания одной темы — отдельный вызов, если вся дисциплина не помещается в ответ."""
+    assignments: list[LearningAssignment] = Field(max_length=2)
+
+
 class Topic(ChangedBlock):
     activity_task_ids: list[str]
     assignments: list[LearningAssignment]
@@ -228,7 +239,20 @@ class SubjectRationale(Grounded):
             excerpt = " ".join(item.excerpt.split())
             if len(excerpt) < 15 or excerpt not in " ".join(source.content.split()):
                 raise ValueError("Цитата отсутствует в источнике или слишком коротка.")
+        if subject := (info.context or {}).get("rationale_subject"):
+            # Вторая проверка: цитата должна подтверждать объяснение и относиться к дисциплине.
+            from orchestration.semantic_check import rationale_problem
+            if problem := rationale_problem(subject, self.explanation, [item.excerpt for item in self.evidence]):
+                raise ValueError(f"Обоснование не подтверждено: {problem}.")
         return self
+
+
+class BoundaryWarning(Model):
+    subject_id: str
+    matched_topic: str
+    adjacent_profession: str
+    exclusive_item: str
+    source_interview_id: str | None
 
 
 class CourseSubject(ChangedBlock):
@@ -237,6 +261,17 @@ class CourseSubject(ChangedBlock):
     conflict_with: str | None
     topics: list[Topic] = Field(min_length=1)
     inclusion_rationale: SubjectRationale | None = None
+    # Происхождение заполняет сервер; в схему ответа модели эти поля не передаются.
+    generated_by: Literal["model", "outline"] | None = Field(default=None, json_schema_extra=SERVER_ONLY)
+    generation_note: str | None = Field(default=None, json_schema_extra=SERVER_ONLY)
+    # Старые версии содержат ранги, которые использовались при расчёте часов.
+    importance: Literal["core", "major", "standard", "minor"] | None = Field(
+        default=None, exclude=True, json_schema_extra=SERVER_ONLY)
+    importance_reason: str | None = Field(default=None, exclude=True, json_schema_extra=SERVER_ONLY)
+    # Итог проверки обоснования: status supports / weak / unrelated / missing, reason, judge.
+    rationale_check: dict | None = Field(default=None, json_schema_extra=SERVER_ONLY)
+    needs_review: bool = Field(default=False, json_schema_extra=SERVER_ONLY)
+    boundary_warnings: list[BoundaryWarning] = Field(default_factory=list, json_schema_extra=SERVER_ONLY)
 
 
 class MarketMetric(Grounded):
@@ -256,12 +291,105 @@ class MarketMetric(Grounded):
         return self
 
 
+class MarketSkill(Model):
+    """Навык или требование рынка из загруженных данных."""
+    name: str = Field(min_length=1, max_length=200)
+    aliases: list[str] = Field(default_factory=list)
+    weight: float | None = Field(default=None, ge=0)
+    vacancies: int | None = Field(default=None, ge=0)
+    tasks: list[str] = Field(default_factory=list)
+
+
+class MarketVacancy(Model):
+    id: str | None = None
+    title: str = Field(min_length=1, max_length=300)
+    skills: list[str] = Field(default_factory=list)
+    text: str = Field(default="", max_length=20_000)
+
+
+class MarketDataset(Model):
+    """Входные рыночные данные курса: список навыков с весами и/или выборка вакансий. Коды стандартов не используются."""
+    source: str = Field(min_length=1, max_length=300)
+    region: str | None = None
+    period: str | None = None
+    collected_at: str | None = None
+    skills: list[MarketSkill] = Field(default_factory=list)
+    vacancies: list[MarketVacancy] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_content(self) -> "MarketDataset":
+        if not self.skills and not self.vacancies:
+            raise ValueError("В файле нет ни навыков, ни вакансий.")
+        return self
+
+
+class SkillCoverage(Model):
+    skill: str
+    vacancies: int | None
+    share: float | None
+    weight: float | None
+    critical: bool
+    level: Literal["full", "partial", "none"]
+    subjects: list[str]
+    topics: list[str]
+    tasks: list[str]
+    priority: float
+    manual: bool = False
+    competence_name: str = ""
+    tools: list[str] = Field(default_factory=list)
+    raw_skills: list[str] = Field(default_factory=list)
+    vacancy_ids: list[str] | None = None
+    expert_tools: list[str] = Field(default_factory=list)
+
+
+class ExpertToolLink(Model):
+    competence_name: str
+    tool_name: str
+    quote: str
+    interview_id: str
+
+
+class MarketAnalysis(Model):
+    """Результат расчёта кодом: покрытие навыков рынка курсом. Модель в расчёте не участвует."""
+    status: Literal["ok", "no_data"]
+    source: str | None = None
+    sample_size: int | None = None
+    period: str | None = None
+    region: str | None = None
+    skills: list[SkillCoverage] = Field(default_factory=list)
+    competences: list[SkillCoverage] = Field(default_factory=list)
+    uncovered: list[str] = Field(default_factory=list)
+    weak_subjects: list[str] = Field(default_factory=list)
+    task_priorities: list[dict] = Field(default_factory=list)
+    market_fit: float | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class BusinessCourseAudit(Grounded):
     market_fit_score: float = Field(ge=0, le=1)
     metrics: list[MarketMetric]
     unavailable_metrics: list[str]
     evidence_summary: str
     suggested_changes: list[ChangeJustification]
+
+
+class CourseLifespanAssessment(Grounded):
+    estimated_lifespan_years: float = Field(ge=0, le=15, strict=True)
+    is_short_lived: bool = Field(strict=True)
+    hr_digest_points: list[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=240)]] = Field(
+        min_length=3, max_length=5)
+    review_by: date | None = None
+    calculated_on: date | None = None
+    calculation_method: Literal["support_end", "market_shift", "combined"] | None = None
+
+    @model_validator(mode="after")
+    def check_lifespan(self) -> "CourseLifespanAssessment":
+        if self.is_short_lived != (0 <= self.estimated_lifespan_years <= 5):
+            raise ValueError("is_short_lived должен соответствовать горизонту от 0 до 5 лет включительно.")
+        prohibited = ("нецелесообразно", "не рекомендуется запускать", "устареет и не окупится")
+        if any(phrase in " ".join(point.casefold().split()) for point in self.hr_digest_points for phrase in prohibited):
+            raise ValueError("Сформулируйте тезисы нейтрально, без рекомендаций и оценок окупаемости.")
+        return self
 
 
 def all_blocks(subjects: list[CourseSubject]) -> dict[str, ChangedBlock]:
@@ -338,6 +466,8 @@ class GapReport(Model):
     questions: list[str]
     business_coverage: float = Field(ge=0, le=1)
     science_coverage: float = Field(ge=0, le=1)
+    formula_breakdown: list[dict] = Field(default_factory=list)
+    coverage_parameters: dict | None = None
 
 
 class RelevanceDecision(Grounded):
@@ -358,10 +488,16 @@ class InterviewTurn(Model):
         return value
 
 
+Importance = Literal["core", "major", "standard", "minor"]
+
+
 class SubjectSuggestion(Grounded):
     name: str
     is_fundamental: bool
     conflict_with: str | None
+    # Прежние ответы модели могут содержать ранги.
+    importance: Importance = Field(default="standard", exclude=True, json_schema_extra=SERVER_ONLY)
+    importance_reason: str | None = Field(default=None, exclude=True, json_schema_extra=SERVER_ONLY)
 
 
 class SubjectPlan(Model):

@@ -3,8 +3,8 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
-from pathlib import Path
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
@@ -12,11 +12,28 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 
 MIGRATIONS = Path(__file__).resolve().parent / "migrations"
+DEFAULT_APP_DATABASE_URL = "postgresql://rpd@127.0.0.1:5432/rpd"
+LEGACY_CHECKPOINT_PATH = "data/checkpoints.sqlite"
 _MIGRATION_THREAD_LOCK = threading.Lock()
 
 
 class DatabaseSetupError(RuntimeError):
     """База приложения не готова, и автоматически подготовить её нельзя."""
+
+
+def run_async(coroutine):
+    """psycopg требует SelectorEventLoop на Windows."""
+    with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop if os.name == "nt" else None) as runner:
+        return runner.run(coroutine)
+
+
+def postgres_dsn(url: str) -> str:
+    parsed = make_url(url)
+    if parsed.drivername == "postgresql+asyncpg" and "ssl" in parsed.query:
+        parsed = parsed.difference_update_query(["ssl"]).update_query_dict({
+            "sslmode": parsed.query.get("sslmode", parsed.query["ssl"]),
+        })
+    return parsed.set(drivername="postgresql").render_as_string(hide_password=False)
 
 
 def sqlite_file(url: str) -> Path | None:
@@ -73,8 +90,13 @@ def migration_lock(url: str, timeout: float = 120):
 
 
 def make_engine(url: str) -> AsyncEngine:
+    parsed = make_url(url)
+    if parsed.drivername in {"postgres", "postgresql"}:
+        parsed = parsed.set(drivername="postgresql+psycopg")
+    elif parsed.drivername == "sqlite":
+        parsed = parsed.set(drivername="sqlite+aiosqlite")
     prepare_sqlite_folder(url)
-    return create_async_engine(url, pool_pre_ping=True)
+    return create_async_engine(parsed, pool_pre_ping=True)
 
 
 async def table_state(url: str) -> tuple[set[str], set[str]]:
@@ -102,18 +124,27 @@ def upgrade_schema(url: str) -> None:
     command.upgrade(config, "head")
 
 
-def ensure_schema(url: str) -> None:
-    """Создаёт таблицы приложения в пустой базе.
+async def managed_by_alembic(url: str) -> bool:
+    engine = make_engine(url)
+    try:
+        async with engine.connect() as connection:
+            return await connection.run_sync(lambda sync: inspect(sync).has_table("alembic_version"))
+    finally:
+        await engine.dispose()
 
-    Базу, где таблицы уже есть, функция не изменяет. Вызывать вне работающего цикла asyncio.
+
+def ensure_schema(url: str) -> None:
+    """Создаёт таблицы приложения в пустой базе и добавляет новые таблицы в базу под управлением Alembic.
+
+    Базу без alembic_version, где таблицы уже есть, функция не изменяет. Вызывать вне работающего цикла asyncio.
     """
-    if not asyncio.run(table_state(url))[0]:
+    if not run_async(table_state(url))[0]:
         return
     with migration_lock(url):
-        missing, present = asyncio.run(table_state(url))
+        missing, present = run_async(table_state(url))
         if not missing:
             return
-        if present:
+        if present and not run_async(managed_by_alembic(url)):
             raise DatabaseSetupError(
                 "В базе приложения есть только часть таблиц (нет: " + ", ".join(sorted(missing)) + "). "
                 "Укажите в APP_DATABASE_URL новую базу или восстановите эту из резервной копии."
@@ -121,11 +152,10 @@ def ensure_schema(url: str) -> None:
         try:
             upgrade_schema(url)
         except Exception as error:
-            # Другой процесс с иной базой блокировок (например, PostgreSQL) мог успеть раньше.
-            if asyncio.run(table_state(url))[0]:
+            if run_async(table_state(url))[0]:
                 raise DatabaseSetupError(
                     "Не удалось создать таблицы базы приложения. Проверьте APP_DATABASE_URL в .env "
-                    "и права на запись в папку базы."
+                    "и права на создание таблиц."
                 ) from error
 
 

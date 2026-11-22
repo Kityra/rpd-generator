@@ -45,7 +45,7 @@ from xml.etree import ElementTree
 
 import httpx
 
-from literature_catalog import references_for_discipline
+from literature_catalog import course_concepts, references_for_discipline
 
 logger = logging.getLogger(__name__)
 
@@ -2329,13 +2329,6 @@ class LiteratureParser:
         return [*textbooks, *articles]
 
 
-async def find_literature(topic: str, discipline: str, *, config: ParserConfig | None = None,
-                          transport: httpx.AsyncBaseTransport | None = None,
-                          llm_expander: LlmExpander | None = None) -> TopicLiterature:
-    async with LiteratureParser(config, transport=transport, llm_expander=llm_expander) as parser:
-        return await parser.find(topic, discipline)
-
-
 def yandex_llm_expander(settings: dict[str, str] | None = None) -> LlmExpander:
     """Расширение запросов академической моделью University в Yandex AI Studio."""
     schema = {"type": "object", "properties": {"terms": {"type": "array", "items": {"type": "string"}}},
@@ -2453,12 +2446,13 @@ async def enrich_course_program(program: dict, sources: dict[str, Any], *, parse
     """
     updated = copy.deepcopy(program)
     subjects = updated.get("subjects", [])
-    reinforcement_learning = any("подкреплением" in subject["title"].casefold() for subject in subjects)
+    # Контекст курса — понятия всех его дисциплин: каталог выбирает издание с учётом соседних дисциплин.
+    context = course_concepts([clean(subject["title"]) for subject in subjects])
     shared_topics = Counter(clean(topic["title"]).casefold() for subject in subjects for topic in subject.get("topics", []))
     curated = {}
     for subject in subjects:
         title = clean(subject["title"])
-        references = references_for_discipline(title, reinforcement_learning=reinforcement_learning)
+        references = references_for_discipline(title, course=context)
         if references:
             curated[title] = [LiteratureSource(ref.title, list(ref.authors), ref.kind, ref.year, ref.publisher,
                                                "Библиографическая запись автора или издателя", ref.pdf, ref.url, 1.0,

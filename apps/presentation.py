@@ -8,7 +8,7 @@ import streamlit as st
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
-from storage.database import make_engine
+from storage.database import make_engine, run_async
 from storage.models import Course
 
 
@@ -34,7 +34,7 @@ def portal_style():
 def portal_brand():
     portal_style()
     st.html('<div class="portal-brand"><span class="portal-mark" aria-hidden="true"></span>'
-            '<span>Проектирование курсов</span></div>')
+            '<span>Проектирование программ и курсов</span></div>')
 
 
 def status_badge(status: str) -> str:
@@ -83,7 +83,7 @@ def follow_course(url: str, course: Course):
     else:
         return
     try:
-        current = asyncio.run(_read_course_state(url, course.id, course.owner_user_id))
+        current = run_async(_read_course_state(url, course.id, course.owner_user_id))
     except (SQLAlchemyError, OSError):
         return
     if current != (course.status, course.updated_at):

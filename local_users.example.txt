@@ -1,0 +1,19 @@
+Локальные учётные записи для разработки и демо.
+Работают только при APP_ENV=development и заполненном LOCAL_USERS_FILE в .env.
+Скопируйте файл в data/local_users.txt (папка data не попадает в Git) и при желании смените пароли.
+Для рабочей среды используйте справочники Yandex: TEACHERS_INDEX_ID, EXPERTS_INDEX_ID, PROGRAM_HEADS_INDEX_ID.
+
+Логин: head@demo.local
+Пароль: demo-head-2026
+Имя: Руководитель программы (демо)
+Роль: руководитель
+
+Логин: teacher@demo.local
+Пароль: demo-teacher-2026
+Имя: Методист по теории графов (демо)
+Роль: методист курса
+
+Логин: expert@demo.local
+Пароль: demo-expert-2026
+Имя: Эксперт-практик (демо)
+Роль: эксперт

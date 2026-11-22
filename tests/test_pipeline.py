@@ -81,10 +81,11 @@ class RpdPipelineTests(unittest.TestCase):
         draft_schema = projected["properties"]["document"]
         self.assertEqual(draft_schema["required"], list(draft_schema["properties"]))
         self.assertFalse(draft_schema["additionalProperties"])
+        self.assertNotIn("workload", draft_schema["properties"])
 
     def test_repairs_schema_and_resumes_without_searching_again(self):
         invalid = json.loads(proposal())
-        invalid["document"]["workload"]["unknownField"] = 30
+        invalid["document"]["metadata"]["unknownField"] = 30
         generate = MagicMock(side_effect=[
             json.dumps(invalid), proposal(("Какую форму аттестации указать?", "|", ".")), proposal((".",)),
         ])
@@ -92,7 +93,7 @@ class RpdPipelineTests(unittest.TestCase):
         paused = graph.invoke({"request": REQUEST}, config=self.config)
         self.assertEqual(paused["__interrupt__"][0].value["questions"], ["Какую форму аттестации указать?"])
         retry_payload = json.loads(generate.call_args_list[1].args[1])
-        self.assertTrue(any("$.workload" in error for error in retry_payload["schemaErrors"]))
+        self.assertTrue(any("$.metadata" in error for error in retry_payload["schemaErrors"]))
         answer = "Зачёт."
         result = graph.invoke(Command(resume=answer), config=self.config)
         resume_payload = json.loads(generate.call_args_list[2].args[1])
@@ -100,6 +101,7 @@ class RpdPipelineTests(unittest.TestCase):
         self.assertCountEqual([call.args[0] for call in self.research.call_args_list], PROFILES)
         self.assertTrue(result["ready"])
         self.assertNotIn("sourceFiles", result["document"]["metadata"])
+        self.assertNotIn("workload", result["document"])
         Draft202012Validator(self.schema).validate(result["document"])
 
     def test_stops_after_three_unresolved_answers(self):
@@ -151,7 +153,7 @@ class RpdPipelineTests(unittest.TestCase):
                 )
                 graph = MagicMock()
 
-                def build(schema_path, research, generate, checkpointer=None, draft_first=False):
+                def build(schema_path, research, generate, checkpointer=None):
                     report = research("university", run_rpd.RpdRequest(**REQUEST))
                     self.assertEqual(report["fragments"], [])
                     self.assertEqual(report["findings"], [])
@@ -222,7 +224,7 @@ class SciencePipelineTests(unittest.TestCase):
                                    output_text=json.dumps(responses[name]))
 
         client.responses.create.side_effect = model
-        graph = run_rpd.create_rpd_graph(client, settings, draft_first=True)
+        graph = run_rpd.create_rpd_graph(client, settings)
         with patch.object(run_rpd, "find_course_articles", return_value=([article], [])):
             result = graph.invoke({"request": {**REQUEST, "facts": "Внутренние данные вуза"}},
                                   config={"configurable": {"thread_id": "science-in-rpd"}})

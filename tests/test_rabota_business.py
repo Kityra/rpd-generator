@@ -86,7 +86,7 @@ class RpdBusinessTests(unittest.TestCase):
         with patch.dict("os.environ", {"RABOTA_IT_DATABASE": str(database)}), \
              patch("orchestration.evidence_cache.snapshot_store"), \
              patch.object(run_rpd, "collect_recent_articles", return_value=[]):
-            graph = run_rpd.create_rpd_graph(client, settings, draft_first=True)
+            graph = run_rpd.create_rpd_graph(client, settings)
             outcome = graph.invoke(
                 {"request": {"discipline": "Python", "institution": "Вуз", "academic_year": "2026/27"}},
                 config={"configurable": {"thread_id": self.id()}},
@@ -122,6 +122,9 @@ class CourseBusinessTests(unittest.IsolatedAsyncioTestCase):
             seen[output.__name__] = (instructions, payload, context)
             if output.__name__ == "SubjectPlan":
                 return output.model_validate({"subjects": []})
+            if output.__name__ == "ProfessionEvidenceVerdicts":
+                return output.model_validate({"items": [{"pair_id": pair["pair_id"], "verdict": "supports"}
+                                                       for pair in payload["pairs"]]})
             ids = [item["source_id"] for item in payload["sources"] if item["source_type"] == "RabotaRu"]
             if output.__name__ == "AppliedActivityModel":
                 value = {"source_ids": ids, "processes": [], "aspects": [], "tasks": [{
@@ -147,10 +150,14 @@ class CourseBusinessTests(unittest.IsolatedAsyncioTestCase):
                 config={"configurable": {"thread_id": "course"}}, interrupt_before=["prepare_interview"],
             )
             self.assertEqual(state["status"], "gap_analysis")
-            self.assertEqual(state["gap_report"]["business_coverage"], 1.0)
+            coverage = state["gap_report"]
+            task = next(item for item in coverage["formula_breakdown"] if item["category"] == "work_task")
+            self.assertEqual(task["independent_sources_count"], 1)
+            self.assertEqual(task["independence_factor"], 0.5)
+            self.assertEqual(coverage["business_coverage"], task["final_score"])
             self.assertEqual(state["gap_report"]["science_coverage"], 0.0)
 
-        settings = SimpleNamespace(app_database_url="unused", checkpoint_url="unused",
+        settings = SimpleNamespace(app_database_url="unused", checkpoint_url="unused", public_origin="http://localhost:8501",
                                    business_coverage_threshold=0.6, science_coverage_threshold=0.6,
                                    literature_parser_enabled=False, public_vacancies_enabled=False)
         with patch.dict("os.environ", {"RABOTA_IT_DATABASE": str(self.path)}), \
