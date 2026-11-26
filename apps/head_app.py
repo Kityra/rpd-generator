@@ -4,7 +4,7 @@ from collections import Counter
 from html import escape
 
 import streamlit as st
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from activity import store
 from activity.config import load_config
@@ -16,8 +16,8 @@ from activity.program import PART_LABELS, RULE_LABELS, SIGNAL_LABELS, find_profe
 from activity.report import (CONFIDENCE_LABELS, DECISION_LABELS, DISCLAIMER, justification_document, model_document,
                              model_json, program_document, program_json)
 from apps.activity_ui import (demo_banner, kpis, needed_hint, quotes_html, status_bar, task_detail, task_label)
-from storage.activity_models import (ActivityExpert, ActivityMergeLog, ActivitySource, ExpertVote, Profession, Program,
-                                     ProgramDiscipline, Recommendation)
+from storage.activity_models import (ActivityExpert, ActivityMergeLog, ActivitySource, ExpertVote, ModelVersionRow,
+                                     Profession, Program, ProgramDiscipline, Recommendation)
 
 
 SCREENS = {"professions": ("Профессии", ":material/work:"), "model": ("Модель деятельности", ":material/account_tree:"),
@@ -28,15 +28,13 @@ SCREENS = {"professions": ("Профессии", ":material/work:"), "model": ("
 DOC_TYPES = ("employer_doc", "expert", "forecast", "science", "rpd")
 
 
-async def professions_list(factory):
+async def professions_list(db):
+    return (await db.scalars(select(Profession).order_by(Profession.is_demo.desc(), Profession.name))).all()
+
+
+async def choose_profession(factory) -> Profession | None:
     async with factory() as db:
-        rows = (await db.scalars(select(Profession).order_by(Profession.is_demo.desc(), Profession.name))).all()
-        versions = {row.id: await store.latest_version(db, row.id) for row in rows}
-        experts = Counter((await db.scalars(select(ActivityExpert.profession_id))).all())
-    return rows, versions, experts
-
-
-def choose_profession(rows) -> Profession | None:
+        rows = await professions_list(db)
     if not rows:
         st.info("Профессий пока нет. Создайте её на экране «Профессии».")
         return None
@@ -51,10 +49,16 @@ def choose_profession(rows) -> Profession | None:
 async def screen_professions(actor, factory):
     st.header("Профессии")
     st.caption("Модели деятельности профессий доступны методистам.")
-    rows, versions, experts = await professions_list(factory)
+    async with factory() as db:
+        rows = await professions_list(db)
+        summaries = store.latest_versions_query().with_only_columns(
+            ModelVersionRow.profession_id, ModelVersionRow.number, ModelVersionRow.as_of, ModelVersionRow.counts)
+        versions = {row.profession_id: row for row in await db.execute(summaries)}
+        counts = select(ActivityExpert.profession_id, func.count()).group_by(ActivityExpert.profession_id)
+        experts = dict((await db.execute(counts)).all())
     for offset in range(0, len(rows), 2):
         for column, row in zip(st.columns(2, gap="medium"), rows[offset:offset + 2]):
-            version = versions[row.id]
+            version = versions.get(row.id)
             with column.container(border=True, key=f"portal-card-profession-{row.id}"):
                 st.subheader(row.name)
                 details = [row.region or "регион не указан", f"горизонт {row.horizon_years} г.",
@@ -86,9 +90,8 @@ async def screen_professions(actor, factory):
                 st.rerun()
 
 
-async def screen_model(actor, factory):
-    rows, _, _ = await professions_list(factory)
-    profession = choose_profession(rows)
+async def screen_model(factory):
+    profession = await choose_profession(factory)
     if profession is None:
         return
     demo_banner(profession.is_demo)
@@ -99,7 +102,7 @@ async def screen_model(actor, factory):
     if action.button("Пересчитать модель", icon=":material/refresh:", width="stretch",
                      help="Пересчёт по текущим источникам, голосам и config/activity_model.yaml"):
         with st.spinner("Считаем метрики, статусы и тренды"):
-            await store.link_claims(factory, profession.id, actor.id)
+            await store.link_claims(factory, profession.id)
             await store.build_version(factory, profession.id)
         st.rerun()
     if version is None:
@@ -198,7 +201,7 @@ async def screen_model(actor, factory):
                 st.write(f"«{names.get(change['id'], change['id'])}»: тренд {TREND_LABELS[change['from']]} → {TREND_LABELS[change['to']]}")
 
 
-async def run_extraction(factory, actor, profession, source_ids: list[str]):
+async def run_extraction(factory, profession, source_ids: list[str]):
     llm = extractor(factory)
     notes = []
     progress = st.progress(0.0, text="Извлекаем утверждения")
@@ -207,15 +210,14 @@ async def run_extraction(factory, actor, profession, source_ids: list[str]):
         notes.extend(result.get("notes") or [])
         progress.progress(index / len(source_ids), text=f"Обработано источников: {index} из {len(source_ids)}")
     progress.progress(1.0, text="Связываем формулировки и пересчитываем модель")
-    await store.link_claims(factory, profession.id, actor.id)
+    await store.link_claims(factory, profession.id)
     await store.build_version(factory, profession.id)
     for note in dict.fromkeys(notes):
         st.warning(note)
 
 
 async def screen_sources(actor, factory):
-    rows, _, _ = await professions_list(factory)
-    profession = choose_profession(rows)
+    profession = await choose_profession(factory)
     if profession is None:
         return
     demo_banner(profession.is_demo)
@@ -240,7 +242,7 @@ async def screen_sources(actor, factory):
                 factory, actor, profession.id, "standard", f"ПС {code}".strip() if code else (upload.name if upload else "Профстандарт"),
                 content, origin_key=f"Минтруд России: ПС {code}", standard_code=code.strip() or None,
                 standard_year=int(year), published_at=approved)
-            await run_extraction(factory, actor, profession, [source_id])
+            await run_extraction(factory, profession, [source_id])
             st.toast("Профстандарт разобран")
     with tab_vacancies, st.form("vacancies"):
         st.caption("JSON или CSV: employer, title, published_at (ГГГГ-ММ-ДД), url, а также text или duties + requirements. "
@@ -257,7 +259,7 @@ async def screen_sources(actor, factory):
                 if new:
                     created.append(source_id)
             if created:
-                await run_extraction(factory, actor, profession, created)
+                await run_extraction(factory, profession, created)
             st.toast(f"Новых вакансий: {len(created)}")
     with tab_documents, st.form("documents"):
         st.caption("Документы работодателей, интервью с представителями профессии, прогнозы, публикации, РПД других вузов.")
@@ -273,7 +275,7 @@ async def screen_sources(actor, factory):
             content = read_document(upload.name, upload.getvalue()) if upload else text
             source_id, _ = await store.add_source(factory, actor, profession.id, kind, title or (upload.name if upload else ""),
                                                   content, origin_key=origin or title, url=url, published_at=published)
-            await run_extraction(factory, actor, profession, [source_id])
+            await run_extraction(factory, profession, [source_id])
             st.toast("Документ разобран")
     async with factory() as db:
         sources = (await db.scalars(select(ActivitySource).where(ActivitySource.profession_id == profession.id)
@@ -291,14 +293,13 @@ async def screen_sources(actor, factory):
             llm = extractor(factory)
             for source in failed:
                 await store.retry_extraction(factory, source.id, profession.name, llm)
-            await store.link_claims(factory, profession.id, actor.id)
+            await store.link_claims(factory, profession.id)
             await store.build_version(factory, profession.id)
             st.rerun()
 
 
 async def screen_experts(actor, factory, users):
-    rows, _, _ = await professions_list(factory)
-    profession = choose_profession(rows)
+    profession = await choose_profession(factory)
     if profession is None:
         return
     demo_banner(profession.is_demo)
@@ -319,7 +320,7 @@ async def screen_experts(actor, factory, users):
     left, right = st.columns([1.2, 1], gap="large")
     with left:
         st.subheader("Пригласить экспертов")
-        directory = [user for user in await users.list_experts()]
+        directory = await users.list_experts()
         invited = {e.user_id for e in experts}
         options = [user for user in directory if user.id not in invited]
         chosen = st.multiselect("Эксперты из справочника", options, format_func=lambda user: user.display_name,
@@ -471,7 +472,8 @@ async def recommendation_card(actor, factory, rec: dict, row: Recommendation | N
 
 async def screen_program(actor, factory, users):
     st.header("Моя программа")
-    professions, _, _ = await professions_list(factory)
+    async with factory() as db:
+        professions = await professions_list(db)
     programs = await head_programs(actor, factory)
     if not programs:
         st.info("Создайте программу: укажите, кого она готовит, и добавьте дисциплины.")
@@ -480,8 +482,9 @@ async def screen_program(actor, factory, users):
     ids = [program.id for program in programs]
     if st.session_state.get("program_id") not in ids:
         st.session_state["program_id"] = ids[0]
-    program = next(p for p in programs if p.id == st.selectbox("Программа", ids, key="program_id",
-                                                              format_func={p.id: p.name for p in programs}.get))
+    names = {p.id: p.name for p in programs}
+    chosen = st.selectbox("Программа", ids, key="program_id", format_func=names.get)
+    program = next(p for p in programs if p.id == chosen)
     demo_banner(program.is_demo)
     async with factory() as db:
         disciplines = (await db.scalars(select(ProgramDiscipline).where(ProgramDiscipline.program_id == program.id)
@@ -580,7 +583,7 @@ async def screen_program(actor, factory, users):
                    "чтобы увидеть, сколько из них покрыто полностью.")
         st.html(matrix_html(analysis, disciplines))
         st.subheader("Покрытие по дисциплинам")
-        models = {pid: content for pid, content in (await latest_models(factory)).items()}
+        models = await latest_models(factory)
         for d in disciplines:
             links = analysis["links"].get(d.id, {})
             with st.expander(f"{d.name} · {len(links)} {plural(len(links), 'задача', 'задачи', 'задач')} · "
@@ -607,9 +610,8 @@ async def latest_models(factory) -> dict[str, dict]:
         return await store.latest_contents(db)
 
 
-async def screen_signal(actor, factory):
-    rows, _, _ = await professions_list(factory)
-    profession = choose_profession(rows)
+async def screen_signal(factory):
+    profession = await choose_profession(factory)
     if profession is None:
         return
     demo_banner(profession.is_demo)
@@ -620,8 +622,8 @@ async def screen_signal(actor, factory):
         st.info("Модель ещё не собрана.")
         return
     signal = content["profile_signal"]
-    css = {"risk": "risk", "transforming": "transforming", "stable": "stable"}[signal["label"]]
-    lines = signal_lines(signal, content)
+    css = escape(signal["label"])
+    lines = signal_lines(signal)
     st.html(f'<div class="am-signal am-signal--{css}"><h3>{escape(SIGNAL_LABELS[signal["label"]])}</h3>'
             f'<div class="am-muted">{escape(DISCLAIMER)}</div></div>')
     config = load_config()["profile_signal"]
@@ -703,8 +705,7 @@ def knowledge_map(models: dict[str, dict]) -> None:
 
 
 async def screen_queue(actor, factory):
-    rows, _, _ = await professions_list(factory)
-    profession = choose_profession(rows)
+    profession = await choose_profession(factory)
     if profession is None:
         return
     demo_banner(profession.is_demo)
@@ -795,8 +796,7 @@ async def screen_queue(actor, factory):
 async def screen_export(actor, factory):
     st.header("Экспорт")
     models = await latest_models(factory)
-    rows, _, _ = await professions_list(factory)
-    profession = choose_profession(rows)
+    profession = await choose_profession(factory)
     if profession is not None and profession.id in models:
         content = models[profession.id]
         demo_banner(profession.is_demo)
@@ -856,7 +856,7 @@ async def render_management(actor, factory, users):
     if screen == "professions":
         await screen_professions(actor, factory)
     elif screen == "model":
-        await screen_model(actor, factory)
+        await screen_model(factory)
     elif screen == "sources":
         await screen_sources(actor, factory)
     elif screen == "experts":
@@ -864,7 +864,7 @@ async def render_management(actor, factory, users):
     elif screen == "program":
         await screen_program(actor, factory, users)
     elif screen == "signal":
-        await screen_signal(actor, factory)
+        await screen_signal(factory)
     elif screen == "queue":
         await screen_queue(actor, factory)
     else:

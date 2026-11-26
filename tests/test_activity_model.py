@@ -8,7 +8,6 @@ import tempfile
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 from activity import engine
 from activity.config import load_config

@@ -167,7 +167,6 @@ def analyse_market(program: dict, dataset: MarketDataset | None, activity: dict 
                                                           "вакансиями (шаблон в templates/) либо дождитесь поиска вакансий."])
     config = load_market_config()["thresholds"]
     skills_dictionary = dictionary(dataset)
-    # Частоты навыков по вакансиям выборки.
     occurrences: dict[str, set[str]] = {}
     original_tags: dict[str, set[str]] = {}
     # Сначала зарегистрировать все явные теги, чтобы распознавать их и в тексте других карточек.
@@ -193,7 +192,12 @@ def analyse_market(program: dict, dataset: MarketDataset | None, activity: dict 
     tasks = (activity or {}).get("tasks", [])
     overrides = overrides or {}
     subjects = program.get("subjects", [])
-    texts = {subject["title"]: _subject_texts(subject) for subject in subjects}
+    texts = {}
+    for subject in subjects:
+        title, topics, assignments = _subject_texts(subject)
+        texts[subject["title"]] = tokens(title), [(label, tokens(text)) for label, text in topics], tokens(assignments)
+    task_texts = [(task["title"], tokens(" ".join([task["title"], *task.get("stack", [])]))) for task in tasks]
+    credits = {"full": 1.0, "partial": config["partial_credit"], "none": 0.0}
     rows = []
     for name in names:
         item = declared.get(name)
@@ -209,8 +213,7 @@ def analyse_market(program: dict, dataset: MarketDataset | None, activity: dict 
             critical, base = False, 0.5
         variants = skills_dictionary.aliases.get(name, [tuple(tokens(name))])
 
-        def mentions(text: str) -> bool:
-            words = tokens(text)
+        def mentions(words: list[str]) -> bool:
             return any(_contains(words, variant) for variant in variants)
 
         full_subjects, topics, partial_subjects = [], [], []
@@ -221,26 +224,24 @@ def analyse_market(program: dict, dataset: MarketDataset | None, activity: dict 
                 topics.extend(hit_topics)
             elif mentions(assignments):
                 partial_subjects.append(title)
-        linked_tasks = [task["title"] for task in tasks if mentions(" ".join([task["title"], *task.get("stack", [])]))]
+        linked_tasks = [title for title, words in task_texts if mentions(words)]
         linked_tasks += [task for task in (item.tasks if item else []) if task not in linked_tasks]
         manual = name in overrides
         if manual:
             full_subjects = [title for title in overrides[name] if title in texts]
             partial_subjects = []
         level = "full" if full_subjects else ("partial" if partial_subjects else "none")
-        credit = {"full": 1.0, "partial": config["partial_credit"], "none": 0.0}[level]
         rows.append(SkillCoverage(skill=name, vacancies=vacancies, share=round(share, 3) if share is not None else None,
                                   weight=weight, critical=critical, level=level,
                                   subjects=full_subjects or partial_subjects, topics=topics, tasks=linked_tasks,
-                                  priority=round(base * (1 - credit), 3), manual=manual, vacancy_ids=ids,
+                                  priority=round(base * (1 - credits[level]), 3), manual=manual, vacancy_ids=ids,
                                   raw_skills=sorted(original_tags.get(name, set())) or [item.name if item else name]))
     rows.sort(key=lambda row: (-row.priority, not row.critical, row.skill))
     covered_subjects = {title for row in rows if row.level != "none" for title in row.subjects}
     weak = [subject["title"] for subject in subjects if subject["title"] not in covered_subjects
             and not any(topic.get("activity_task_ids") for topic in subject.get("topics", []))]
     scored = [row for row in rows if row.critical] or rows
-    credit = {"full": 1.0, "partial": config["partial_credit"], "none": 0.0}
-    fit = round(sum(credit[row.level] for row in scored) / len(scored), 3) if scored else None
+    fit = round(sum(credits[row.level] for row in scored) / len(scored), 3) if scored else None
     task_scores: dict[str, dict] = {}
     for row in rows:
         for task in row.tasks:

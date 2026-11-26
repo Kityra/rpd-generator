@@ -201,7 +201,7 @@ def model_document(content: dict) -> Doc:
     doc.h(1, "Сигнал по профилю")
     signal = content["profile_signal"]
     doc.p(SIGNAL_LABELS[signal["label"]] + ".")
-    doc.ul(signal_lines(signal, content))
+    doc.ul(signal_lines(signal))
     doc.note(DISCLAIMER)
     diff = content.get("diff") or {}
     doc.h(1, "Изменения с прошлой версии")
@@ -255,7 +255,7 @@ def program_document(program: dict, analysis: dict, decisions: list[dict], model
     for model in models.values():
         signal = model["profile_signal"]
         doc.p(f"«{model['profession']['name']}»: {SIGNAL_LABELS[signal['label']].lower()}.")
-        doc.ul(signal_lines(signal, model))
+        doc.ul(signal_lines(signal))
     doc.note(DISCLAIMER)
     doc.h(1, "Как разрабатывать программу")
     doc.ul([step.format(n_min=load_config()["experts"]["n_min"]) for step in METHOD_STEPS])

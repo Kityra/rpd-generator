@@ -500,12 +500,10 @@ async def seed_experts(factory, actor, profession_id: str, today: date) -> None:
             row.cards = {**(row.cards or {}), "2": [proposal.id] if expert in voters else [k8s]}
 
 
-async def seed_adjacent(factory, actor, today: date) -> dict[str, str]:
-    result = {}
+async def seed_adjacent(factory, actor, today: date) -> None:
     for offset, (name, spec) in enumerate(ADJACENT.items()):
         rng = random.Random(SEED + 10 + offset)
         profession_id = await store.create_profession(factory, actor, name, "Россия", 3, [], is_demo=True)
-        result[name] = profession_id
         await add_vacancies(factory, actor, profession_id, name, [(line, share, share * 0.8) for line, share in spec["duties"]],
                             spec["employers"], spec["titles"], spec["requirements"], today, rng)
         document = "\n".join([f"ДЕМО. Описание должности «{name}» от работодателя.", "Обязанности:",
@@ -517,10 +515,9 @@ async def seed_adjacent(factory, actor, today: date) -> dict[str, str]:
         await store.extract_source(factory, source_id, name)
         await store.link_claims(factory, profession_id)
         await store.build_version(factory, profession_id, today)
-    return result
 
 
-async def seed_program(factory, actor, profession_id: str, teacher: str, today: date) -> str:
+async def seed_program(factory, actor, profession_id: str, teacher: str) -> str:
     program_id = await store.create_program(
         factory, actor, "Программная инженерия: бэкенд-разработка (ДЕМО)", level="bachelor", total_zet=240,
         institution="ДЕМО-университет", academic_year="2026/2027",
@@ -557,7 +554,7 @@ async def run(head_login: str, teacher_login: str, expert_login: str, do_reset: 
         await seed_adjacent(factory, actor, today)
         await store.build_version(factory, backend, today)
         await store.invite_expert(factory, actor, backend, user_id("expert", expert_login))
-        program_id = await seed_program(factory, actor, backend, user_id("teacher", teacher_login), today)
+        program_id = await seed_program(factory, actor, backend, user_id("teacher", teacher_login))
         async with factory() as db:
             version = await store.latest_version(db, backend)
         statuses = version.counts["statuses"]

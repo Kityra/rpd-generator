@@ -1,8 +1,4 @@
-"""Tables of the profession activity model and of the educational programme (migration 0004).
-
-IDs are UUID strings, as elsewhere in the project. The module is imported at the end of storage/models.py,
-so Base.metadata contains these tables.
-"""
+"""Tables for profession activity models and educational programmes."""
 
 from datetime import datetime
 
@@ -20,9 +16,8 @@ class Profession(Base):
     horizon_years: Mapped[int] = mapped_column(Integer, default=3)
     standard_codes: Mapped[list] = mapped_column(JsonType, default=list)
     status: Mapped[str] = mapped_column(String(30), default="draft")
-    # Demo data is labelled on every screen and export.
     is_demo: Mapped[bool] = mapped_column(Boolean, default=False)
-    # {"delphi_round": 1|2, "market_totals": {"now": int, "prev": int, "source": str}}
+    # Stores the current Delphi round and the market sample sizes for both periods.
     meta: Mapped[dict] = mapped_column(JsonType, default=dict)
     created_by: Mapped[str] = mapped_column(String(256), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
@@ -46,7 +41,7 @@ class ActivitySource(Base):
     # Professional standard code and approval year (type=standard).
     standard_code: Mapped[str | None] = mapped_column(String(40))
     standard_year: Mapped[int | None] = mapped_column(Integer)
-    # {"extraction": "done" | "failed", "extraction_error": str, "region": str, "added_by": str}
+    # Stores extraction status and provenance alongside the source.
     meta: Mapped[dict] = mapped_column(JsonType, default=dict)
 
 

@@ -62,6 +62,9 @@ RETRYABLE_OUTCOMES = frozenset({"timeout", "circuit_open", "network_error", "una
 GAP_QUERY_LABELS = {"missing_tasks": "рабочие задачи и процессы", "missing_stack": "инструменты",
                     "missing_artifacts": "результаты работы", "missing_quality_criteria": "критерии качества",
                     "conflicting_evidence": "проверка утверждений по источникам"}
+BUSINESS_SOURCE_TYPES = frozenset({"Priklad", "HH", SOURCE}) | VACANCY_SOURCE_TYPES
+VOLATILE_SOURCE_FIELDS = frozenset({"retrieved_at", "relevance_score"})
+SOURCE_METADATA_FIELDS = ("parent_document_id", "publication_year")
 
 
 def is_truncated(error: Exception) -> bool:
@@ -69,12 +72,6 @@ def is_truncated(error: Exception) -> bool:
     if classify_outcome(error) == "truncated":
         return True
     return isinstance(error, ValidationError) and any(item["type"] == "json_invalid" for item in error.errors())
-BUSINESS_SOURCE_TYPES = frozenset({"Priklad", "HH", SOURCE}) | VACANCY_SOURCE_TYPES
-
-
-
-VOLATILE_SOURCE_FIELDS = frozenset({"retrieved_at", "relevance_score"})
-SOURCE_METADATA_FIELDS = ("parent_document_id", "publication_year")
 
 
 def merge_records(previous: list[dict], additions: list[dict]) -> list[dict]:
@@ -380,10 +377,12 @@ def subject_request(state: GraphState, names: list[str], suggestions: list[dict]
     plan = [item for item in suggestions if " ".join(item["name"].casefold().split()) in keys]
     terms = concepts(" ".join(names))
     tasks = state.get("applied_activity", {}).get("tasks", [])
-    ranked = sorted(tasks, key=lambda task: weights.for_references(task.get("source_ids", []), sources)
-                    * len(terms & concepts(" ".join([task["title"], *task.get("stack", [])]))), reverse=True)
-    chosen = [task for task in ranked if terms & concepts(" ".join([task["title"], *task.get("stack", [])]))]
-    chosen = (chosen or ranked[:3])[:SUBJECT_TASK_LIMIT]
+    ranked = [(task, len(terms & concepts(" ".join([task["title"], *task.get("stack", [])])))) for task in tasks]
+    ranked.sort(key=lambda entry: weights.for_references(entry[0].get("source_ids", []), sources) * entry[1],
+                reverse=True)
+    chosen = [task for task, matches in ranked if matches][:SUBJECT_TASK_LIMIT]
+    if not chosen:
+        chosen = [task for task, _ in ranked[:3]]
     judge_unavailable = state.get("profession_profile", {}).get("judge_unavailable", False)
     scope = negative_scope(state.get("profession_boundaries", []))
     hint = (outline_hint(state["course_meta"]["title"], names[0], suggestions, ctx)
@@ -394,14 +393,15 @@ def subject_request(state: GraphState, names: list[str], suggestions: list[dict]
     cited += [key for block in ctx.get("revision_blocks", {}).values() for key in block.source_ids]
     if ctx.get("manual_subject_source_id"):
         cited.append(ctx["manual_subject_source_id"])
-    others = sorted((source for key, source in sources.items() if source.source_type != "Interview"),
-                    key=lambda source: -len(terms & concepts(f"{source.title} {source.content[:2000]}")))
+    source_matches = {key: len(terms & concepts(f"{source.title} {source.content[:2000]}"))
+                      for key, source in sources.items() if source.source_type != "Interview"}
+    others = sorted(source_matches, key=source_matches.__getitem__, reverse=True)
     selected = list(dict.fromkeys([key for key in cited if key in sources and sources[key].source_type != "Interview"]
-                                  + [source.source_id for source in others]))
+                                  + [sources[key].source_id for key in others]))
     if weights.customized:
         cited_ids = set(cited)
         selected.sort(key=lambda key: weights.for_source(sources[key]) * (
-            1 + len(terms & concepts(f"{sources[key].title} {sources[key].content[:2000]}")) + 2 * (key in cited_ids)),
+            1 + source_matches[key] + 2 * (key in cited_ids)),
                       reverse=True)
     selected = selected[:SUBJECT_SOURCE_LIMIT]
     conflicts = state.get("source_conflicts", [])

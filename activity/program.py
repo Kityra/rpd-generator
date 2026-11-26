@@ -6,6 +6,7 @@
 
 import hashlib
 import json
+from collections import Counter
 from dataclasses import dataclass, field
 
 from orchestration.semantic_check import concepts
@@ -114,12 +115,18 @@ def topic_shares(discipline: Discipline, covered: dict[str, dict]) -> tuple[dict
     """Доли содержания по задачам и доля тем без связи. Каждая тема имеет одинаковый вес."""
     topics = discipline.topics or (discipline.name,)
     per_topic = 1 / len(topics)
-    members = {index: [key for key, link in covered.items() if index in link["topics"]] for index in range(len(topics))}
-    floating = [key for key, link in covered.items() if not any(key in group for group in members.values())]
+    members: dict[int, list[str]] = {index: [] for index in range(len(topics))}
+    floating = []
+    for key, link in covered.items():
+        indexes = members.keys() & link["topics"]
+        if not indexes:
+            floating.append(key)
+        for index in indexes:
+            members[index].append(key)
     if floating:
         empty = [index for index, group in members.items() if not group] or list(members)
         for index in empty:
-            members[index] = members[index] + floating
+            members[index].extend(floating)
     shares = dict.fromkeys(covered, 0.0)
     nothing = 0.0
     for group in members.values():
@@ -131,6 +138,10 @@ def topic_shares(discipline: Discipline, covered: dict[str, dict]) -> tuple[dict
     return shares, nothing
 
 
+def _covered_task_keys(links: dict[str, dict]) -> set[str]:
+    return {key for discipline_links in links.values() for key in discipline_links}
+
+
 def analyse(program: ProgramInput, all_models: dict[str, dict] | None = None, config: dict | None = None,
             areas: list[dict] | None = None) -> dict:
     """Покрытие дисциплин, рекомендации R1–R5 и R7 и баланс ЗЕТ."""
@@ -139,7 +150,6 @@ def analyse(program: ProgramInput, all_models: dict[str, dict] | None = None, co
     area_dictionary = AreaDictionary(areas or load_areas())
     all_models = all_models or program.models
     weights = {profession_id: weight for profession_id, weight in program.targets if profession_id in program.models}
-    # Покрытие каждой задачи каждой целевой профессии.
     links: dict[str, dict[str, dict]] = {d.id: {} for d in program.disciplines}
     tasks: dict[str, tuple[str, dict]] = {}
     for profession_id in weights:
@@ -152,10 +162,7 @@ def analyse(program: ProgramInput, all_models: dict[str, dict] | None = None, co
                 link = coverage(discipline, task, config, program.overrides.get((discipline.id, task["id"])))
                 if link:
                     links[discipline.id][key] = link
-    covered_by: dict[str, list[str]] = {}
-    for discipline_id, covered in links.items():
-        for key in covered:
-            covered_by.setdefault(key, []).append(discipline_id)
+    covered_tasks = _covered_task_keys(links)
     topic_coverage = {d.id: topic_shares(d, links[d.id]) for d in program.disciplines}
     by_id = {d.id: d for d in program.disciplines}
     recommendations = []
@@ -233,7 +240,7 @@ def analyse(program: ProgramInput, all_models: dict[str, dict] | None = None, co
                 continue
             members = [model["tasks"][task_id] for task_id in function["tasks"]]
             uncovered = [task for task in members if task["status"] in ELIGIBLE
-                         and f"{profession_id}:{task['id']}" not in covered_by]
+                         and f"{profession_id}:{task['id']}" not in covered_tasks]
             share = weight * sum(task["priority"] for task in uncovered) / total
             if not uncovered or share < rules["new_discipline_min_share"] - 1e-9:
                 continue
@@ -265,20 +272,30 @@ def analyse(program: ProgramInput, all_models: dict[str, dict] | None = None, co
 
     # R2. Обновить: добавить растущие и новые задачи функции, заменить отклонённое, исчезающее, автоматизируемое.
     # Растущую задачу функции рекомендуем той дисциплине, которая покрывает больше всего задач этой функции.
-    owners: dict[tuple[str, str], str] = {}
-    for function_key in {(owner, task["function_id"]) for owner, task in tasks.values()}:
-        counts = {d.id: sum(1 for key in links[d.id] if (tasks[key][0], tasks[key][1]["function_id"]) == function_key
-                            and tasks[key][1]["status"] in ELIGIBLE) for d in program.disciplines}
-        best = max(sorted(counts), key=lambda d_id: counts[d_id], default=None)
-        if best is not None and counts[best]:
-            owners[function_key] = best
+    owners: dict[tuple[str, str], tuple[int, str]] = {}
+    for discipline_id in sorted(links):
+        counts: Counter[tuple[str, str]] = Counter()
+        for key in links[discipline_id]:
+            profession_id, task = tasks[key]
+            if task["status"] in ELIGIBLE:
+                counts[profession_id, task["function_id"]] += 1
+        for function_key, count in counts.items():
+            previous = owners.get(function_key)
+            if previous is None or count > previous[0]:
+                owners[function_key] = (count, discipline_id)
+    additions: dict[str, list[str]] = {}
+    for key, (profession_id, task) in tasks.items():
+        if (key in covered_tasks or task["function_id"] == OTHER_FUNCTION
+                or task["status"] not in ELIGIBLE or task["trend"] not in ("new", "growing")):
+            continue
+        owner = owners.get((profession_id, task["function_id"]))
+        if owner is not None:
+            additions.setdefault(owner[1], []).append(key)
     for discipline in program.disciplines:
         if discipline.id in removed:
             continue  # дисциплину предлагается убрать (R3): обновлять её незачем
         covered = links[discipline.id]
-        add = [key for key, (profession_id, task) in tasks.items()
-               if owners.get((profession_id, task["function_id"])) == discipline.id and task["function_id"] != OTHER_FUNCTION
-               and task["status"] in ELIGIBLE and task["trend"] in ("new", "growing") and key not in covered_by]
+        add = additions.get(discipline.id, [])
         replace = [key for key in covered if tasks[key][1]["status"] == "rejected"
                    or tasks[key][1]["trend"] in ("disappearing", "automated")]
         if add:
@@ -336,9 +353,8 @@ def analyse(program: ProgramInput, all_models: dict[str, dict] | None = None, co
         signal = model["profile_signal"]
         if signal["label"] == "stable":
             continue
-        lines = signal_lines(signal, model)
-        for successor in adjacent(program, profession_id, all_models, links, config):
-            lines.append(successor)
+        lines = signal_lines(signal)
+        lines.extend(adjacent(program, profession_id, all_models, config))
         recommendations.append(recommendation(
             "R7", model["profession"]["name"], f"{SIGNAL_LABELS[signal['label']]}: «{model['profession']['name']}».",
             lines + ["Вакансии запаздывают, эксперты дают опережающий сигнал. Это повод для обсуждения, а не приговор."],
@@ -351,9 +367,9 @@ def analyse(program: ProgramInput, all_models: dict[str, dict] | None = None, co
     frees = sum(rec["zet"]["frees"] for rec in recommendations)
     needs = sum(rec["zet"]["needs"] for rec in recommendations)
     disciplines_zet = sum(d.zet for d in program.disciplines)
-    matrix = coverage_matrix(program, weights, tasks, links)
+    matrix = coverage_matrix(program, weights, links)
     return {"recommendations": recommendations, "matrix": matrix,
-            "links": {d_id: covered for d_id, covered in links.items()},
+            "links": links,
             "unlinked_topic_share": {key: unlinked for key, (_, unlinked) in topic_coverage.items()},
             "protected": sorted(protected),
             "balance": {"frees": frees, "needs": needs, "disciplines_zet": disciplines_zet,
@@ -368,7 +384,7 @@ def recommendation(rule: str, target: str, action: str, lines: list[str], tasks:
             "weight": round(weight if weight is not None else sum(task["priority"] for task in tasks), 4)}
 
 
-def signal_lines(signal: dict, model: dict) -> list[str]:
+def signal_lines(signal: dict) -> list[str]:
     market, tasks, experts = signal["market"], signal["tasks"], signal["experts"]
     lines = []
     if market["value"] is None:
@@ -390,16 +406,16 @@ def signal_lines(signal: dict, model: dict) -> list[str]:
     return lines
 
 
-def adjacent(program: ProgramInput, profession_id: str, all_models: dict[str, dict], links: dict, config: dict) -> list[str]:
+def adjacent(program: ProgramInput, profession_id: str, all_models: dict[str, dict], config: dict) -> list[str]:
     """Сколько содержания программы сохраняется при переходе на смежную роль и что добавить (R1 относительно X)."""
-    signal = program.models[profession_id]["profile_signal"]
     target = program.models[profession_id]
-    names = [item["name"] for item in signal["successors"]]
+    signal = target["profile_signal"]
     lines = []
-    for name in names:
+    for successor in signal["successors"]:
+        name = successor["name"]
         model = find_profession(all_models, name, profession_id, config)
         if model is None:
-            count = next(item["count"] for item in signal["successors"] if item["name"] == name)
+            count = successor["count"]
             lines.append(f"Постройте модель деятельности для «{name}» (назвали {count} из {signal['successors_answered']} экспертов).")
             continue
         retained = retention(target, model, config)
@@ -447,20 +463,22 @@ def retention(target: dict, other: dict, config: dict) -> float | None:
     return kept / total
 
 
-def coverage_matrix(program: ProgramInput, weights: dict, tasks: dict, links: dict) -> list[dict]:
+def coverage_matrix(program: ProgramInput, weights: dict, links: dict) -> list[dict]:
     """Матрица «дисциплины × функции»: сколько подтверждённых задач функции покрыто дисциплиной."""
     rows = []
+    discipline_links = {discipline.id: links[discipline.id] for discipline in program.disciplines}
+    covered_tasks = _covered_task_keys(discipline_links)
     for profession_id in weights:
         model = program.models[profession_id]
         for function in model["functions"]:
             eligible = [task_id for task_id in function["tasks"] if model["tasks"][task_id]["status"] in ELIGIBLE]
+            eligible_keys = [f"{profession_id}:{task_id}" for task_id in eligible]
             cells = {}
-            for discipline in program.disciplines:
-                keys = [f"{profession_id}:{task_id}" for task_id in eligible if f"{profession_id}:{task_id}" in links[discipline.id]]
-                cells[discipline.id] = {"covered": len(keys),
-                                        "full": sum(links[discipline.id][key]["coverage"] == "full" for key in keys)}
-            covered = {task_id for task_id in eligible if any(
-                f"{profession_id}:{task_id}" in links[d.id] for d in program.disciplines)}
+            for discipline_id, coverage_links in discipline_links.items():
+                matches = [coverage_links[key] for key in eligible_keys if key in coverage_links]
+                cells[discipline_id] = {"covered": len(matches),
+                                        "full": sum(link["coverage"] == "full" for link in matches)}
+            covered = covered_tasks.intersection(eligible_keys)
             rows.append({"profession_id": profession_id, "profession": model["profession"]["name"],
                          "function_id": function["id"], "function": function["name"], "eligible": len(eligible),
                          "covered": len(covered), "cells": cells,

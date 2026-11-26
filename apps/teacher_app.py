@@ -247,7 +247,7 @@ def course_context(meta):
     return " · ".join(str(meta[key]) for key in ("institution", "year") if meta.get(key))
 
 
-async def expert_actions(actor, settings, factory, users, course, interview):
+async def expert_actions(actor, settings, factory, users, interview):
     st.subheader("Интервью эксперта")
     with st.chat_message("assistant"):
         st.write(interview.gap_report["prompt"])
@@ -425,7 +425,7 @@ async def course_detail(actor, settings, factory, users, course, notices):
                             st.rerun()
                     st.caption("Сборка продолжится без интервью. Оставшиеся пробелы будут отмечены в черновике.")
                     if not handoff:
-                        await expert_actions(actor, settings, factory, users, course, interviews[0])
+                        await expert_actions(actor, settings, factory, users, interviews[0])
                 if can_review:
                     await review_actions(actor, factory, course, draft, active)
                 if version:

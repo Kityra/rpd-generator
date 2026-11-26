@@ -34,6 +34,7 @@ import re
 import sys
 import unicodedata
 from collections import Counter
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from html.parser import HTMLParser
@@ -49,9 +50,6 @@ from literature_catalog import course_concepts, references_for_discipline
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Константы
-# ---------------------------------------------------------------------------
 
 OPENALEX_WORKS = "https://api.openalex.org/works"
 CROSSREF_WORKS = "https://api.crossref.org/works"
@@ -166,9 +164,6 @@ POSITIVE_WORDS = (
     "algorithm", "neural", "learning", "matrix", "equation", "geometry", "optimization", "agent",
 )
 
-# ---------------------------------------------------------------------------
-# Нормализация текста, стемминг, сходство строк
-# ---------------------------------------------------------------------------
 
 _TOKEN = re.compile(r"[0-9a-zа-я]+", re.IGNORECASE)
 _RU_SUFFIXES = tuple(sorted({
@@ -325,10 +320,6 @@ def format_isbn(isbn: str) -> str:
         return f"{isbn[:3]}-{isbn[3]}-{isbn[4:9]}-{isbn[9:12]}-{isbn[12]}"
     return isbn
 
-# ---------------------------------------------------------------------------
-# URL: нормализация и анти-мусорные фильтры
-# ---------------------------------------------------------------------------
-
 
 def host_of(url: str) -> str:
     host = (urlsplit(url).hostname or "").lower()
@@ -400,10 +391,6 @@ def is_internal_file(name: str) -> bool:
         return True
     words = re.findall(r"[a-zа-я]{3,}", lowered)
     return len(words) < 2
-
-# ---------------------------------------------------------------------------
-# Конфигурация
-# ---------------------------------------------------------------------------
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -477,10 +464,6 @@ class ParserConfig:
             semantic_scholar_enabled=os.environ.get("SCIENCE_SEMANTIC_SCHOLAR_ENABLED", "0").strip() == "1",
             semantic_scholar_api_key=os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "").strip(),
         )
-
-# ---------------------------------------------------------------------------
-# HTTP-слой: повторные запросы, лимиты на хост, кеш
-# ---------------------------------------------------------------------------
 
 
 class SourceUnavailable(RuntimeError):
@@ -635,10 +618,6 @@ class Http:
                     raise
             await asyncio.sleep(self._delay(attempt, retry_after))
         raise SourceUnavailable(f"{url}: исчерпаны попытки")
-
-# ---------------------------------------------------------------------------
-# Проверка PDF
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -828,13 +807,9 @@ def pdf_front_text(content: bytes, pages: int = 5) -> tuple[str, dict[str, str]]
         for index in range(min(pages, len(reader.pages))):
             chunks.append(reader.pages[index].extract_text() or "")
         return "\n".join(chunks), info
-    except Exception as error:  # noqa: BLE001 - pypdf бросает много разных исключений на битых файлах
-        logger.debug("PDF не разобран: %s", error)
+    except Exception:  # noqa: BLE001 - повреждённые PDF могут вызвать разные исключения pypdf.
         return "", {}
 
-# ---------------------------------------------------------------------------
-# Разбор HTML (stdlib)
-# ---------------------------------------------------------------------------
 
 _VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 _BLOCK = {"p", "div", "li", "tr", "td", "h1", "h2", "h3", "h4", "h5", "section", "article", "dd", "dt", "ul", "ol"}
@@ -979,11 +954,10 @@ class _PageParser(HTMLParser):
 
 def parse_html(text: str, base_url: str = "") -> Page:
     parser = _PageParser(base_url)
-    try:
+    # Сохраняем уже разобранную часть при ошибке в HTML.
+    with suppress(Exception):
         parser.feed(text or "")
         parser.close()
-    except Exception as error:  # noqa: BLE001 - HTMLParser на битой разметке
-        logger.debug("HTML разобран частично: %s", error)
     while parser._li:
         parts, links = parser._li.pop()
         parser.items.append((clean(" ".join(parts)), links))
@@ -1011,10 +985,6 @@ def jsonld_objects(page: Page, kinds: set[str]) -> list[dict]:
 
     walk(page.jsonld)
     return found
-
-# ---------------------------------------------------------------------------
-# Словарь терминов и расширение запросов
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -1175,10 +1145,6 @@ def classify_area(topic: str, discipline: str) -> Literal["math", "it"]:
         return "math"
     return "it"
 
-# ---------------------------------------------------------------------------
-# Каталог фундаментальных учебников (только метаданные, без ссылок)
-# ---------------------------------------------------------------------------
-
 
 @dataclass(frozen=True)
 class CanonicalBook:
@@ -1275,10 +1241,6 @@ def catalog_match(title: str, authors: Sequence[str]) -> CanonicalBook | None:
             return book
     return None
 
-# ---------------------------------------------------------------------------
-# Профиль темы
-# ---------------------------------------------------------------------------
-
 
 @dataclass(frozen=True)
 class TopicProfile:
@@ -1336,10 +1298,6 @@ def build_profile(topic: str, discipline: str, extra_terms: Sequence[str] = ()) 
     return TopicProfile(topic, discipline, classify_area(topic, discipline), topic_set, discipline_set, phrases,
                         broad, (exact, terminology, generalised), tuple(article_ru), tuple(article_en),
                         tuple(textbook_queries), catalog[:4])
-
-# ---------------------------------------------------------------------------
-# Кандидаты и результат
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -1449,10 +1407,6 @@ class TopicLiterature:
             data.update({"queries": self.queries, "unavailable_sources": self.unavailable,
                          "rejected": self.rejected[:50]})
         return data
-
-# ---------------------------------------------------------------------------
-# Адаптеры источников
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -1905,9 +1859,6 @@ async def enrich_pdf_front(ctx: SearchContext, candidate: Candidate) -> None:
         candidate.language = "ru" if has_cyrillic(text[:3000] or candidate.title) else "en"
         return
 
-# ---------------------------------------------------------------------------
-# Релевантность, верификация, скоринг
-# ---------------------------------------------------------------------------
 
 _NEGATIVE = frozenset(stem(word) for word in NEGATIVE_WORDS)
 _POSITIVE = frozenset(stem(word) for word in POSITIVE_WORDS)
@@ -2130,9 +2081,6 @@ def to_source(candidate: Candidate) -> LiteratureSource:
         score_breakdown=dict(candidate.breakdown),
     )
 
-# ---------------------------------------------------------------------------
-# Оркестратор
-# ---------------------------------------------------------------------------
 
 LlmExpander = Callable[[str, str], Awaitable[list[str]]]
 
@@ -2358,9 +2306,6 @@ def yandex_llm_expander(settings: dict[str, str] | None = None) -> LlmExpander:
 
     return expand
 
-# ---------------------------------------------------------------------------
-# Интеграция с программой курса (domain.schemas)
-# ---------------------------------------------------------------------------
 
 LEARNING_TYPES = {"Books", "Crossref", "arXiv", "documentation", "Literature"}
 
@@ -2417,8 +2362,9 @@ def clean_references(references: list[dict], sources: dict[str, Any]) -> list[di
     result: list[dict] = []
     titles: list[str] = []
     urls: set[str] = set()
+    source_ids: set[str] = set()
     for reference in references:
-        if is_junk_reference(reference, sources) or any(r["source_id"] == reference["source_id"] for r in result):
+        if is_junk_reference(reference, sources) or reference["source_id"] in source_ids:
             continue
         record = sources.get(reference["source_id"])
         title = _record_field(record, "title") if record is not None else reference.get("locator", "")
@@ -2428,6 +2374,7 @@ def clean_references(references: list[dict], sources: dict[str, Any]) -> list[di
         if url:
             urls.add(url)
         titles.append(title)
+        source_ids.add(reference["source_id"])
         result.append(reference)
     return result
 
@@ -2511,9 +2458,6 @@ async def enrich_course_program(program: dict, sources: dict[str, Any], *, parse
         subject["learning_references"] = kept or subject.get("learning_references", [])
     return updated, list(records.values()), results
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 DEMO_TOPICS: tuple[tuple[str, str], ...] = (
     ("Обучение на основе временных различий", "Машинное обучение"),

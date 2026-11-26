@@ -66,8 +66,8 @@ class InterviewerExtraction(Contract):
         if not isinstance(data, Mapping):
             return data
         rows = []
-        for key in ("items", "extracted_claims"):
-            entries = data.get(key)
+        for field_name in ("items", "extracted_claims"):
+            entries = data.get(field_name)
             if isinstance(entries, list):
                 rows.extend({field: item.get(field) for field in ("slot_name", "statement", "tool_name", "operation")}
                             for item in entries if isinstance(item, Mapping))

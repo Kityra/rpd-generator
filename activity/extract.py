@@ -166,7 +166,7 @@ def _header(low: str) -> str | None:
     if len(head) > 40:
         return None
     for name, group in (("duties", _DUTY_HEADERS), ("requirements", _REQUIREMENT_HEADERS), ("other", _OTHER_HEADERS)):
-        if any(head == item or head.startswith(item + " ") or head.startswith(item + ":") for item in group):
+        if any(head == item or head.startswith((item + " ", item + ":")) for item in group):
             return name
     return None
 

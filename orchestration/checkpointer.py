@@ -20,8 +20,9 @@ async def open_checkpointer(url: str):
             finally:
                 await saver.conn.execute("SELECT pg_advisory_unlock(%s)", (CHECKPOINT_SETUP_LOCK,))
             yield saver
-    else:
-        Path(url).parent.mkdir(parents=True, exist_ok=True)
-        async with AsyncSqliteSaver.from_conn_string(url) as saver:
-            await saver.setup()
-            yield saver
+        return
+
+    Path(url).parent.mkdir(parents=True, exist_ok=True)
+    async with AsyncSqliteSaver.from_conn_string(url) as saver:
+        await saver.setup()
+        yield saver

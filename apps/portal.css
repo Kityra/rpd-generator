@@ -167,7 +167,6 @@
 .portal-step--current .portal-step-line { background: var(--portal-progress-green); }
 .portal-progress .portal-step--current, .portal-step--current a { color: var(--portal-progress-green-text); font-weight: 700; }
 .portal-progress .portal-progress-note { margin: .75rem 0 0; color: var(--portal-muted); font-size: .77rem; }
-.portal-course-meta { color: var(--portal-muted); font-size: .85rem; margin-top: .35rem; overflow-wrap: anywhere; }
 
 @container (max-width: 740px) {
     .st-key-course-workspace [data-testid="stHorizontalBlock"] { flex-wrap: wrap; }
@@ -184,7 +183,7 @@
 /* --- Модель деятельности: чипы, карточки, «почему здесь», матрица --- */
 @keyframes portal-rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 @keyframes portal-grow { from { width: 0; } }
-.am-card, .am-why, .am-rec, .am-signal, .am-matrix-wrap, .am-banner, .am-kpis { animation: portal-rise .35s ease-out both; }
+.am-why, .am-rec, .am-signal, .am-matrix-wrap, .am-banner, .am-kpis { animation: portal-rise .35s ease-out both; }
 .am-banner { margin: .2rem 0 .8rem; padding: .55rem .85rem; border-radius: 12px; background: #fff3dc; color: #744807;
     font-size: .86rem; font-weight: 600; border: 1px solid #f3dfb5; }
 .am-chip { display: inline-flex; align-items: center; gap: .3rem; font-size: .76rem; line-height: 1.3; padding: .2rem .58rem;
@@ -235,5 +234,5 @@
 .am-gap { color: #932f40; font-weight: 700; }
 
 @media (prefers-reduced-motion: reduce) {
-    .am-card, .am-why, .am-rec, .am-signal, .am-matrix-wrap, .am-banner, .am-kpis, .am-bar i { animation: none; }
+    .am-why, .am-rec, .am-signal, .am-matrix-wrap, .am-banner, .am-kpis, .am-bar i { animation: none; }
 }

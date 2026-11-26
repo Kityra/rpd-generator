@@ -8,14 +8,12 @@ from orchestration import call_log, rabota_business, relevance_filter
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGES = ("apps", "auth", "domain", "orchestration", "storage", "workers", "rabota_it")
+PACKAGES = ("activity", "apps", "auth", "domain", "orchestration", "rabota_it", "scripts", "storage", "tests", "workers")
 
 
 def unused_imports(path: Path) -> list[str]:
     tree = ast.parse(path.read_text(encoding="utf-8-sig"))
-    used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
-    used |= {node.value.id for node in ast.walk(tree)
-             if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)}
+    used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
     # Имена из строковых аннотаций («"EvidenceClient"») тоже считаются использованными.
     annotations = " ".join(node.value for node in ast.walk(tree) if isinstance(node, ast.Constant)
                            and isinstance(node.value, str) and len(node.value) < 200)
@@ -33,7 +31,7 @@ class CleanupTests(unittest.TestCase):
     def test_no_unused_imports_in_application_modules(self):
         files = [path for package in PACKAGES for path in (ROOT / package).rglob("*.py")
                  if path.name != "__init__.py" and "migrations" not in path.parts]
-        files.append(ROOT / "app.py")
+        files.extend(ROOT.glob("*.py"))
         problems = [item for path in files for item in unused_imports(path)]
         self.assertEqual(problems, [])
 

@@ -143,7 +143,6 @@ class Context:
         self.data, self.as_of, self.config = data, as_of, config
         self.areas = AreaDictionary(areas)
         self.sources = {source.id: source for source in data.sources}
-        self.items = {item.id: item for item in data.items}
         self.now, self.prev = windows(as_of, config)
         vacancies = [source for source in data.sources if source.type == "vacancy"]
         self.vacancies_now = [source for source in vacancies if inside(source.day, self.now)]
@@ -164,6 +163,9 @@ class Context:
         versions = {item.id: item.version for item in data.items}
         current = [vote for vote in data.votes if vote.item_version == versions.get(vote.item_id)]
         self.latest = latest_votes(current)
+        self.votes_by_item: dict[str, list[Vote]] = {}
+        for (_, item_id), vote in sorted(self.latest.items()):
+            self.votes_by_item.setdefault(item_id, []).append(vote)
         self.outdated_votes = Counter(vote.item_id for vote in data.votes
                                       if vote.item_id in versions and vote.item_version != versions[vote.item_id])
 
@@ -248,8 +250,9 @@ def segment_flag(votes: list[Vote], experts: dict[str, Expert], config: dict) ->
 
 def expert_metrics(ctx: Context, item: Item) -> dict:
     config = ctx.config["experts"]
-    votes = [vote for (expert, item_id), vote in sorted(ctx.latest.items()) if item_id == item.id]
+    votes = ctx.votes_by_item.get(item.id, [])
     reliable = [vote for vote in votes if vote.expert_id in ctx.reliable]
+    verdicts = Counter(vote.verdict for vote in reliable)
     answered = [vote for vote in reliable if vote.verdict != "dont_know"]
     k = sum(vote.verdict in YES for vote in answered)
     n = len(answered)
@@ -262,8 +265,8 @@ def expert_metrics(ctx: Context, item: Item) -> dict:
     needed = experts_needed(p, config["z"], config["majority"]) if p is not None else None
     return {
         "n": n, "k": k, "p": _r(p), "ci": [_r(v) for v in ci] if ci else None,
-        "verdicts": {key: sum(vote.verdict == key for vote in reliable) for key in VERDICT_LABELS},
-        "dont_know": sum(vote.verdict == "dont_know" for vote in reliable),
+        "verdicts": {key: verdicts[key] for key in VERDICT_LABELS},
+        "dont_know": verdicts["dont_know"],
         "excluded_votes": len(votes) - len(reliable), "outdated_version_votes": ctx.outdated_votes.get(item.id, 0),
         "importance": _r(importance, 2), "forecast": {key: forecasts[key] for key in ("more", "same", "less", "automated")},
         "n_forecast": n_forecast, "forecast_net": _r(net),
@@ -386,7 +389,7 @@ def quotes_of(ctx: Context, claims: list[Claim], limit: int | None = None) -> li
     return result[:limit] if limit else result
 
 
-def reason_of(ctx: Context, item: Item, task: dict) -> dict:
+def reason_of(ctx: Context, task: dict) -> dict:
     """«Почему здесь» по шаблону, без LLM (раздел 7.8)."""
     config = ctx.config
     status, metrics = task["status"], task["metrics"]
@@ -519,26 +522,36 @@ def build(data: ModelData, as_of: date, config: dict | None = None, areas: list[
             "function_id": item.parent_id if item.parent_id in function_ids else None,
             "areas": ctx.areas.detect(item.name), "market": market_metrics(ctx, claims),
             "quotes": quotes_of(ctx, claims, 3), "tasks": []}
+    by_area: dict[str, list[dict]] = {}
+    by_function: dict[str, list[dict]] = {}
+    total_priority = 0
     for task in tasks_out.values():
+        area_names = set(task["areas"])
         for link in task["related"]:
-            knowledge_out[link["id"]]["tasks"].append(task["id"])
-            task["areas"] = sorted(set(task["areas"]) | set(knowledge_out[link["id"]]["areas"]))
-    for task in tasks_out.values():
-        item = ctx.items[task["id"]]
-        task["reason"] = reason_of(ctx, item, task)
-    eligible = [task for task in tasks_out.values() if task["status"] in ELIGIBLE]
-    total_priority = sum(task["priority"] for task in eligible)
+            related = knowledge_out[link["id"]]
+            related["tasks"].append(task["id"])
+            area_names.update(related["areas"])
+        task["areas"] = sorted(area_names)
+        task["reason"] = reason_of(ctx, task)
+        eligible = task["status"] in ELIGIBLE
+        if eligible:
+            total_priority += task["priority"]
+        for name in task["areas"]:
+            members = by_area.setdefault(name, [])
+            if eligible:
+                members.append(task)
+        if not task["is_control"]:
+            by_function.setdefault(task["function_id"], []).append(task)
     area_weights = {}
-    for name in sorted({area for task in tasks_out.values() for area in task["areas"]}):
-        using = [task for task in eligible if name in task["areas"]]
+    for name, using in sorted(by_area.items()):
         area_weights[name] = {"kind": ctx.areas.kind(name), "tasks": [task["id"] for task in using],
                               "weight": _r(sum(task["priority"] for task in using) / total_priority) if total_priority else 0.0}
     function_list = [{"id": item.id, "name": item.name, "code": item.standard_code, "origin": item.origin}
                      for item in functions]
-    if any(task["function_id"] == OTHER_FUNCTION for task in tasks_out.values() if not task["is_control"]):
+    if OTHER_FUNCTION in by_function:
         function_list.append({"id": OTHER_FUNCTION, "name": OTHER_FUNCTION_NAME, "code": None, "origin": "system"})
     for function in function_list:
-        members = [task for task in tasks_out.values() if task["function_id"] == function["id"] and not task["is_control"]]
+        members = by_function.get(function["id"], [])
         members.sort(key=lambda task: (-task["priority"], task["name"], task["id"]))
         function["tasks"] = [task["id"] for task in members]
         function["priority"] = sum(task["priority"] for task in members if task["status"] in ELIGIBLE)

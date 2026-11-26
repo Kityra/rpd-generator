@@ -17,6 +17,7 @@ from streamlit.testing.v1 import AppTest
 
 from apps.common import composer
 from apps.presentation import progress_html
+from storage.activity_models import Program
 from storage.models import Base, Course, ExpertInvitation, Interview, now
 
 
@@ -50,6 +51,9 @@ class PortalUITests(unittest.TestCase):
             engine = create_engine("sqlite:///" + path.as_posix())
             Base.metadata.create_all(engine)
             with Session(engine) as db:
+                db.add_all([Program(id="first", head_user_id="users:1", name="Первая программа", created_at=now()),
+                            Program(id="second", head_user_id="users:1", name="Вторая программа",
+                                    created_at=now() + timedelta(seconds=1))])
                 db.add(Course(id="other", thread_id="other", owner_user_id="other-teacher",
                               status="waiting_for_expert", course_meta={"title": "Интервью о данных"}))
                 db.add(Course(id="own", thread_id="own", owner_user_id="users:1",
@@ -91,6 +95,10 @@ class PortalUITests(unittest.TestCase):
                 self.assertFalse(app.error)
                 next(b for b in app.sidebar.button if b.label == "Модель деятельности").click().run()
                 self.assertIn("Модель деятельности «Инженер данных»", [heading.value for heading in app.header])
+                app.sidebar.button(key="nav-management-program").click().run()
+                app.selectbox(key="program_id").set_value("second").run()
+                self.assertFalse(app.exception)
+                self.assertIn("Вторая программа", [field.value for field in app.text_input])
                 next(b for b in app.button if b.label == "Создать курс").click().run()
                 self.assertFalse(app.number_input)
                 for field, value in zip(app.text_input, ("Аналитика", "Вуз", "2026/2027", "Аналитик данных"), strict=True):

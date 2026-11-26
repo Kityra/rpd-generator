@@ -169,20 +169,23 @@ async def retry_extraction(factory: Factory, source_id: str, profession_name: st
 
 def function_similarity(task_name: str, function: ActivityItem, members: list[ActivityItem]) -> float:
     terms = concepts(task_name)
-    return max([jaccard(terms, concepts(function.name)), *(jaccard(terms, concepts(item.name)) for item in members)],
-               default=0.0)
+    return max(jaccard(terms, concepts(function.name)),
+               max((jaccard(terms, concepts(item.name)) for item in members), default=0.0))
 
 
 def nearest_function(task_name: str, functions: list[ActivityItem], tasks: list[ActivityItem]) -> tuple[ActivityItem | None, float]:
+    members_by_function: dict[str | None, list[ActivityItem]] = {}
+    for task in tasks:
+        members_by_function.setdefault(task.parent_id, []).append(task)
     best, score = None, 0.0
     for function in sorted(functions, key=lambda item: item.id):
-        value = function_similarity(task_name, function, [t for t in tasks if t.parent_id == function.id])
+        value = function_similarity(task_name, function, members_by_function.get(function.id, []))
         if value > score:
             best, score = function, value
     return best, score
 
 
-async def link_claims(factory: Factory, profession_id: str, actor: str = "system") -> dict:
+async def link_claims(factory: Factory, profession_id: str) -> dict:
     """Привязать проверенные утверждения к пунктам модели: точное совпадение ключа или новый пункт."""
     config = load_config()
     areas = AreaDictionary()
@@ -190,19 +193,16 @@ async def link_claims(factory: Factory, profession_id: str, actor: str = "system
     counts = Counter()
     async with write_transaction(factory) as db:
         items = (await db.scalars(select(ActivityItem).where(ActivityItem.profession_id == profession_id))).all()
-        linked = set((await db.scalars(select(ClaimLink.claim_id).join(ActivityClaim).join(ActivitySource)
-                                       .where(ActivitySource.profession_id == profession_id))).all())
-        claims = (await db.scalars(select(ActivityClaim).join(ActivitySource).where(
+        linked = select(ClaimLink.claim_id).where(ClaimLink.claim_id == ActivityClaim.id).exists()
+        claims = (await db.execute(select(ActivityClaim, ActivitySource.type).join(ActivitySource).where(
             ActivitySource.profession_id == profession_id, ActivityClaim.quote_ok.is_(True),
-            ActivityClaim.foreign_role.is_(False)).order_by(ActivitySource.collected_at, ActivityClaim.created_at,
-                                                             ActivityClaim.id))).all()
-        sources = {s.id: s for s in (await db.scalars(select(ActivitySource).where(
-            ActivitySource.profession_id == profession_id))).all()}
+            ActivityClaim.foreign_role.is_(False), ~linked).order_by(ActivitySource.collected_at, ActivityClaim.created_at,
+                                                                     ActivityClaim.id))).all()
         by_key = {(item.level, item.canonical_key): item for item in items if item.active and not item.is_control}
         functions = {item.standard_code: item for item in items if item.level == "function" and item.standard_code}
-        for claim in claims:
-            if claim.id in linked:
-                continue
+        active_functions = [item for item in items if item.level == "function" and item.active]
+        tasks = [item for item in items if item.level == "task"]
+        for claim, source_type in claims:
             level = claim.kind
             key = canonical_key(claim.text, level, config)
             item = by_key.get((level, key))
@@ -218,14 +218,14 @@ async def link_claims(factory: Factory, profession_id: str, actor: str = "system
                         db.add(parent)
                         await db.flush()
                         functions[hint["code"]] = parent
-                        items = [*items, parent]
+                        if parent.active:
+                            active_functions.append(parent)
                         counts["functions"] += 1
                 elif level == "task":
-                    candidates = [i for i in items if i.level == "function" and i.active]
-                    best, score = nearest_function(claim.text, candidates, [i for i in items if i.level == "task"])
+                    best, score = nearest_function(claim.text, active_functions, tasks)
                     if best is not None and score >= config["grouping"]["auto"] - 1e-9:
                         parent = best
-                origin = "expert_proposal" if sources[claim.source_id].type == "expert" and level == "task" else "sources"
+                origin = "expert_proposal" if source_type == "expert" and level == "task" else "sources"
                 found = areas.detect(claim.text)
                 item = ActivityItem(profession_id=profession_id, level=level, name=claim.text, canonical_key=key,
                                     parent_id=parent.id if parent else None, origin=origin,
@@ -234,7 +234,10 @@ async def link_claims(factory: Factory, profession_id: str, actor: str = "system
                                     knowledge_area_id=area_ids.get(found[0]) if found and level != "task" else None)
                 db.add(item)
                 await db.flush()
-                items = [*items, item]
+                if item.level == "task":
+                    tasks.append(item)
+                elif item.level == "function" and item.active:
+                    active_functions.append(item)
                 by_key[(level, key)] = item
                 counts[f"new_{level}"] += 1
                 method = "exact"
@@ -368,10 +371,12 @@ async def review_queue(db: AsyncSession, profession_id: str, content: dict | Non
         ActivityMergeLog.profession_id == profession_id, ActivityMergeLog.action == "dismiss"))).all()}
     tasks = sorted((i for i in items if i.level == "task" and i.active and not i.is_control), key=lambda i: (i.name, i.id))
     functions = [i for i in items if i.level == "function" and i.active]
+    task_concepts = {task.id: concepts(task.name) for task in tasks}
     duplicates = []
     for index, left in enumerate(tasks):
-        for right in tasks[index + 1:]:
-            score = jaccard(concepts(left.name), concepts(right.name))
+        for right_index in range(index + 1, len(tasks)):
+            right = tasks[right_index]
+            score = jaccard(task_concepts[left.id], task_concepts[right.id])
             key = "dup:" + ":".join(sorted([left.id, right.id]))
             if score >= config["duplicate_review"] - 1e-9 and key not in dismissed:
                 duplicates.append({"key": key, "left": left, "right": right, "similarity": round(score, 2)})
@@ -589,13 +594,17 @@ async def build_version(factory: Factory, profession_id: str, as_of: date | None
         return row
 
 
-async def latest_contents(db: AsyncSession) -> dict[str, dict]:
-    """Последние версии моделей всех профессий: для карты знаний и смежных ролей."""
+def latest_versions_query():
     numbers = select(ModelVersionRow.profession_id, func.max(ModelVersionRow.number).label("number")).group_by(
         ModelVersionRow.profession_id).subquery()
-    rows = (await db.scalars(select(ModelVersionRow).join(numbers, (ModelVersionRow.profession_id == numbers.c.profession_id)
-                                                          & (ModelVersionRow.number == numbers.c.number)))).all()
-    return {row.profession_id: row.content for row in rows}
+    return select(ModelVersionRow).join(numbers, (ModelVersionRow.profession_id == numbers.c.profession_id)
+                                        & (ModelVersionRow.number == numbers.c.number))
+
+
+async def latest_contents(db: AsyncSession) -> dict[str, dict]:
+    """Последние версии моделей всех профессий: для карты знаний и смежных ролей."""
+    query = latest_versions_query().with_only_columns(ModelVersionRow.profession_id, ModelVersionRow.content)
+    return dict((await db.execute(query)).all())
 
 
 # --- Программа и рекомендации (разделы 7.10–7.11). ---

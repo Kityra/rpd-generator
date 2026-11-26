@@ -80,7 +80,7 @@ async def card(factory, expert, item, content: dict, round_number: int, colleagu
             for comment in comments[:5]:
                 st.caption(f"Комментарий коллеги: «{comment}»")
         key = f"{expert.id}-{item.id}-{round_number}"
-        verdict = st.radio(f"Это часть работы специалиста?", list(VERDICT_LABELS), format_func=VERDICT_LABELS.get,
+        verdict = st.radio("Это часть работы специалиста?", list(VERDICT_LABELS), format_func=VERDICT_LABELS.get,
                            index=None, key=f"verdict-{key}")
         yes = verdict in ("regular", "sometimes")
         importance = st.select_slider("Насколько важно для новичка в первые 2 года?", options=[1, 2, 3, 4, 5], value=3,

@@ -68,13 +68,16 @@ def assess(experts: list[Expert], votes: list[Vote], controls: dict[str, dict], 
     controls: {item_id: {"kind": "foreign" | "duplicate", "duplicate_of": item_id | None}}.
     """
     rules = config["experts"]["exclude"]
-    latest = latest_votes(votes)
-    by_expert: dict[str, list[Vote]] = {}
+    latest_by_expert: dict[str, dict[str, Vote]] = {}
+    for (expert_id, item_id), vote in latest_votes(votes).items():
+        latest_by_expert.setdefault(expert_id, {})[item_id] = vote
+    first_round_by_expert: dict[str, list[Vote]] = {}
     for vote in votes:
-        by_expert.setdefault(vote.expert_id, []).append(vote)
+        if vote.round == 1:
+            first_round_by_expert.setdefault(vote.expert_id, []).append(vote)
     result = {}
     for expert in experts:
-        own = {item: vote for (expert_id, item), vote in latest.items() if expert_id == expert.id}
+        own = latest_by_expert.get(expert.id, {})
         reasons, codes, checks = [], [], {}
         foreign = [vote for item, vote in own.items() if controls.get(item, {}).get("kind") == "foreign"
                    and vote.verdict != "dont_know"]
@@ -88,16 +91,17 @@ def assess(experts: list[Expert], votes: list[Vote], controls: dict[str, dict], 
         for item, vote in own.items():
             control = controls.get(item, {})
             original = own.get(control.get("duplicate_of") or "")
-            if control.get("kind") == "duplicate" and original is not None:
-                left, right = side(vote.verdict), side(original.verdict)
-                if left and right:
-                    pairs += 1
-                    mismatched += left != right
+            if control.get("kind") != "duplicate" or original is None:
+                continue
+            left, right = side(vote.verdict), side(original.verdict)
+            if left and right:
+                pairs += 1
+                mismatched += left != right
         checks["duplicates"] = {"pairs": pairs, "mismatched": mismatched}
         if pairs and mismatched / pairs >= rules["duplicate_mismatch_share"]:
             reasons.append(f"ответил по-разному на одну и ту же задачу в {mismatched} из {pairs} пар-дублей")
             codes.append("duplicates")
-        first_round = [vote for vote in by_expert.get(expert.id, []) if vote.round == 1]
+        first_round = first_round_by_expert.get(expert.id, [])
         timings = [vote.elapsed_ms / 1000 for vote in first_round if vote.elapsed_ms is not None]
         seconds = median(timings)
         checks["median_seconds"] = round(seconds, 2) if seconds is not None else None

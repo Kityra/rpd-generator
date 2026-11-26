@@ -107,21 +107,26 @@ def rationale_problem(title: str, explanation: str, excerpts: list[str]) -> str 
 
 
 def similarity(left: str, right: str) -> float:
-    a, b = concepts(left), concepts(right)
-    return len(a & b) / len(a | b) if a and b else 0.0
+    return _concept_similarity(concepts(left), concepts(right))
+
+
+def _concept_similarity(left: set[str], right: set[str]) -> float:
+    return len(left & right) / len(left | right) if left and right else 0.0
 
 
 def duplicate_subjects(subjects: list[dict]) -> list[dict]:
     """Дубли и почти-дубли дисциплин по названию."""
     threshold = load_analysis()["composition"]["duplicate_similarity"]
+    titles = [subject["title"] for subject in subjects]
+    vocabulary = [concepts(title) for title in titles]
     pairs = []
-    for index, left in enumerate(subjects):
-        for right in subjects[index + 1:]:
-            score = similarity(left["title"], right["title"])
-            a, b = concepts(left["title"]), concepts(right["title"])
+    for index, a in enumerate(vocabulary):
+        for other in range(index + 1, len(vocabulary)):
+            b = vocabulary[other]
+            score = _concept_similarity(a, b)
             contained = bool(a and b) and (a <= b or b <= a) and min(len(a), len(b)) >= 2
             if score >= threshold or contained:
-                pairs.append({"subjects": [left["title"], right["title"]], "similarity": round(score, 2)})
+                pairs.append({"subjects": [titles[index], titles[other]], "similarity": round(score, 2)})
     return pairs
 
 
